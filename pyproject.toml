@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "router-ia"
+version = "0.1.0"
+description = "Experimental hierarchical MoE GGUF runtime"
+requires-python = ">=3.10"
+dependencies = [
+    "gguf>=0.17.0",
+]
+
+[project.scripts]
+router-inspect = "router_ia.inspect:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
