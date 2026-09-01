@@ -45,8 +45,6 @@ def json_safe(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [json_safe(v) for v in value]
 
-    # numpy scalar types expose item(). Try this before tolist() because
-    # numpy scalar wrappers can otherwise be less predictable to stringify.
     item = getattr(value, "item", None)
     if callable(item):
         try:
@@ -54,9 +52,6 @@ def json_safe(value: Any) -> Any:
         except (TypeError, ValueError):
             pass
 
-    # numpy arrays and memmap objects expose tolist(). For a GGUF metadata
-    # field backed by a memmap this materializes only the metadata value, not
-    # the model tensor data.
     tolist = getattr(value, "tolist", None)
     if callable(tolist):
         try:
@@ -130,6 +125,8 @@ def inspect(path: Path) -> dict:
         "file": str(path),
         "metadata": metadata,
         "tensor_count": len(tensors),
+        "tensor_names": [x.name for x in tensors],
+        "tensors": [asdict(x) for x in tensors],
         "expert_count": len(expert_map),
         "experts": expert_map,
     }
@@ -145,6 +142,11 @@ def main() -> None:
         "--output",
         type=Path,
         default=Path("model-map.json"),
+    )
+    parser.add_argument(
+        "--show-tensors",
+        action="store_true",
+        help="Print every tensor name after inspection.",
     )
 
     args = parser.parse_args()
@@ -163,6 +165,11 @@ def main() -> None:
     print(f"Tensores: {result['tensor_count']}")
     print(f"Experts encontrados: {result['expert_count']}")
     print(f"Mapa salvo em: {args.output}")
+
+    if args.show_tensors:
+        print("\nTensor names:")
+        for index, name in enumerate(result["tensor_names"]):
+            print(f"[{index:03d}] {name}")
 
 
 if __name__ == "__main__":
