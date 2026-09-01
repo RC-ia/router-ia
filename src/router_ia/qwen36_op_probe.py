@@ -206,7 +206,9 @@ def main() -> None:
     dequant_ms = (perf_counter() - start) * 1000.0
 
     qkv_current = qkv.reshape(1, -1)
-    tap = conv_fp32[:, -1].reshape(1, -1)
+    # Weight is [channel, 1, kernel]; for token 0 only the final causal tap
+    # multiplies the current token because three history positions are zero.
+    tap = conv_fp32[:, 0, -1].reshape(1, -1)
     start = perf_counter()
     y_linear = qkv_current * tap
     y = F.silu(y_linear)
