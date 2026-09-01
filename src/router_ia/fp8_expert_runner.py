@@ -34,15 +34,10 @@ HIDDEN_SIZE = 512
 
 
 def _dequantize_blockwise(weight: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
-    """Dequantize a block-wise FP8 E4M3 weight to float32.
-
-    ``weight_scale_inv`` follows the native Qwen FP8 format: one inverse
-    scale per 128x128 weight block. Shapes must be
-    ``(ceil(out/128), ceil(in/128))``.
-    """
+    """Dequantize a block-wise FP8 E4M3 weight to float32."""
     if weight.ndim != 2 or scale_inv.ndim != 2:
         raise ValueError(
-            f"Expected 2-D weight/scale tensors, got {weight.shape} and {scale_inv.shape}"
+            f"Expected 2-D weight/scale tensors, got {tuple(weight.shape)} and {tuple(scale_inv.shape)}"
         )
 
     out_features, in_features = map(int, weight.shape)
@@ -56,11 +51,22 @@ def _dequantize_blockwise(weight: torch.Tensor, scale_inv: torch.Tensor) -> torc
             f"shape {tuple(weight.shape)}; expected {expected_scales}"
         )
 
-    # E4M3 -> float32. Expand each 128x128 inverse scale over its block.
     values = weight.float()
     expanded = scale_inv.float().repeat_interleave(BLOCK, dim=0).repeat_interleave(BLOCK, dim=1)
-    expanded = expanded[:out_features, :in_features]
-    return values * expanded
+    return values * expanded[:out_features, :in_features]
+
+
+def _make_input(seed: int, device: torch.device) -> torch.Tensor:
+    """Create a deterministic input on CPU, then transfer it to CUDA.
+
+    Using a CPU generator avoids the ``Expected a 'cuda' device type for
+    generator but found 'cpu'`` error on builds where a CPU Generator cannot
+    be passed to a CUDA random operation.
+    """
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    cpu_x = torch.randn(INPUT_SIZE, generator=generator, dtype=torch.float32)
+    return cpu_x.to(device, non_blocking=False)
 
 
 def run_one(
@@ -83,24 +89,15 @@ def run_one(
         device="cuda",
     )
 
-    # Load the selected expert through the real two-level cache.
     expert_blob = cache.get(layer, expert, tier="vram")
 
     start = perf_counter()
-    gate = _dequantize_blockwise(
-        expert_blob.weights["gate_proj"], expert_blob.scales["gate_proj"]
-    )
-    up = _dequantize_blockwise(
-        expert_blob.weights["up_proj"], expert_blob.scales["up_proj"]
-    )
-    down = _dequantize_blockwise(
-        expert_blob.weights["down_proj"], expert_blob.scales["down_proj"]
-    )
+    gate = _dequantize_blockwise(expert_blob.weights["gate_proj"], expert_blob.scales["gate_proj"])
+    up = _dequantize_blockwise(expert_blob.weights["up_proj"], expert_blob.scales["up_proj"])
+    down = _dequantize_blockwise(expert_blob.weights["down_proj"], expert_blob.scales["down_proj"])
     dequant_ms = (perf_counter() - start) * 1000.0
 
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(seed)
-    x = torch.randn(INPUT_SIZE, generator=generator, dtype=torch.float32, device=device)
+    x = _make_input(seed, device)
 
     if gate.shape != (HIDDEN_SIZE, INPUT_SIZE):
         raise ValueError(f"Unexpected gate shape: {tuple(gate.shape)}")
