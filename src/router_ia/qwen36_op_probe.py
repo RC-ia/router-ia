@@ -126,10 +126,15 @@ def split_qkv(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor
 
 
 def load_projection(root: Path, prefix: str, device: str) -> torch.Tensor:
+    """Load a linear-attention projection, whether BF16 or FP8."""
     weight = load_tensor(root, prefix + ".weight", device="cpu")
-    scale = load_tensor(root, prefix + ".weight_scale_inv", device="cpu")
-    out = dequantize_fp8_blockwise(weight, scale).to(device)
-    del weight, scale
+    if weight.dtype == torch.float8_e4m3fn:
+        scale = load_tensor(root, prefix + ".weight_scale_inv", device="cpu")
+        out = dequantize_fp8_blockwise(weight, scale).to(device)
+        del scale
+    else:
+        out = weight.float().to(device)
+    del weight
     return out
 
 
@@ -154,7 +159,6 @@ def compute_delta_rule(root: Path, token_id: int, device: str) -> tuple[torch.Te
     k = F.normalize(k.float(), dim=-1, eps=EPS)
     q = q * (HEAD_DIM ** -0.5)
 
-    # Reference recurrent update with zero initial state (single token).
     state = torch.zeros(1, NUM_V_HEADS, HEAD_DIM, HEAD_DIM, device=device, dtype=torch.float32)
     state = state * decay.unsqueeze(-1).unsqueeze(-1)
     retrieved = torch.einsum("bhkd,bhk->bhd", state, k)
@@ -162,7 +166,7 @@ def compute_delta_rule(root: Path, token_id: int, device: str) -> tuple[torch.Te
     state = state + k.unsqueeze(-1) * delta.unsqueeze(-2)
     out = torch.einsum("bhkd,bhk->bhd", state, q)
 
-    del conv, a_weight, b_weight, norm_weight, a_raw, b_raw, A_log, dt_bias, q, k
+    del conv, a_weight, b_weight, norm_weight, a_raw, b_raw, A_log, dt_bias, q, k, state
     gc.collect()
     if device == "cuda":
         torch.cuda.empty_cache()
@@ -287,13 +291,9 @@ def main() -> None:
         torch.cuda.synchronize()
     total_ms = (perf_counter() - start) * 1000.0
     print("op=delta")
-    print(f"beta shape: {tuple(beta.shape)}")
-    print(f"g shape: {tuple(g.shape)}")
-    print(f"decay shape: {tuple(decay.shape)}")
-    print(f"beta range: {beta.min().item():.8f} .. {beta.max().item():.8f}")
-    print(f"g range: {g.min().item():.8f} .. {g.max().item():.8f}")
-    print(f"decay range: {decay.min().item():.8f} .. {decay.max().item():.8f}")
-    print(f"state init: zeros; sequence length=1")
+    stats("beta", beta)
+    stats("g", g)
+    stats("decay", decay)
     stats("retrieved", retrieved)
     stats("delta", delta)
     stats("delta output", out)
