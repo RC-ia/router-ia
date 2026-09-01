@@ -16,11 +16,23 @@ class TensorInfo:
     shape: list[int]
     dtype: str
     nbytes: int
+    data_offset: int | None = None
 
 
 EXPERT_TENSOR_RE = re.compile(
     r"^blk\.(?P<layer>\d+)\.ffn_(?P<kind>gate|up|down)_exps\.weight$"
 )
+
+
+# Qwen3.6 stores routed experts packed along GGML axis 2.  The gguf-py
+# ReaderTensor exposes the tensor's absolute data_offset and n_bytes, so the
+# byte region for expert X is:
+#
+#     data_offset + X * (n_bytes / n_experts)
+#
+# The important point is that we do NOT decode/dequantize the tensor here.
+# This map describes where the already-quantized expert bytes live in GGUF.
+EXPERT_AXIS = 2
 
 
 def json_safe(value: Any) -> Any:
@@ -52,6 +64,10 @@ def json_safe(value: Any) -> Any:
 
 
 def tensor_nbytes(tensor) -> int:
+    value = getattr(tensor, "n_bytes", None)
+    if value is not None:
+        return int(value)
+
     value = getattr(tensor, "nbytes", None)
     if value is not None:
         return int(value)
@@ -63,7 +79,72 @@ def tensor_nbytes(tensor) -> int:
     return 0
 
 
-def inspect(path: Path) -> dict:
+def tensor_data_offset(tensor) -> int | None:
+    value = getattr(tensor, "data_offset", None)
+    if value is None:
+        return None
+    return int(value)
+
+
+def build_expert_entry(
+    *,
+    layer: int,
+    expert: int,
+    sources: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Build a single logical (layer, expert) entry from packed tensors."""
+    tensors: dict[str, dict[str, Any]] = {}
+    total_bytes = 0
+
+    for kind in ("gate", "up", "down"):
+        source = sources[kind]
+        expert_count = source["expert_count"]
+        nbytes = source["nbytes"]
+        data_offset = source["data_offset"]
+
+        if expert >= expert_count:
+            raise ValueError(
+                f"Expert {expert} is outside {kind} tensor range "
+                f"(count={expert_count}) at layer {layer}"
+            )
+
+        if nbytes % expert_count != 0:
+            raise ValueError(
+                f"Tensor {source['tensor']} has {nbytes} bytes, which is not "
+                f"divisible by {expert_count} experts"
+            )
+
+        bytes_per_expert = nbytes // expert_count
+        offset = None
+        end_offset = None
+
+        if data_offset is not None:
+            offset = data_offset + expert * bytes_per_expert
+            end_offset = offset + bytes_per_expert
+
+        tensors[kind] = {
+            "tensor": source["tensor"],
+            "axis": EXPERT_AXIS,
+            "index": expert,
+            "shape": source["shape"],
+            "dtype": source["dtype"],
+            "bytes": bytes_per_expert,
+            "data_offset": data_offset,
+            "offset": offset,
+            "end_offset": end_offset,
+        }
+        total_bytes += bytes_per_expert
+
+    return {
+        "layer": layer,
+        "expert": expert,
+        "total_bytes": total_bytes,
+        "total_mib": round(total_bytes / (1024**2), 6),
+        "tensors": tensors,
+    }
+
+
+def inspect(path: Path, *, expand_experts: bool = True) -> dict:
     reader = GGUFReader(str(path))
 
     metadata: dict[str, Any] = {}
@@ -73,7 +154,7 @@ def inspect(path: Path) -> dict:
             metadata[key] = json_safe(value[-1])
 
     tensors: list[TensorInfo] = []
-    expert_tensors: list[dict[str, Any]] = []
+    packed: dict[int, dict[str, dict[str, Any]]] = {}
 
     for tensor in reader.tensors:
         info = TensorInfo(
@@ -81,59 +162,96 @@ def inspect(path: Path) -> dict:
             shape=[int(x) for x in tensor.shape],
             dtype=str(tensor.tensor_type),
             nbytes=tensor_nbytes(tensor),
+            data_offset=tensor_data_offset(tensor),
         )
         tensors.append(info)
 
         match = EXPERT_TENSOR_RE.match(tensor.name)
-        if match:
-            shape = info.shape
-            expert_count = shape[-1] if shape else None
-            bytes_per_expert = None
-            if expert_count and info.nbytes:
-                bytes_per_expert = info.nbytes // expert_count
+        if not match:
+            continue
 
-            expert_tensors.append(
-                {
-                    "layer": int(match.group("layer")),
-                    "kind": match.group("kind"),
-                    "tensor": info.name,
-                    "shape": shape,
-                    "dtype": info.dtype,
-                    "nbytes": info.nbytes,
-                    "expert_count_from_shape": expert_count,
-                    "bytes_per_expert_if_last_axis": bytes_per_expert,
-                }
+        layer = int(match.group("layer"))
+        kind = match.group("kind")
+        shape = info.shape
+
+        if len(shape) != 3:
+            raise ValueError(
+                f"Packed expert tensor {info.name} is expected to be 3D, "
+                f"got shape={shape}"
             )
 
-    expert_layers: dict[str, dict[str, Any]] = {}
-    for item in expert_tensors:
-        layer = str(item["layer"])
-        entry = expert_layers.setdefault(layer, {})
-        entry[item["kind"]] = item
+        expert_count = shape[EXPERT_AXIS]
+        if expert_count <= 0:
+            raise ValueError(
+                f"Packed expert tensor {info.name} has invalid expert count "
+                f"{expert_count}"
+            )
 
-    complete_layers = sum(
-        1
-        for entry in expert_layers.values()
-        if {"gate", "up", "down"}.issubset(entry)
+        layer_entry = packed.setdefault(layer, {})
+        layer_entry[kind] = {
+            "tensor": info.name,
+            "shape": shape,
+            "dtype": info.dtype,
+            "nbytes": info.nbytes,
+            "data_offset": info.data_offset,
+            "expert_count": expert_count,
+        }
+
+    complete_layers = sorted(
+        layer for layer, entry in packed.items() if {"gate", "up", "down"}.issubset(entry)
     )
 
-    inferred_expert_counts = sorted(
+    expert_counts = sorted(
         {
-            item["expert_count_from_shape"]
-            for item in expert_tensors
-            if item["expert_count_from_shape"] is not None
+            int(source["expert_count"])
+            for entry in packed.values()
+            for source in entry.values()
         }
+    )
+
+    expert_layers: dict[str, Any] = {}
+
+    for layer in complete_layers:
+        sources = packed[layer]
+        count = next(iter(sources.values()))["expert_count"]
+
+        if any(source["expert_count"] != count for source in sources.values()):
+            raise ValueError(
+                f"Layer {layer} has inconsistent expert counts: "
+                f"{[source['expert_count'] for source in sources.values()]}"
+            )
+
+        layer_info: dict[str, Any] = {
+            "expert_count": count,
+            "tensor_sources": sources,
+        }
+
+        if expand_experts:
+            layer_info["experts"] = {
+                str(expert): build_expert_entry(
+                    layer=layer,
+                    expert=expert,
+                    sources=sources,
+                )
+                for expert in range(count)
+            }
+
+        expert_layers[str(layer)] = layer_info
+
+    total_experts = sum(
+        int(info["expert_count"]) for info in expert_layers.values()
     )
 
     return {
         "file": str(path),
         "metadata": metadata,
         "tensor_count": len(tensors),
-        "expert_tensor_count": len(expert_tensors),
+        "expert_tensor_count": sum(len(entry) for entry in packed.values()),
         "expert_layer_count": len(expert_layers),
-        "complete_expert_layers": complete_layers,
-        "inferred_expert_counts": inferred_expert_counts,
-        "expert_tensors": expert_tensors,
+        "complete_expert_layers": len(complete_layers),
+        "inferred_expert_counts": expert_counts,
+        "expert_count_total": total_experts,
+        "expert_axis": EXPERT_AXIS,
         "expert_layers": expert_layers,
         "tensor_names": [x.name for x in tensors],
         "tensors": [asdict(x) for x in tensors],
@@ -142,7 +260,7 @@ def inspect(path: Path) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Inspect GGUF tensors and map packed MoE expert tensors."
+        description="Inspect GGUF tensors and build a packed MoE expert map."
     )
     parser.add_argument("model", type=Path)
     parser.add_argument(
@@ -159,7 +277,12 @@ def main() -> None:
     parser.add_argument(
         "--show-experts",
         action="store_true",
-        help="Print only packed MoE expert tensors and their shapes/sizes.",
+        help="Print packed MoE tensor information and expert slices.",
+    )
+    parser.add_argument(
+        "--no-expand-experts",
+        action="store_true",
+        help="Do not write 256 individual expert entries per layer to JSON.",
     )
 
     args = parser.parse_args()
@@ -167,7 +290,10 @@ def main() -> None:
     if not args.model.is_file():
         raise SystemExit(f"Arquivo não encontrado: {args.model}")
 
-    result = inspect(args.model)
+    result = inspect(
+        args.model,
+        expand_experts=not args.no_expand_experts,
+    )
 
     args.output.write_text(
         json.dumps(result, indent=2, ensure_ascii=False),
@@ -178,34 +304,41 @@ def main() -> None:
     print(f"Tensores: {result['tensor_count']}")
     print(f"Tensores de experts: {result['expert_tensor_count']}")
     print(f"Camadas MoE completas: {result['complete_expert_layers']}")
-    print(f"Experts inferidos pela última dimensão: {result['inferred_expert_counts']}")
+    print(f"Experts por camada: {result['inferred_expert_counts']}")
+    print(f"Experts totais mapeados: {result['expert_count_total']}")
+    print(f"Eixo dos experts: {result['expert_axis']}")
     print(f"Mapa salvo em: {args.output}")
 
     if args.show_experts:
-        print("\nExpert tensors:")
-        for item in result["expert_tensors"]:
-            mib = item["nbytes"] / (1024**2)
-            per_expert = item["bytes_per_expert_if_last_axis"]
-            per_expert_mib = (
-                per_expert / (1024**2) if per_expert is not None else None
-            )
-            if per_expert_mib is not None:
+        print("\nPacked expert tensors:")
+        for layer in result["expert_layers"].values():
+            print(f"\nLayer {layer['experts']['0']['layer'] if 'experts' in layer else '?'}")
+            for kind in ("gate", "up", "down"):
+                source = layer["tensor_sources"][kind]
+                mib = source["nbytes"] / (1024**2)
+                per_expert = source["nbytes"] // source["expert_count"]
+                per_expert_mib = per_expert / (1024**2)
                 print(
-                    f"layer={item['layer']:02d} "
-                    f"kind={item['kind']:4s} "
-                    f"shape={item['shape']} "
-                    f"dtype={item['dtype']} "
+                    f"  {kind:4s} {source['tensor']} "
+                    f"shape={source['shape']} dtype={source['dtype']} "
                     f"size={mib:.2f} MiB "
-                    f"~per-expert={per_expert_mib:.2f} MiB"
+                    f"per-expert={per_expert_mib:.4f} MiB "
+                    f"data_offset={source['data_offset']}"
                 )
-            else:
-                print(
-                    f"layer={item['layer']:02d} "
-                    f"kind={item['kind']:4s} "
-                    f"shape={item['shape']} "
-                    f"dtype={item['dtype']} "
-                    f"size={mib:.2f} MiB"
-                )
+
+            if "experts" in layer:
+                for expert_id in (0, layer["expert_count"] - 1):
+                    expert = layer["experts"][str(expert_id)]
+                    print(
+                        f"  example expert={expert_id} "
+                        f"total={expert['total_bytes'] / (1024**2):.4f} MiB"
+                    )
+                    for kind, tensor in expert["tensors"].items():
+                        print(
+                            f"    {kind:4s} offset={tensor['offset']} "
+                            f"end={tensor['end_offset']} "
+                            f"bytes={tensor['bytes']}"
+                        )
 
     if args.show_tensors:
         print("\nTensor names:")
