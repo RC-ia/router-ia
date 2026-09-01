@@ -14,16 +14,27 @@ from pathlib import Path
 from typing import Any
 
 
-# Qwen3.6 FP8 checkpoint names are of the form:
+# Qwen3.6 FP8 checkpoint names look like:
 # model.language_model.layers.N....
-LAYER_RE = re.compile(r"(?:^|\\.)layers\\.(\\d+)(?:\\.|$)", re.IGNORECASE)
-ROUTER_RE = re.compile(r"(?:^|\\.)(?:mlp\\.)gate\\.(?:weight|bias)$|(?:router|gate_inp|router_logits|shared_expert_gate)", re.IGNORECASE)
-EMBED_RE = re.compile(r"(?:^|\\.)(?:embed_tokens|token_embed|word_embeddings|token_embedding)\\.weight$", re.IGNORECASE)
-OUTPUT_RE = re.compile(r"(?:^|\\.)(?:lm_head|output)\\.weight$", re.IGNORECASE)
+LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)", re.IGNORECASE)
+ROUTER_RE = re.compile(
+    r"(?:^|\.)(?:mlp\.)gate\.(?:weight|bias)$"
+    r"|(?:^|\.)(?:router|gate_inp|router_logits|shared_expert_gate)",
+    re.IGNORECASE,
+)
+EMBED_RE = re.compile(
+    r"(?:^|\.)(?:embed_tokens|token_embed|word_embeddings|token_embedding)\.weight$",
+    re.IGNORECASE,
+)
+OUTPUT_RE = re.compile(r"(?:^|\.)(?:lm_head|output)\.weight$", re.IGNORECASE)
 NORM_RE = re.compile(r"norm", re.IGNORECASE)
-ATTN_RE = re.compile(r"(?:self_attn|linear_attn|attention|attn|deltanet|delta_net|ssm)", re.IGNORECASE)
+ATTN_RE = re.compile(
+    r"(?:self_attn|linear_attn|attention|attn|deltanet|delta_net|ssm)",
+    re.IGNORECASE,
+)
 EXPERT_RE = re.compile(
-    r"(?:^|\\.)layers\\.(?P<layer>\\d+)\\.mlp\\.experts\\.(?P<expert>\\d+)\\.(?P<kind>gate_proj|up_proj|down_proj)\\.weight$",
+    r"(?:^|\.)layers\.(?P<layer>\d+)\.mlp\.experts\."
+    r"(?P<expert>\d+)\.(?P<kind>gate_proj|up_proj|down_proj)\.weight$",
     re.IGNORECASE,
 )
 
@@ -91,11 +102,20 @@ def collect_metadata(root: Path, shards: list[Path]) -> dict[str, Any]:
     return metadata
 
 
+def layer_of(name: str) -> int | None:
+    match = LAYER_RE.search(name)
+    return int(match.group(1)) if match else None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Probe Qwen3.6 Safetensors tensors")
-    parser.add_argument("root", type=Path, help="Directory containing Qwen3.6 .safetensors shards")
+    parser.add_argument(
+        "root", type=Path, help="Directory containing Qwen3.6 .safetensors shards"
+    )
     parser.add_argument("--layer", type=int, default=0)
-    parser.add_argument("--all-layers", action="store_true", help="Print every transformer layer")
+    parser.add_argument(
+        "--all-layers", action="store_true", help="Print every transformer layer"
+    )
     parser.add_argument("--all-tensors", action="store_true", help="Print all tensor names")
     args = parser.parse_args()
 
@@ -158,7 +178,9 @@ def main() -> None:
 
     selected_layers = sorted(layer_experts) if args.all_layers else [args.layer]
     for layer in selected_layers:
-        candidates = [r for r in tensor_records if LAYER_RE.search(r[0]) and int(LAYER_RE.search(r[0]).group(1)) == layer]
+        candidates = [
+            r for r in tensor_records if layer_of(r[0]) == layer
+        ]
         print(f"\n[LAYER {layer} TENSORS]")
         if not candidates:
             print("  <none>")
@@ -177,12 +199,9 @@ def main() -> None:
             print(f"  {name} shape={shape} dtype={dtype} shard={shard.name}{tag}")
 
     print("\n[LIKELY ROUTER TENSORS IN SELECTED LAYER]")
-    selected_router = []
-    for record in tensor_records:
-        name = record[0]
-        match = LAYER_RE.search(name)
-        if match and int(match.group(1)) == args.layer and ROUTER_RE.search(name):
-            selected_router.append(record)
+    selected_router = [
+        r for r in tensor_records if layer_of(r[0]) == args.layer and ROUTER_RE.search(r[0])
+    ]
     for name, shard, dtype, shape in selected_router:
         print(f"  {name} shape={shape} dtype={dtype} shard={shard.name}")
     if not selected_router:
