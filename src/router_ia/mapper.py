@@ -35,7 +35,7 @@ EXPERT_PATTERNS = [
 
 
 def json_safe(value: Any) -> Any:
-    """Convert GGUF/numpy values into standard JSON-compatible Python types."""
+    """Convert arbitrary GGUF/numpy values into JSON-compatible Python types."""
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
 
@@ -45,7 +45,8 @@ def json_safe(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [json_safe(v) for v in value]
 
-    # numpy scalar types (and similar objects) usually expose item().
+    # numpy scalar types expose item(). Try this before tolist() because
+    # numpy scalar wrappers can otherwise be less predictable to stringify.
     item = getattr(value, "item", None)
     if callable(item):
         try:
@@ -53,8 +54,9 @@ def json_safe(value: Any) -> Any:
         except (TypeError, ValueError):
             pass
 
-    # numpy arrays / memmaps expose tolist(). This also avoids serializing
-    # the backing memmap object itself.
+    # numpy arrays and memmap objects expose tolist(). For a GGUF metadata
+    # field backed by a memmap this materializes only the metadata value, not
+    # the model tensor data.
     tolist = getattr(value, "tolist", None)
     if callable(tolist):
         try:
