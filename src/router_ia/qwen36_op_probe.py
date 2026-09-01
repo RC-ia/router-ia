@@ -125,11 +125,55 @@ def split_qkv(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor
     return q, k, v, q32, k32
 
 
+def load_projection(root: Path, prefix: str, device: str) -> torch.Tensor:
+    weight = load_tensor(root, prefix + ".weight", device="cpu")
+    scale = load_tensor(root, prefix + ".weight_scale_inv", device="cpu")
+    out = dequantize_fp8_blockwise(weight, scale).to(device)
+    del weight, scale
+    return out
+
+
+def compute_delta_rule(root: Path, token_id: int, device: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    conv = compute_conv(root, token_id, device)
+    _, _, v, q, k = split_qkv(conv)
+
+    a_weight = load_projection(root, LAYER_PREFIX + "linear_attn.in_proj_a", device)
+    b_weight = load_projection(root, LAYER_PREFIX + "linear_attn.in_proj_b", device)
+    norm_weight = load_tensor(root, LAYER_PREFIX + "input_layernorm.weight", device=device)
+
+    h = rmsnorm(load_embedding_row(root, token_id).to(device), norm_weight)
+    a_raw = F.linear(h.float(), a_weight.float()).reshape(1, NUM_V_HEADS)
+    b_raw = F.linear(h.float(), b_weight.float()).reshape(1, NUM_V_HEADS)
+    beta = torch.sigmoid(b_raw)
+    A_log = load_tensor(root, LAYER_PREFIX + "linear_attn.A_log", device=device).float().reshape(1, NUM_V_HEADS)
+    dt_bias = load_tensor(root, LAYER_PREFIX + "linear_attn.dt_bias", device=device).float().reshape(1, NUM_V_HEADS)
+    g = -torch.exp(A_log) * F.softplus(a_raw + dt_bias)
+    decay = torch.exp(g)
+
+    q = F.normalize(q.float(), dim=-1, eps=EPS)
+    k = F.normalize(k.float(), dim=-1, eps=EPS)
+    q = q * (HEAD_DIM ** -0.5)
+
+    # Reference recurrent update with zero initial state (single token).
+    state = torch.zeros(1, NUM_V_HEADS, HEAD_DIM, HEAD_DIM, device=device, dtype=torch.float32)
+    state = state * decay.unsqueeze(-1).unsqueeze(-1)
+    retrieved = torch.einsum("bhkd,bhk->bhd", state, k)
+    delta = (v.float() - retrieved) * beta.unsqueeze(-1)
+    state = state + k.unsqueeze(-1) * delta.unsqueeze(-2)
+    out = torch.einsum("bhkd,bhk->bhd", state, q)
+
+    del conv, a_weight, b_weight, norm_weight, a_raw, b_raw, A_log, dt_bias, q, k
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    return beta, g, decay, retrieved, delta, out
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Qwen3.6 isolated Layer-0 operation probe")
     parser.add_argument("root", type=Path)
     parser.add_argument("--token-id", type=int, default=0)
-    parser.add_argument("--op", choices=("norm", "qkv", "conv", "split"), default="qkv")
+    parser.add_argument("--op", choices=("norm", "qkv", "conv", "split", "delta"), default="qkv")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     args = parser.parse_args()
 
@@ -208,29 +252,54 @@ def main() -> None:
             torch.cuda.empty_cache()
         return
 
-    conv = compute_conv(root, args.token_id, args.device)
+    if args.op == "split":
+        conv = compute_conv(root, args.token_id, args.device)
+        start = perf_counter()
+        q, k, v, q32, k32 = split_qkv(conv)
+        if args.device == "cuda":
+            torch.cuda.synchronize()
+        split_ms = (perf_counter() - start) * 1000.0
+
+        print("op=split")
+        print(f"input shape: {tuple(conv.shape)}")
+        print(f"Q shape: {tuple(q.shape)}")
+        print(f"K shape: {tuple(k.shape)}")
+        print(f"V shape: {tuple(v.shape)}")
+        print(f"Q expanded shape: {tuple(q32.shape)}")
+        print(f"K expanded shape: {tuple(k32.shape)}")
+        print(f"split/reshape time: {split_ms:.3f} ms")
+        print(f"Q norm: {torch.linalg.vector_norm(q).item():.8f}")
+        print(f"K norm: {torch.linalg.vector_norm(k).item():.8f}")
+        print(f"V norm: {torch.linalg.vector_norm(v).item():.8f}")
+        print(f"Q expanded norm: {torch.linalg.vector_norm(q32).item():.8f}")
+        print(f"K expanded norm: {torch.linalg.vector_norm(k32).item():.8f}")
+        print("head configuration: Q/K=16x128 -> expanded to 32 heads; V=32x128")
+
+        del conv, q, k, v, q32, k32
+        gc.collect()
+        if args.device == "cuda":
+            torch.cuda.empty_cache()
+        return
+
     start = perf_counter()
-    q, k, v, q32, k32 = split_qkv(conv)
+    beta, g, decay, retrieved, delta, out = compute_delta_rule(root, args.token_id, args.device)
     if args.device == "cuda":
         torch.cuda.synchronize()
-    split_ms = (perf_counter() - start) * 1000.0
+    total_ms = (perf_counter() - start) * 1000.0
+    print("op=delta")
+    print(f"beta shape: {tuple(beta.shape)}")
+    print(f"g shape: {tuple(g.shape)}")
+    print(f"decay shape: {tuple(decay.shape)}")
+    print(f"beta range: {beta.min().item():.8f} .. {beta.max().item():.8f}")
+    print(f"g range: {g.min().item():.8f} .. {g.max().item():.8f}")
+    print(f"decay range: {decay.min().item():.8f} .. {decay.max().item():.8f}")
+    print(f"state init: zeros; sequence length=1")
+    stats("retrieved", retrieved)
+    stats("delta", delta)
+    stats("delta output", out)
+    print(f"op=delta total time={total_ms:.3f} ms")
 
-    print("op=split")
-    print(f"input shape: {tuple(conv.shape)}")
-    print(f"Q shape: {tuple(q.shape)}")
-    print(f"K shape: {tuple(k.shape)}")
-    print(f"V shape: {tuple(v.shape)}")
-    print(f"Q expanded shape: {tuple(q32.shape)}")
-    print(f"K expanded shape: {tuple(k32.shape)}")
-    print(f"split/reshape time: {split_ms:.3f} ms")
-    print(f"Q norm: {torch.linalg.vector_norm(q).item():.8f}")
-    print(f"K norm: {torch.linalg.vector_norm(k).item():.8f}")
-    print(f"V norm: {torch.linalg.vector_norm(v).item():.8f}")
-    print(f"Q expanded norm: {torch.linalg.vector_norm(q32).item():.8f}")
-    print(f"K expanded norm: {torch.linalg.vector_norm(k32).item():.8f}")
-    print("head configuration: Q/K=16x128 -> expanded to 32 heads; V=32x128")
-
-    del conv, q, k, v, q32, k32
+    del beta, g, decay, retrieved, delta, out
     gc.collect()
     if args.device == "cuda":
         torch.cuda.empty_cache()
