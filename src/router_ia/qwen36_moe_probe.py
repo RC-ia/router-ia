@@ -13,6 +13,7 @@ LM head are deliberately left for later stages.
 """
 
 import argparse
+import gc
 from pathlib import Path
 from time import perf_counter
 
@@ -43,7 +44,6 @@ def discover_embedding_shard(root: Path) -> Path:
                 return shard
 
     for shard in sorted(root.glob("*.safetensors")):
-        # Read only keys: no tensor payload is loaded here.
         with safe_open(str(shard), framework="pt", device="cpu") as handle:
             if EMBEDDING_NAME in handle.keys():
                 return shard
@@ -76,8 +76,10 @@ def run_expert(
     expert: int,
     x: torch.Tensor,
 ) -> torch.Tensor:
-    """Run one FP8 expert using the existing cache and dequantization path."""
-    blob = cache.get(layer, expert, tier="vram")
+    """Run one FP8 expert using RAM or VRAM according to the device."""
+    tier = "vram" if x.device.type == "cuda" else "ram"
+    blob = cache.get(layer, expert, tier=tier)
+
     gate = _dequantize_blockwise(
         blob.weights["gate_proj"], blob.scales["gate_proj"]
     )
@@ -88,6 +90,8 @@ def run_expert(
         blob.weights["down_proj"], blob.scales["down_proj"]
     )
 
+    # Dequantization is allowed to create temporary CPU tensors even when the
+    # cache entry is on CUDA; transfer each matrix only for the computation.
     gate = gate.to(device=x.device)
     up = up.to(device=x.device)
     down = down.to(device=x.device)
@@ -95,7 +99,20 @@ def run_expert(
     gate_out = F.linear(x, gate)
     up_out = F.linear(x, up)
     hidden = F.silu(gate_out) * up_out
-    return F.linear(hidden, down)
+    output = F.linear(hidden, down)
+
+    # Drop temporary matrices/intermediates as soon as the expert result is
+    # materialized. This keeps peak native/CUDA memory bounded between experts.
+    del gate, up, down, gate_out, up_out, hidden
+    return output
+
+
+def cleanup_temporaries(*tensors: torch.Tensor) -> None:
+    for tensor in tensors:
+        del tensor
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def main() -> None:
@@ -105,7 +122,7 @@ def main() -> None:
     parser.add_argument("--layer", type=int, default=0)
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
-    parser.add_argument("--ram-gb", type=float, default=6.0)
+    parser.add_argument("--ram-gb", type=float, default=2.0)
     parser.add_argument("--vram-gb", type=float, default=3.0)
     args = parser.parse_args()
 
@@ -121,9 +138,12 @@ def main() -> None:
     print(f"Model: {root}")
     print(f"Layer: {args.layer}")
     print(f"Token ID: {args.token_id}")
+    print(f"Cache limits: RAM={args.ram_gb:.1f} GiB VRAM={args.vram_gb:.1f} GiB")
 
     start = perf_counter()
     x = load_embedding(root, args.token_id, args.device)
+    if args.device.startswith("cuda"):
+        torch.cuda.synchronize()
     embedding_ms = (perf_counter() - start) * 1000.0
 
     print(f"Embedding shape: {tuple(x.shape)}")
@@ -172,11 +192,14 @@ def main() -> None:
         elapsed_ms = (perf_counter() - start) * 1000.0
         total_expert_ms += elapsed_ms
         aggregate.add_(output, alpha=float(weight))
+        output_norm = torch.linalg.vector_norm(output).item()
         print(
             f"  expert={expert:3d} weight={float(weight):.8f} "
-            f"shape={tuple(output.shape)} norm={torch.linalg.vector_norm(output).item():.6f} "
+            f"shape={tuple(output.shape)} norm={output_norm:.6f} "
             f"time={elapsed_ms:.3f} ms"
         )
+        del output
+        cleanup_temporaries()
 
     print("\nAGGREGATED")
     print(f"  Shape: {tuple(aggregate.shape)}")
