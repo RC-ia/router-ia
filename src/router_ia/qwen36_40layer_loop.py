@@ -130,12 +130,7 @@ def linear_attention_step(root: Path, layer: int, x0: torch.Tensor, device: str)
 
 
 def full_attention_step(root: Path, layer: int, x0: torch.Tensor, device: str) -> torch.Tensor:
-    """Execute one-token full attention for the periodic Qwen3.6 full-attn layers.
-
-    With one token at position 0 there is no past KV cache and RoPE is an exact
-    identity (cos=1, sin=0). We nevertheless keep the head normalization,
-    grouped-query expansion, causal softmax and output gate explicit.
-    """
+    """Execute one-token full attention for periodic Qwen3.6 full-attn layers."""
     prefix = layer_prefix(layer)
     input_norm = load_layer_weight(root, layer, "input_layernorm.weight", device)
     h = rmsnorm(x0, input_norm)
@@ -160,13 +155,14 @@ def full_attention_step(root: Path, layer: int, x0: torch.Tensor, device: str) -
     q = rmsnorm(q, q_norm_w).float()
     k = rmsnorm(k, k_norm_w).float()
 
-    # Position 0: applying partial RoPE would be exactly the identity.
     k = k.repeat_interleave(FULL_NUM_KV_GROUPS, dim=1)
     v = v.repeat_interleave(FULL_NUM_KV_GROUPS, dim=1)
 
-    scores = torch.matmul(q.unsqueeze(2), k.unsqueeze(-1)).squeeze(-1) * (FULL_HEAD_DIM ** -0.5)
+    # Shapes: q=[B,H,1,D], k=[B,H,1,D], v=[B,H,1,D].
+    # For position 0 there is one causal key, so softmax has a single element.
+    scores = torch.matmul(q.unsqueeze(2), k.transpose(-1, -2)).squeeze(-2) * (FULL_HEAD_DIM ** -0.5)
     attn_weights = torch.softmax(scores.float(), dim=-1)
-    attn = torch.matmul(attn_weights.unsqueeze(2), v.unsqueeze(-1)).squeeze(-1)
+    attn = torch.matmul(attn_weights.unsqueeze(-2), v).squeeze(-2)
     attn = attn * torch.sigmoid(gate)
     attn_flat = attn.reshape(1, FULL_Q_DIM)
 
@@ -303,7 +299,6 @@ def main() -> None:
             residual = linear_attention_step(root, layer, x_before, args.device)
         else:
             residual = full_attention_step(root, layer, x_before, args.device)
-
         x, expert_ids, weights, shared_gate, moe_input_norm = moe_step(
             root, layer, residual, args.top_k, args.device
         )
