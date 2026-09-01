@@ -6,6 +6,7 @@ import re
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 from gguf import GGUFReader
 
@@ -27,20 +28,48 @@ class ExpertInfo:
 
 
 EXPERT_PATTERNS = [
-    # padrões comuns de MoE; não assumimos que todos serão usados
+    # Padrões comuns de MoE; o Qwen será validado pelos nomes reais do GGUF.
     re.compile(r"(?:blk|block)\.(\d+).*?expert.*?(\d+)", re.I),
     re.compile(r"(?:blk|block)\.(\d+).*?experts.*?(\d+)", re.I),
 ]
 
 
-def tensor_nbytes(tensor) -> int:
-    # O gguf.py expõe nbytes nas versões atuais.
-    value = getattr(tensor, "nbytes", None)
+def json_safe(value: Any) -> Any:
+    """Convert GGUF/numpy values into standard JSON-compatible Python types."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
 
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+
+    # numpy scalar types (and similar objects) usually expose item().
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return json_safe(item())
+        except (TypeError, ValueError):
+            pass
+
+    # numpy arrays / memmaps expose tolist(). This also avoids serializing
+    # the backing memmap object itself.
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        try:
+            return json_safe(tolist())
+        except (TypeError, ValueError):
+            pass
+
+    return str(value)
+
+
+def tensor_nbytes(tensor) -> int:
+    value = getattr(tensor, "nbytes", None)
     if value is not None:
         return int(value)
 
-    # Fallback conservador.
     data = getattr(tensor, "data", None)
     if data is not None:
         return int(data.nbytes)
@@ -64,7 +93,7 @@ def inspect(path: Path) -> dict:
     for key, field in reader.fields.items():
         value = getattr(field, "parts", None)
         if value:
-            metadata[key] = value[-1]
+            metadata[key] = json_safe(value[-1])
 
     tensors: list[TensorInfo] = []
     experts: dict[tuple[int, int], list[TensorInfo]] = defaultdict(list)
