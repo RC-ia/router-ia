@@ -5,11 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import struct
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
-
-from safetensors import safe_open
 
 
 EXPERT_PATTERNS = (
@@ -31,6 +30,17 @@ class TensorInfo:
     shape: list[int]
     dtype: str
     shard: str
+
+
+def _read_safetensors_header(path: Path) -> dict[str, Any]:
+    """Read the JSON header of a safetensors file."""
+    with open(path, "rb") as f:
+        size_bytes = f.read(8)
+        if len(size_bytes) < 8:
+            raise ValueError(f"Invalid safetensors file: {path}")
+        header_len = struct.unpack("<Q", size_bytes)[0]
+        header_bytes = f.read(header_len)
+        return json.loads(header_bytes.decode("utf-8"))
 
 
 def _expert_match(name: str) -> re.Match[str] | None:
@@ -77,29 +87,29 @@ def inspect(root: Path, *, show_tensors: bool = False) -> dict[str, Any]:
     scales: dict[tuple[int, int], dict[str, TensorInfo]] = {}
 
     for shard in shards:
-        # Use CPU only for header access. PySafeSlice does not expose dtype in
-        # some safetensors versions, so dtype comes from SafeOpenHandle.
-        with safe_open(str(shard), framework="pt", device="cpu") as handle:
-            for name in handle.keys():
-                sliced = handle.get_slice(name)
-                info = TensorInfo(
-                    name=name,
-                    shape=[int(x) for x in sliced.get_shape()],
-                    dtype=str(handle.get_dtype(name)),
-                    shard=shard.name,
-                )
-                tensors.append(info)
+        header = _read_safetensors_header(shard)
+        for name, meta in header.items():
+            if name == "__metadata__":
+                continue
+            # meta contains "dtype" (e.g., "F32", "BF16") and "shape" list
+            info = TensorInfo(
+                name=name,
+                shape=meta["shape"],
+                dtype=meta["dtype"],
+                shard=shard.name,
+            )
+            tensors.append(info)
 
-                match = _expert_match(name)
-                if match:
-                    key = (int(match.group("layer")), int(match.group("expert")))
-                    experts.setdefault(key, {})[match.group("kind")] = info
-                    continue
+            match = _expert_match(name)
+            if match:
+                key = (int(match.group("layer")), int(match.group("expert")))
+                experts.setdefault(key, {})[match.group("kind")] = info
+                continue
 
-                scale_match = SCALE_RE.match(name)
-                if scale_match:
-                    key = (int(scale_match.group("layer")), int(scale_match.group("expert")))
-                    scales.setdefault(key, {})[scale_match.group("kind")] = info
+            scale_match = SCALE_RE.match(name)
+            if scale_match:
+                key = (int(scale_match.group("layer")), int(scale_match.group("expert")))
+                scales.setdefault(key, {})[scale_match.group("kind")] = info
 
     layer_experts: dict[int, set[int]] = {}
     for layer, expert in experts:
