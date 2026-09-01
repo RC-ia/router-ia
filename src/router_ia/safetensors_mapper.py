@@ -76,17 +76,16 @@ def inspect(root: Path, *, show_tensors: bool = False) -> dict[str, Any]:
     experts: dict[tuple[int, int], dict[str, TensorInfo]] = {}
     scales: dict[tuple[int, int], dict[str, TensorInfo]] = {}
 
-    # Important: use device="cpu". Some installed safetensors versions do not
-    # accept device="meta". get_slice() reads only tensor metadata and does not
-    # materialize the complete tensor payload.
     for shard in shards:
+        # Use CPU only for header access. PySafeSlice does not expose dtype in
+        # some safetensors versions, so dtype comes from SafeOpenHandle.
         with safe_open(str(shard), framework="pt", device="cpu") as handle:
             for name in handle.keys():
                 sliced = handle.get_slice(name)
                 info = TensorInfo(
                     name=name,
                     shape=[int(x) for x in sliced.get_shape()],
-                    dtype=str(sliced.dtype),
+                    dtype=str(handle.get_dtype(name)),
                     shard=shard.name,
                 )
                 tensors.append(info)
