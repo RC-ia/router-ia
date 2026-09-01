@@ -10,14 +10,13 @@ from time import perf_counter
 import torch
 import torch.nn.functional as F
 
-from .qwen36_delta_sequence_probe import build_token_step
+from .qwen36_delta_sequence_probe import token_params
+from .qwen36_op_probe import HEAD_DIM, LAYER_PREFIX, NUM_V_HEADS, load_projection, load_tensor
 
 EPS = 1e-6
-NUM_V_HEADS = 32
-HEAD_DIM = 128
 
 
-def gated_rmsnorm(x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def gated_rmsnorm(x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if x.shape != z.shape:
         raise ValueError(f"x/z shape mismatch: {tuple(x.shape)} vs {tuple(z.shape)}")
     if x.ndim != 3 or x.shape[1:] != (NUM_V_HEADS, HEAD_DIM):
@@ -32,7 +31,40 @@ def gated_rmsnorm(x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor) -> tup
     normalized = (x / rms) * w
     gate = F.silu(z)
     out = normalized * gate
-    return out, normalized
+    return out, normalized, gate
+
+
+def build_inputs(root: Path, token_id: int, device: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    norm_weight = load_tensor(root, LAYER_PREFIX + "linear_attn.in_norm.weight", device=device)
+    if norm_weight.numel() != HEAD_DIM:
+        norm_weight = load_tensor(root, LAYER_PREFIX + "linear_attn.norm.weight", device=device)
+
+    a_weight = load_projection(root, LAYER_PREFIX + "linear_attn.in_proj_a", device)
+    b_weight = load_projection(root, LAYER_PREFIX + "linear_attn.in_proj_b", device)
+    a_log = load_tensor(root, LAYER_PREFIX + "linear_attn.A_log", device=device).float().reshape(1, NUM_V_HEADS)
+    dt_bias = load_tensor(root, LAYER_PREFIX + "linear_attn.dt_bias", device=device).float().reshape(1, NUM_V_HEADS)
+
+    q, k, v, beta, g, decay = token_params(root, token_id, device, norm_weight, a_weight, b_weight, a_log, dt_bias)
+    state = torch.zeros(1, NUM_V_HEADS, HEAD_DIM, HEAD_DIM, device=device, dtype=torch.float32)
+    state = state * decay.unsqueeze(-1).unsqueeze(-1)
+    retrieved = torch.einsum("bhkd,bhk->bhd", state, k)
+    delta = (v - retrieved) * beta.unsqueeze(-1)
+    state = state + k.unsqueeze(-1) * delta.unsqueeze(-2)
+    attn = torch.einsum("bhkd,bhk->bhd", state, q)
+
+    z_weight = load_projection(root, LAYER_PREFIX + "linear_attn.in_proj_z", device)
+    # token_params already has the correctly normalized hidden available only internally,
+    # so rebuild it here from the embedding-normalized input used by the projections.
+    from .qwen36_op_probe import load_embedding_row, rmsnorm
+    h = rmsnorm(load_embedding_row(root, token_id).to(device), norm_weight)
+    z = F.linear(h.float(), z_weight.float()).reshape(1, NUM_V_HEADS, HEAD_DIM)
+    out_norm_weight = load_tensor(root, LAYER_PREFIX + "linear_attn.norm.weight", device=device)
+
+    del q, k, v, beta, g, decay, state, retrieved, delta, norm_weight, a_weight, b_weight, a_log, dt_bias, z_weight, h
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    return attn, z, out_norm_weight
 
 
 def main() -> None:
@@ -46,10 +78,7 @@ def main() -> None:
         raise SystemExit("CUDA unavailable")
 
     root = args.root.resolve()
-    step = build_token_step(root, args.token_id, args.device)
-    attn = step["delta_output"]
-    z = step["z"]
-    norm_weight = step["norm_weight"]
+    attn, z, norm_weight = build_inputs(root, args.token_id, args.device)
 
     print("op=gated_rmsnorm")
     print(f"token id: {args.token_id}")
@@ -58,7 +87,7 @@ def main() -> None:
     print(f"norm weight shape: {tuple(norm_weight.shape)}")
 
     start = perf_counter()
-    out, normalized = gated_rmsnorm(attn, z, norm_weight)
+    out, normalized, gate = gated_rmsnorm(attn, z, norm_weight)
     if args.device == "cuda":
         torch.cuda.synchronize()
     elapsed_ms = (perf_counter() - start) * 1000.0
@@ -73,12 +102,12 @@ def main() -> None:
 
     show("attention input", attn)
     show("z", z)
-    show("silu(z)", F.silu(z))
+    show("silu(z)", gate)
     show("normalized", normalized)
     show("gated rmsnorm output", out)
     print(f"op=gated_rmsnorm time={elapsed_ms:.3f} ms")
 
-    del step, attn, z, norm_weight, out, normalized
+    del attn, z, norm_weight, out, normalized, gate
     gc.collect()
     if args.device == "cuda":
         torch.cuda.empty_cache()
