@@ -216,9 +216,7 @@ class ExpertCache:
             handle.seek(part.offset)
             data = handle.read(part.size)
         if len(data) != part.size:
-            raise IOError(
-                f"Short read for {part.tensor}: expected {part.size}, got {len(data)}"
-            )
+            raise IOError(f"Short read for {part.tensor}: expected {part.size}, got {len(data)}")
         return data
 
     def _load_blob(self, key: ExpertKey) -> ExpertBlob:
@@ -249,7 +247,6 @@ class ExpertCache:
             self.stats.ram_evictions += 1
 
     def _evict_vram(self, required: int = 0) -> None:
-        """Evict LRU VRAM experts; their CPU copy stays in RAM when possible."""
         while self.vram and self.vram_used + required > self.vram_limit:
             key, entry = self.vram.popitem(last=False)
             self.vram_used -= entry.size
@@ -260,7 +257,6 @@ class ExpertCache:
                 self.stats.vram_to_ram += 1
                 continue
 
-            # Defensive fallback if the CPU copy was evicted independently.
             blob = self._load_blob(key)
             self._evict_ram(blob.size)
             if blob.size <= self.ram_limit:
@@ -277,7 +273,6 @@ class ExpertCache:
 
         self.stats.ram_misses += 1
         blob = self._load_blob(key)
-        # Do not evict RAM copies of experts currently resident in VRAM.
         self._evict_ram(blob.size, protected=set(self.vram.keys()))
         if blob.size <= self.ram_limit:
             self.ram[key] = CacheEntry(key=key, blob=blob, size=blob.size)
@@ -285,7 +280,6 @@ class ExpertCache:
         return blob
 
     def promote_to_vram(self, layer: int, expert: int) -> ExpertBlob:
-        """Promote one quantized expert from RAM to CUDA VRAM."""
         if not self.device.startswith("cuda") or torch is None:
             raise RuntimeError("VRAM promotion requires a CUDA device")
 
@@ -305,8 +299,9 @@ class ExpertCache:
 
         self._evict_vram(cpu_blob.size)
 
+        # bytearray makes the buffer writable and avoids PyTorch's warning.
         cuda_slices = {
-            kind: torch.frombuffer(memoryview(data), dtype=torch.uint8).clone().to(self.device)
+            kind: torch.frombuffer(bytearray(data), dtype=torch.uint8).to(self.device)
             for kind, data in cpu_blob.slices.items()
         }
         cuda_blob = ExpertBlob(
@@ -332,7 +327,6 @@ class ExpertCache:
         raise ValueError("tier must be 'ram' or 'vram'")
 
     def access_sequence(self, sequence: Iterable[ExpertKey], *, tier: str = "vram") -> None:
-        """Access experts in order and print residency changes."""
         for key in sequence:
             before = set(self.vram.keys())
             self.access(*key, tier=tier)
