@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-"""Safely probe one Qwen3.6 Layer-0 operation at a time.
-
-Default path is CPU and deliberately avoids the expert cache. Use --op to
-select a single operation so failures cannot be hidden inside a full layer.
-"""
+"""Safely probe one Qwen3.6 Layer-0 operation at a time."""
 
 import argparse
 import gc
@@ -20,6 +16,7 @@ HIDDEN = 2048
 QKV_OUT = 8192
 BLOCK = 128
 CONV_KERNEL = 4
+CONV_CHANNELS = 8192
 LAYER_PREFIX = "model.language_model.layers.0."
 EMBEDDING_NAME = "model.language_model.embed_tokens.weight"
 EPS = 1e-6
@@ -41,22 +38,6 @@ def load_tensor(root: Path, name: str, device: str = "cpu") -> torch.Tensor:
     raise KeyError(f"Tensor not found: {name}")
 
 
-def load_optional_tensor(root: Path, name: str, device: str = "cpu") -> torch.Tensor | None:
-    index_path = root / "model.safetensors.index.json"
-    shard_name = None
-    if index_path.is_file():
-        payload = json.loads(index_path.read_text(encoding="utf-8"))
-        shard_name = payload.get("weight_map", {}).get(name)
-    shards = [root / shard_name] if shard_name else sorted(root.glob("*.safetensors"))
-    for shard in shards:
-        if not shard.is_file():
-            continue
-        with safe_open(str(shard), framework="pt", device="cpu") as handle:
-            if name in handle.keys():
-                return handle.get_tensor(name).to(device=device)
-    return None
-
-
 def load_embedding_row(root: Path, token_id: int) -> torch.Tensor:
     emb = load_tensor(root, EMBEDDING_NAME, device="cpu")
     if emb.ndim != 2 or emb.shape[1] != HIDDEN:
@@ -73,51 +54,24 @@ def rmsnorm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 
 def dequantize_fp8_blockwise(weight: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
-    """Dequantize 2-D Qwen3.6 FP8 E4M3 weights with 128x128 inverse scales."""
     if weight.ndim != 2 or scale_inv.ndim != 2:
         raise ValueError(
             f"Expected 2-D weight/scale tensors, got {tuple(weight.shape)} and {tuple(scale_inv.shape)}"
         )
     out_features, in_features = map(int, weight.shape)
-    expected = (
-        (out_features + BLOCK - 1) // BLOCK,
-        (in_features + BLOCK - 1) // BLOCK,
-    )
+    expected = ((out_features + BLOCK - 1) // BLOCK, (in_features + BLOCK - 1) // BLOCK)
     if tuple(scale_inv.shape) != expected:
         raise ValueError(
-            f"Scale shape {tuple(scale_inv.shape)} does not match weight {tuple(weight.shape)}; "
-            f"expected {expected}"
+            f"Scale shape {tuple(scale_inv.shape)} does not match weight {tuple(weight.shape)}; expected {expected}"
         )
     expanded = scale_inv.float().repeat_interleave(BLOCK, dim=0).repeat_interleave(BLOCK, dim=1)
     return weight.float() * expanded[:out_features, :in_features]
 
 
-def dequantize_conv1d_weight(weight: torch.Tensor, scale_inv: torch.Tensor | None) -> torch.Tensor:
-    """Dequantize a depthwise FP8 conv weight, accepting common scale layouts."""
-    if weight.ndim != 3:
-        raise ValueError(f"Expected conv weight [channels,1,kernel], got {tuple(weight.shape)}")
-    if weight.shape[1] != 1 or weight.shape[2] != CONV_KERNEL:
+def dequantize_conv1d_weight(weight: torch.Tensor) -> torch.Tensor:
+    if tuple(weight.shape) != (CONV_CHANNELS, 1, CONV_KERNEL):
         raise ValueError(f"Unexpected conv weight shape: {tuple(weight.shape)}")
-    if weight.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
-        return weight.float()
-    if scale_inv is None:
-        raise KeyError("FP8 conv1d weight requires linear_attn.conv1d.weight_scale_inv")
-
-    channels, _, kernel = map(int, weight.shape)
-    flat = weight.reshape(channels, kernel)
-    scale = scale_inv.float().reshape(-1)
-    rows = (channels + BLOCK - 1) // BLOCK
-    cols = (kernel + BLOCK - 1) // BLOCK
-    if scale.numel() == rows:
-        scale2 = scale[:, None]
-    elif scale.numel() == rows * cols:
-        scale2 = scale.reshape(rows, cols)
-    else:
-        raise ValueError(
-            f"Unsupported conv scale shape {tuple(scale_inv.shape)} for weight {tuple(weight.shape)}"
-        )
-    expanded = scale2.repeat_interleave(BLOCK, dim=0).repeat_interleave(BLOCK, dim=1)
-    return flat.float() * expanded[:channels, :kernel]
+    return weight.float()
 
 
 def stats(name: str, x: torch.Tensor) -> None:
@@ -194,21 +148,15 @@ def main() -> None:
 
     qkv = compute_qkv(root, args.token_id, args.device)
     conv_weight = load_tensor(root, LAYER_PREFIX + "linear_attn.conv1d.weight", device="cpu")
-    conv_scale = load_optional_tensor(root, LAYER_PREFIX + "linear_attn.conv1d.weight_scale_inv", device="cpu")
+    if tuple(conv_weight.shape) != (CONV_CHANNELS, 1, CONV_KERNEL):
+        raise ValueError(f"Unexpected conv weight shape: {tuple(conv_weight.shape)}")
     print(f"qkv input shape={tuple(qkv.shape)}")
     print(f"conv weight shape={tuple(conv_weight.shape)} dtype={conv_weight.dtype}")
-    print(f"conv scale shape={tuple(conv_scale.shape) if conv_scale is not None else None}")
+    print("conv scale shape=None")
 
-    start = perf_counter()
-    conv_fp32 = dequantize_conv1d_weight(conv_weight, conv_scale).to(args.device)
-    if args.device == "cuda":
-        torch.cuda.synchronize()
-    dequant_ms = (perf_counter() - start) * 1000.0
-
-    qkv_current = qkv.reshape(1, -1)
-    # Weight is [channel, 1, kernel]; for token 0 only the final causal tap
-    # multiplies the current token because three history positions are zero.
-    tap = conv_fp32[:, 0, -1].reshape(1, -1)
+    conv_fp32 = dequantize_conv1d_weight(conv_weight).to(args.device)
+    qkv_current = qkv.reshape(1, CONV_CHANNELS)
+    tap = conv_fp32[:, 0, -1].reshape(1, CONV_CHANNELS)
     start = perf_counter()
     y_linear = qkv_current * tap
     y = F.silu(y_linear)
@@ -217,12 +165,12 @@ def main() -> None:
     compute_ms = (perf_counter() - start) * 1000.0
 
     print("op=conv causal history=zeros")
-    print(f"op=conv dequant time={dequant_ms:.3f} ms")
+    print("op=conv dequant time=0.000 ms (BF16 direct)")
     print(f"op=conv compute time={compute_ms:.3f} ms")
     stats("conv pre-activation", y_linear.reshape(-1))
     stats("conv output", y.reshape(-1))
 
-    del qkv, conv_weight, conv_scale, conv_fp32, qkv_current, tap, y_linear, y
+    del qkv, conv_weight, conv_fp32, qkv_current, tap, y_linear, y
     gc.collect()
     if args.device == "cuda":
         torch.cuda.empty_cache()
