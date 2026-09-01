@@ -1,15 +1,6 @@
 from __future__ import annotations
 
-"""Run one packed Qwen3.6 expert as an isolated experiment.
-
-The cache keeps quantized GGUF bytes. This runner is the first bridge to
-actual math:
-
-    GGUF -> ExpertCache -> ggml dequantization -> FP32 matrices -> CUDA GEMM
-
-It intentionally runs one expert only. It is not the full model executor.
-Dequantization is delegated to exported ggml row-dequantization functions.
-"""
+"""Run one packed Qwen3.6 expert as an isolated experiment."""
 
 import argparse
 import ctypes
@@ -22,10 +13,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .expert_cache import ExpertCache
+try:
+    from .expert_cache import ExpertCache
+except ImportError:  # Allows: python expert_runner.py ...
+    from expert_cache import ExpertCache
 
 
-# Current GGML enum values: IQ3_XXS=18 and IQ4_XS=23.
 TYPE_IQ3_XXS = 18
 TYPE_IQ4_XS = 23
 EXPERT_INPUT = 2048
@@ -37,17 +30,13 @@ class GGMLDequantizer:
     def __init__(self, dll_path: Path | None = None) -> None:
         self.dll_path = dll_path or self._find_dll()
         if self.dll_path is None:
-            raise FileNotFoundError(
-                "ggml.dll was not found. Pass --ggml-dll PATH."
-            )
+            raise FileNotFoundError("ggml.dll was not found. Pass --ggml-dll PATH.")
         self.dll_path = self.dll_path.resolve()
-
         if os.name == "nt":
             try:
                 os.add_dll_directory(str(self.dll_path.parent))
             except (AttributeError, FileNotFoundError, OSError):
                 pass
-
         self.lib = ctypes.CDLL(str(self.dll_path))
         self.functions: dict[int, Callable[..., None]] = {}
         self._bind(TYPE_IQ3_XXS, "dequantize_row_iq3_xxs")
@@ -57,9 +46,11 @@ class GGMLDequantizer:
     def _find_dll() -> Path | None:
         candidates: list[Path] = []
         for root in (Path.cwd(), Path(__file__).resolve().parent):
-            candidates.extend(
-                [root / "ggml.dll", root / "ggml-base.dll", root / "llama.dll"]
-            )
+            candidates.extend([
+                root / "ggml.dll",
+                root / "ggml-base.dll",
+                root / "llama.dll",
+            ])
         return next((p for p in candidates if p.is_file()), None)
 
     def _bind(self, type_id: int, symbol: str) -> None:
@@ -69,7 +60,6 @@ class GGMLDequantizer:
             raise RuntimeError(
                 f"{symbol} is not exported by {self.dll_path}."
             ) from exc
-
         function.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(ctypes.c_float),
@@ -83,7 +73,6 @@ class GGMLDequantizer:
             function = self.functions[type_id]
         except KeyError as exc:
             raise ValueError(f"Unsupported GGML type id: {type_id}") from exc
-
         output = np.empty(elements, dtype=np.float32)
         source = ctypes.create_string_buffer(raw)
         function(
@@ -103,7 +92,6 @@ def dequantized_matrix(
     """Dequantize one expert slice to its logical 2D matrix."""
     if len(packed_shape) != 3 or packed_shape[2] != 256:
         raise ValueError(f"Unexpected expert tensor shape: {packed_shape}")
-
     shape = (packed_shape[0], packed_shape[1])
     elements = shape[0] * shape[1]
     values = dequantizer.dequantize(raw, int(dtype), elements)
@@ -127,32 +115,21 @@ def run_one_expert(
         vram_limit_bytes=int(vram_gb * 1024**3),
         device=device,
     )
-
     parts = cache.index.get(layer, expert)
     cpu_blob = cache.get_cpu(layer, expert)
-
-    # Exercise RAM -> VRAM residency before doing any math.
     if device.startswith("cuda"):
         cache.get_vram(layer, expert)
 
     dequantizer = GGMLDequantizer(ggml_dll)
-
     start = perf_counter()
-    gate = dequantized_matrix(
-        dequantizer, cpu_blob.slices["gate"], parts["gate"].dtype, parts["gate"].shape
-    )
-    up = dequantized_matrix(
-        dequantizer, cpu_blob.slices["up"], parts["up"].dtype, parts["up"].shape
-    )
-    down = dequantized_matrix(
-        dequantizer, cpu_blob.slices["down"], parts["down"].dtype, parts["down"].shape
-    )
+    gate = dequantized_matrix(dequantizer, cpu_blob.slices["gate"], parts["gate"].dtype, parts["gate"].shape)
+    up = dequantized_matrix(dequantizer, cpu_blob.slices["up"], parts["up"].dtype, parts["up"].shape)
+    down = dequantized_matrix(dequantizer, cpu_blob.slices["down"], parts["down"].dtype, parts["down"].shape)
     dequant_ms = (perf_counter() - start) * 1000.0
 
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
     x = torch.randn(EXPERT_INPUT, generator=generator, dtype=torch.float32)
-
     gate = gate.to(device)
     up = up.to(device)
     down = down.to(device)
@@ -161,13 +138,10 @@ def run_one_expert(
     if device.startswith("cuda"):
         torch.cuda.synchronize()
     start = perf_counter()
-
-    # Logical expert projections for shapes [2048, 512], [2048, 512], [512, 2048].
     gate_out = x @ gate
     up_out = x @ up
     hidden = F.silu(gate_out) * up_out
     output = hidden @ down
-
     if device.startswith("cuda"):
         torch.cuda.synchronize()
     compute_ms = (perf_counter() - start) * 1000.0
@@ -200,7 +174,6 @@ def main() -> None:
 
     if args.device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("CUDA is unavailable in this Python environment.")
-
     run_one_expert(
         args.model,
         args.layer,
