@@ -18,6 +18,7 @@ from safetensors import safe_open
 
 HIDDEN = 2048
 QKV_OUT = 8192
+BLOCK = 128
 LAYER_PREFIX = "model.language_model.layers.0."
 EMBEDDING_NAME = "model.language_model.embed_tokens.weight"
 EPS = 1e-6
@@ -54,6 +55,26 @@ def rmsnorm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS) * (1.0 + w)
 
 
+def dequantize_fp8_blockwise(weight: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
+    """Dequantize Qwen3.6 fine-grained FP8 using 128x128 inverse scales."""
+    if weight.ndim != 2 or scale_inv.ndim != 2:
+        raise ValueError(
+            f"Expected 2-D weight/scale tensors, got {tuple(weight.shape)} and {tuple(scale_inv.shape)}"
+        )
+    out_features, in_features = map(int, weight.shape)
+    expected = (
+        (out_features + BLOCK - 1) // BLOCK,
+        (in_features + BLOCK - 1) // BLOCK,
+    )
+    if tuple(scale_inv.shape) != expected:
+        raise ValueError(
+            f"Scale shape {tuple(scale_inv.shape)} does not match weight {tuple(weight.shape)}; "
+            f"expected {expected}"
+        )
+    expanded = scale_inv.float().repeat_interleave(BLOCK, dim=0).repeat_interleave(BLOCK, dim=1)
+    return weight.float() * expanded[:out_features, :in_features]
+
+
 def stats(name: str, x: torch.Tensor) -> None:
     y = x.detach().float().cpu()
     print(f"{name}: shape={tuple(x.shape)} dtype={x.dtype} norm={torch.linalg.vector_norm(y).item():.8f} mean={y.mean().item():.8f} std={y.std().item():.8f}")
@@ -86,17 +107,29 @@ def main() -> None:
 
     x = load_embedding_row(root, args.token_id).to(args.device)
     norm_weight = load_tensor(root, LAYER_PREFIX + "input_layernorm.weight", device=args.device)
-    qkv_weight = load_tensor(root, LAYER_PREFIX + "linear_attn.in_proj_qkv.weight", device=args.device)
+    qkv_weight = load_tensor(root, LAYER_PREFIX + "linear_attn.in_proj_qkv.weight", device="cpu")
+    qkv_scale = load_tensor(root, LAYER_PREFIX + "linear_attn.in_proj_qkv.weight_scale_inv", device="cpu")
     h = rmsnorm(x, norm_weight)
     stats("norm input", h)
     print(f"qkv weight shape={tuple(qkv_weight.shape)} dtype={qkv_weight.dtype}")
+    print(f"qkv scale shape={tuple(qkv_scale.shape)} dtype={qkv_scale.dtype}")
+
     start = perf_counter()
-    y = F.linear(h.float(), qkv_weight.float())
+    qkv_fp32 = dequantize_fp8_blockwise(qkv_weight, qkv_scale).to(args.device)
     if args.device == "cuda":
         torch.cuda.synchronize()
-    print(f"op=qkv time={(perf_counter()-start)*1000:.3f} ms")
+    dequant_ms = (perf_counter() - start) * 1000.0
+
+    start = perf_counter()
+    y = F.linear(h.float(), qkv_fp32.float())
+    if args.device == "cuda":
+        torch.cuda.synchronize()
+    compute_ms = (perf_counter() - start) * 1000.0
+    print(f"op=qkv dequant time={dequant_ms:.3f} ms")
+    print(f"op=qkv compute time={compute_ms:.3f} ms")
     stats("qkv output", y)
-    del x, norm_weight, qkv_weight, h, y
+
+    del x, norm_weight, qkv_weight, qkv_scale, h, qkv_fp32, y
     gc.collect()
     if args.device == "cuda":
         torch.cuda.empty_cache()
