@@ -17,6 +17,11 @@ QKV_OUT = 8192
 BLOCK = 128
 CONV_KERNEL = 4
 CONV_CHANNELS = 8192
+NUM_K_HEADS = 16
+NUM_V_HEADS = 32
+HEAD_DIM = 128
+KEY_DIM = NUM_K_HEADS * HEAD_DIM
+VALUE_DIM = NUM_V_HEADS * HEAD_DIM
 LAYER_PREFIX = "model.language_model.layers.0."
 EMBEDDING_NAME = "model.language_model.embed_tokens.weight"
 EPS = 1e-6
@@ -94,11 +99,37 @@ def compute_qkv(root: Path, token_id: int, device: str) -> torch.Tensor:
     return y
 
 
+def compute_conv(root: Path, token_id: int, device: str) -> torch.Tensor:
+    qkv = compute_qkv(root, token_id, device)
+    conv_weight = load_tensor(root, LAYER_PREFIX + "linear_attn.conv1d.weight", device="cpu")
+    if tuple(conv_weight.shape) != (CONV_CHANNELS, 1, CONV_KERNEL):
+        raise ValueError(f"Unexpected conv weight shape: {tuple(conv_weight.shape)}")
+    conv = conv_weight.float().to(device)
+    tap = conv[:, 0, -1].reshape(1, CONV_CHANNELS)
+    y = F.silu(qkv.reshape(1, CONV_CHANNELS) * tap).reshape(CONV_CHANNELS)
+    if device == "cuda":
+        torch.cuda.synchronize()
+    del qkv, conv_weight, conv, tap
+    return y
+
+
+def split_qkv(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if x.numel() != QKV_OUT:
+        raise ValueError(f"Expected {QKV_OUT} QKV values, got {x.numel()}")
+    q, k, v = torch.split(x.reshape(-1), [KEY_DIM, KEY_DIM, VALUE_DIM], dim=0)
+    q = q.reshape(1, NUM_K_HEADS, HEAD_DIM)
+    k = k.reshape(1, NUM_K_HEADS, HEAD_DIM)
+    v = v.reshape(1, NUM_V_HEADS, HEAD_DIM)
+    q32 = q.repeat_interleave(NUM_V_HEADS // NUM_K_HEADS, dim=1)
+    k32 = k.repeat_interleave(NUM_V_HEADS // NUM_K_HEADS, dim=1)
+    return q, k, v, q32, k32
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Qwen3.6 isolated Layer-0 operation probe")
     parser.add_argument("root", type=Path)
     parser.add_argument("--token-id", type=int, default=0)
-    parser.add_argument("--op", choices=("norm", "qkv", "conv"), default="qkv")
+    parser.add_argument("--op", choices=("norm", "qkv", "conv", "split"), default="qkv")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     args = parser.parse_args()
 
@@ -146,31 +177,60 @@ def main() -> None:
             torch.cuda.empty_cache()
         return
 
-    qkv = compute_qkv(root, args.token_id, args.device)
-    conv_weight = load_tensor(root, LAYER_PREFIX + "linear_attn.conv1d.weight", device="cpu")
-    if tuple(conv_weight.shape) != (CONV_CHANNELS, 1, CONV_KERNEL):
-        raise ValueError(f"Unexpected conv weight shape: {tuple(conv_weight.shape)}")
-    print(f"qkv input shape={tuple(qkv.shape)}")
-    print(f"conv weight shape={tuple(conv_weight.shape)} dtype={conv_weight.dtype}")
-    print("conv scale shape=None")
+    if args.op == "conv":
+        qkv = compute_qkv(root, args.token_id, args.device)
+        conv_weight = load_tensor(root, LAYER_PREFIX + "linear_attn.conv1d.weight", device="cpu")
+        if tuple(conv_weight.shape) != (CONV_CHANNELS, 1, CONV_KERNEL):
+            raise ValueError(f"Unexpected conv weight shape: {tuple(conv_weight.shape)}")
+        print(f"qkv input shape={tuple(qkv.shape)}")
+        print(f"conv weight shape={tuple(conv_weight.shape)} dtype={conv_weight.dtype}")
+        print("conv scale shape=None")
 
-    conv_fp32 = dequantize_conv1d_weight(conv_weight).to(args.device)
-    qkv_current = qkv.reshape(1, CONV_CHANNELS)
-    tap = conv_fp32[:, 0, -1].reshape(1, CONV_CHANNELS)
+        conv_fp32 = dequantize_conv1d_weight(conv_weight).to(args.device)
+        qkv_current = qkv.reshape(1, CONV_CHANNELS)
+        tap = conv_fp32[:, 0, -1].reshape(1, CONV_CHANNELS)
+        start = perf_counter()
+        y_linear = qkv_current * tap
+        y = F.silu(y_linear)
+        if args.device == "cuda":
+            torch.cuda.synchronize()
+        compute_ms = (perf_counter() - start) * 1000.0
+
+        print("op=conv causal history=zeros")
+        print("op=conv dequant time=0.000 ms (BF16 direct)")
+        print(f"op=conv compute time={compute_ms:.3f} ms")
+        stats("conv pre-activation", y_linear.reshape(-1))
+        stats("conv output", y.reshape(-1))
+
+        del qkv, conv_weight, conv_fp32, qkv_current, tap, y_linear, y
+        gc.collect()
+        if args.device == "cuda":
+            torch.cuda.empty_cache()
+        return
+
+    conv = compute_conv(root, args.token_id, args.device)
     start = perf_counter()
-    y_linear = qkv_current * tap
-    y = F.silu(y_linear)
+    q, k, v, q32, k32 = split_qkv(conv)
     if args.device == "cuda":
         torch.cuda.synchronize()
-    compute_ms = (perf_counter() - start) * 1000.0
+    split_ms = (perf_counter() - start) * 1000.0
 
-    print("op=conv causal history=zeros")
-    print("op=conv dequant time=0.000 ms (BF16 direct)")
-    print(f"op=conv compute time={compute_ms:.3f} ms")
-    stats("conv pre-activation", y_linear.reshape(-1))
-    stats("conv output", y.reshape(-1))
+    print("op=split")
+    print(f"input shape: {tuple(conv.shape)}")
+    print(f"Q shape: {tuple(q.shape)}")
+    print(f"K shape: {tuple(k.shape)}")
+    print(f"V shape: {tuple(v.shape)}")
+    print(f"Q expanded shape: {tuple(q32.shape)}")
+    print(f"K expanded shape: {tuple(k32.shape)}")
+    print(f"split/reshape time: {split_ms:.3f} ms")
+    print(f"Q norm: {torch.linalg.vector_norm(q).item():.8f}")
+    print(f"K norm: {torch.linalg.vector_norm(k).item():.8f}")
+    print(f"V norm: {torch.linalg.vector_norm(v).item():.8f}")
+    print(f"Q expanded norm: {torch.linalg.vector_norm(q32).item():.8f}")
+    print(f"K expanded norm: {torch.linalg.vector_norm(k32).item():.8f}")
+    print("head configuration: Q/K=16x128 -> expanded to 32 heads; V=32x128")
 
-    del qkv, conv_weight, conv_fp32, qkv_current, tap, y_linear, y
+    del conv, q, k, v, q32, k32
     gc.collect()
     if args.device == "cuda":
         torch.cuda.empty_cache()
