@@ -1,4 +1,4 @@
-from __future__
+from __future__ import annotations
 
 """Execute the Qwen3.6 Layer-0 shared expert in isolation."""
 
@@ -10,24 +10,27 @@ from time import perf_counter
 import torch
 import torch.nn.functional as F
 
-from .qwen36_moe8_probe import build_moe_input, load_expert_projection
-from .qwen36_op_probe import load_tensor
+from .qwen36_moe8_probe import build_moe_input
+from .qwen36_op_probe import dequantize_fp8_blockwise, load_tensor
 
 HIDDEN = 2048
 DEFAULT_LAYER = 0
 
 
 def load_shared_projection(root: Path, layer: int, kind: str, device: str) -> torch.Tensor:
+    """Load one shared-expert projection directly from its model tensor names."""
     prefix = f"model.language_model.layers.{layer}.mlp.shared_expert.{kind}"
-    try:
-        return load_expert_projection(root, layer, 0, f"shared_expert.{kind}", device)
-    except KeyError:
-        weight = load_tensor(root, prefix + ".weight", device="cpu")
-        if weight.ndim != 2:
-            raise ValueError(f"Unexpected shared expert {kind} weight shape: {tuple(weight.shape)}")
+    weight = load_tensor(root, prefix + ".weight", device="cpu")
+    if weight.ndim != 2:
+        raise ValueError(f"Unexpected shared expert {kind} weight shape: {tuple(weight.shape)}")
+    if weight.dtype == torch.float8_e4m3fn:
+        scale = load_tensor(root, prefix + ".weight_scale_inv", device="cpu")
+        out = dequantize_fp8_blockwise(weight, scale).to(device)
+        del scale
+    else:
         out = weight.float().to(device)
-        del weight
-        return out
+    del weight
+    return out
 
 
 def main() -> None:
