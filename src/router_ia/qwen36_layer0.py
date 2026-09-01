@@ -20,7 +20,7 @@ from safetensors import safe_open
 
 from .fp8_expert_cache import FP8ExpertCache
 from .fp8_expert_runner import _dequantize_blockwise
-from .qwen36_moe_probe import discover_embedding_shard, load_embedding
+from .qwen36_moe_probe import load_embedding
 from .qwen36_router import DEFAULT_HIDDEN_SIZE, route
 
 EPS = 1e-6
@@ -34,7 +34,6 @@ VALUE_DIM = NUM_V_HEADS * V_HEAD_DIM
 CONV_DIM = KEY_DIM * 2 + VALUE_DIM
 CONV_KERNEL = 4
 MOE_INTERMEDIATE = 512
-EMBEDDING_NAME = "model.language_model.embed_tokens.weight"
 LAYER_PREFIX = "model.language_model.layers.0."
 
 
@@ -61,9 +60,21 @@ def _rmsnorm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 
 def _gated_rmsnorm(x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Apply gated RMSNorm over the value-head dimension.
+
+    Qwen3.6's linear-attention norm has one scale value per V head channel
+    (128 values), while the attention output has shape [batch, 32, 128].
+    Normalizing the flattened 4096-vector would apply the wrong axes.
+    """
+    if x.shape != z.shape:
+        raise ValueError(f"gated RMSNorm x/z shape mismatch: {tuple(x.shape)} vs {tuple(z.shape)}")
+    if x.ndim < 2 or x.shape[-1] != weight.numel():
+        raise ValueError(
+            f"gated RMSNorm expected last dim {weight.numel()}, got {tuple(x.shape)}"
+        )
     y = x.float()
     y = y * torch.rsqrt(y.pow(2).mean(dim=-1, keepdim=True) + EPS)
-    y = y * weight.float()
+    y = y * weight.float().reshape((1,) * (y.ndim - 1) + (weight.numel(),))
     return y * F.silu(z.float())
 
 
@@ -96,14 +107,12 @@ def _gated_delta_first_token(
     decay = torch.exp(g.float()).view(1, NUM_V_HEADS, 1, 1)
     b = beta.float().sigmoid().view(1, NUM_V_HEADS, 1)
 
-    # First token starts from an all-zero recurrent state.
     state = torch.zeros(
         1, NUM_V_HEADS, K_HEAD_DIM, V_HEAD_DIM,
         dtype=torch.float32,
         device=value.device,
     )
     state = state * decay
-    # delta = v - state @ k = v for zero state.
     delta = v - torch.zeros_like(v)
     delta = delta * b
     state = state + k.unsqueeze(-1) * delta.unsqueeze(-2)
@@ -182,8 +191,8 @@ def run_layer0(root: Path, token_id: int, device: str, ram_gb: float, vram_gb: f
     g = -tensors["linear_attn.A_log"].float().exp() * F.softplus(a.float() + tensors["linear_attn.dt_bias"].float())
 
     attn = _gated_delta_first_token(q, k, v, g, b)
-    attn = _gated_rmsnorm(attn.reshape(1, VALUE_DIM), z.reshape(1, VALUE_DIM), tensors["linear_attn.norm.weight"])
-    mixer_out = _linear(attn, tensors["linear_attn.out_proj.weight"]).reshape(HIDDEN)
+    attn = _gated_rmsnorm(attn, z, tensors["linear_attn.norm.weight"])
+    mixer_out = _linear(attn.reshape(1, VALUE_DIM), tensors["linear_attn.out_proj.weight"]).reshape(HIDDEN)
     residual = x0 + mixer_out
 
     moe_in = _rmsnorm(residual, tensors["post_attention_layernorm.weight"])
