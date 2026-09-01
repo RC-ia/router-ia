@@ -35,9 +35,8 @@ def gated_rmsnorm(x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor) -> tup
 
 
 def build_inputs(root: Path, token_id: int, device: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    norm_weight = load_tensor(root, LAYER_PREFIX + "linear_attn.in_norm.weight", device=device)
-    if norm_weight.numel() != HEAD_DIM:
-        norm_weight = load_tensor(root, LAYER_PREFIX + "linear_attn.norm.weight", device=device)
+    # The checkpoint uses linear_attn.norm.weight for the post-Delta Gated RMSNorm.
+    norm_weight = load_tensor(root, LAYER_PREFIX + "input_layernorm.weight", device=device)
 
     a_weight = load_projection(root, LAYER_PREFIX + "linear_attn.in_proj_a", device)
     b_weight = load_projection(root, LAYER_PREFIX + "linear_attn.in_proj_b", device)
@@ -53,8 +52,6 @@ def build_inputs(root: Path, token_id: int, device: str) -> tuple[torch.Tensor, 
     attn = torch.einsum("bhkd,bhk->bhd", state, q)
 
     z_weight = load_projection(root, LAYER_PREFIX + "linear_attn.in_proj_z", device)
-    # token_params already has the correctly normalized hidden available only internally,
-    # so rebuild it here from the embedding-normalized input used by the projections.
     from .qwen36_op_probe import load_embedding_row, rmsnorm
     h = rmsnorm(load_embedding_row(root, token_id).to(device), norm_weight)
     z = F.linear(h.float(), z_weight.float()).reshape(1, NUM_V_HEADS, HEAD_DIM)
