@@ -8,15 +8,13 @@ post-attention LayerNorm, router weights, shared-expert weights/scales, and the
 shared-expert gate. Routed expert IDs are still determined by the real router;
 no prediction or approximation is used.
 
-The prefetched objects remain as raw CPU tensors. They are consumed by the
-normal MoE path and removed from the prefetch cache, keeping the memory budget
-small. A single worker is used to avoid unsafe concurrent access to the
-Safetensors handle store.
+Prefetched tensors are one-shot per layer: once the layer's MoE has consumed
+its guaranteed tensors, the temporary RAM cache is cleared immediately.
 """
 
 import atexit
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import torch
@@ -32,13 +30,10 @@ _executor = ThreadPoolExecutor(
 )
 _prefetch_lock = threading.Lock()
 _prefetch_cache: dict[tuple[Path, str], torch.Tensor] = {}
-_prefetch_futures: dict[tuple[Path, str], object] = {}
+_prefetch_futures: dict[tuple[Path, str], Future[torch.Tensor]] = {}
 
-
-# Keep the optimized persistent reader as the underlying source. The wrapper
-# below adds only a small RAM cache for tensors that are certain to be consumed
-# by the current layer's MoE block.
 _original_load_tensor = optimized._cached_load_tensor
+_original_moe_step = base.moe_step
 
 
 def _key(root: Path, name: str) -> tuple[Path, str]:
@@ -57,8 +52,8 @@ def _prefetch_one(root: Path, name: str) -> torch.Tensor:
 def _load_tensor(root: Path, name: str, device: str = "cpu") -> torch.Tensor:
     key = _key(root, name)
     with _prefetch_lock:
-        future = _prefetch_futures.get(key)
         cached = _prefetch_cache.get(key)
+        future = _prefetch_futures.get(key)
 
     if cached is None and future is not None:
         cached = future.result()
@@ -66,9 +61,6 @@ def _load_tensor(root: Path, name: str, device: str = "cpu") -> torch.Tensor:
     if cached is None:
         return _original_load_tensor(root, name, device=device)
 
-    # Consumption is one-shot. The normal code may request the same tensor
-    # more than once within a layer, so only remove it when explicitly told to
-    # consume it; ordinary reads keep the small cached tensor available.
     if device == "cpu":
         return cached
     return cached.to(device=device)
@@ -111,9 +103,7 @@ def _cleanup_layer(root: Path, layer: int) -> None:
     ]
     with _prefetch_lock:
         for name in names:
-            tensor = _prefetch_cache.pop(_key(root, name), None)
-            if tensor is not None:
-                del tensor
+            _prefetch_cache.pop(_key(root, name), None)
 
 
 _original_linear_attention = base.linear_attention_step
@@ -130,11 +120,23 @@ def _full_attention_with_prefetch(root: Path, layer: int, x0: torch.Tensor, devi
     return _original_full_attention(root, layer, x0, device)
 
 
-# Patch the reference module with the optimized reader plus the guaranteed
-# MoE-weight prefetch layer.
+def _moe_with_cleanup(
+    root: Path,
+    layer: int,
+    residual: torch.Tensor,
+    top_k: int,
+    device: str,
+):
+    try:
+        return _original_moe_step(root, layer, residual, top_k, device)
+    finally:
+        _cleanup_layer(root, layer)
+
+
 base.load_tensor = _load_tensor
 base.linear_attention_step = _linear_attention_with_prefetch
 base.full_attention_step = _full_attention_with_prefetch
+base.moe_step = _moe_with_cleanup
 
 
 @atexit.register
