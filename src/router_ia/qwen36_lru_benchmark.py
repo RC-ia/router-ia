@@ -58,14 +58,16 @@ def print_cache_stats(label: str, root: Path) -> None:
         print(f"  cache {label}: reader not initialized")
         return
 
+    stats = store.cache.snapshot()
     print(
         f"  cache {label}: "
-        f"items={len(store.tensor_cache)} | "
-        f"ram={store.cache_bytes / (1024 ** 2):.1f}/"
-        f"{store.max_cache_bytes / (1024 ** 2):.1f} MiB | "
-        f"hits={store.cache_hits} | misses={store.cache_misses} | "
-        f"hit_rate={store.cache_hit_rate * 100.0:.2f}% | "
-        f"evictions={store.cache_evictions}"
+        f"items={stats['items']} | "
+        f"ram={stats['bytes'] / (1024 ** 2):.1f}/"
+        f"{store.cache.max_bytes / (1024 ** 2):.1f} MiB | "
+        f"hits={stats['hits']} | misses={stats['misses']} | "
+        f"hit_rate={stats['hit_rate']:.2f}% | "
+        f"evictions={stats['evictions']} | "
+        f"loads={stats['loads']}"
     )
 
 
@@ -110,31 +112,41 @@ def main() -> None:
         print(f"\ngeneration {generation}/{args.generations}")
         print_cache_stats("before", root)
 
+        generation_times: list[float] = []
         for token_id in tokens:
-            all_times.append(
-                run_token(
-                    root,
-                    token_id,
-                    args.start_layer,
-                    args.end_layer,
-                    args.top_k,
-                    args.device,
-                )
+            elapsed = run_token(
+                root,
+                token_id,
+                args.start_layer,
+                args.end_layer,
+                args.top_k,
+                args.device,
             )
+            all_times.append(elapsed)
+            generation_times.append(elapsed)
 
         generation_time = perf_counter() - generation_start
-        print(f"  generation time: {generation_time:.3f} s")
+        print(f"  generation wall time: {generation_time:.3f} s")
+        print(f"  generation avg/token: {sum(generation_times) / len(generation_times):.3f} s")
         print_cache_stats("after", root)
 
     total_time = perf_counter() - total_start
     print("\nsummary")
-    print(f"  total time: {total_time:.3f} s")
+    print(f"  total wall time: {total_time:.3f} s")
     print(f"  tokens processed: {len(all_times)}")
     print(f"  avg token time: {sum(all_times) / len(all_times):.3f} s")
     if len(all_times) >= 2:
         print(f"  first token time: {all_times[0]:.3f} s")
         print(f"  last token time: {all_times[-1]:.3f} s")
-        print(f"  change first->last: {(all_times[-1] - all_times[0]):+.3f} s")
+        print(f"  change first->last: {all_times[-1] - all_times[0]:+.3f} s")
+    if len(tokens) > 0 and len(all_times) >= len(tokens) * 2:
+        first_gen = all_times[:len(tokens)]
+        second_gen = all_times[len(tokens):len(tokens) * 2]
+        avg1 = sum(first_gen) / len(first_gen)
+        avg2 = sum(second_gen) / len(second_gen)
+        print(f"  generation 1 avg/token: {avg1:.3f} s")
+        print(f"  generation 2 avg/token: {avg2:.3f} s")
+        print(f"  generation avg change: {avg2 - avg1:+.3f} s/token")
     print_cache_stats("final", root)
 
 
