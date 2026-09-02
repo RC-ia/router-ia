@@ -1,30 +1,33 @@
 from __future__ import annotations
 
-"""Qwen3.6 loop with persistent shards and soft priority-aware RAM cache.
+"""Qwen3.6 loop with hierarchical RAM/VRAM tensor caches.
 
-The cache keeps raw CPU tensors and uses the full RAM budget as one shared pool.
-Eviction is global, but expert tensors receive a strong preservation bonus so
-frequently reused MoE weights are less likely to be evicted than ordinary
-attention/norm tensors.
+Cache hierarchy for CUDA runs:
+
+    VRAM cache -> RAM cache -> SSD shards
+
+The VRAM cache keeps raw weight tensors resident on the GPU when possible.
+The RAM cache remains the larger fallback tier. Both caches use a soft
+frequency/recency priority score, with a preservation bonus for MoE experts.
 
 Environment variables:
     QWEN36_CACHE_GB:
-        Total RAM budget for raw tensor cache, default 3.0 GiB.
-    QWEN36_EXPERT_BONUS:
-        Preservation bonus for expert tensors in the eviction score,
-        default 4.0.
-    QWEN36_CACHE_LOG_INTERVAL:
-        Print cache progress every N cache inserts, default 0 (disabled).
+        Total RAM cache budget in GiB, default 3.0.
     QWEN36_VRAM_GB:
-        Optional per-process CUDA allocator limit in GiB. Disabled by default
-        (0). When enabled, the limit is applied as a fraction of the detected
-        GPU's total VRAM before model tensors are allocated.
+        Optional per-process CUDA allocator limit in GiB, default 0 (disabled).
+    QWEN36_VRAM_CACHE_GB:
+        VRAM tensor-cache budget in GiB, default 3.0.
+    QWEN36_EXPERT_BONUS:
+        Preservation bonus for expert tensors, default 4.0.
+    QWEN36_CACHE_LOG_INTERVAL:
+        Print cache progress every N RAM/VRAM cache inserts, default 0.
 """
 
 import atexit
 import json
 import math
 import os
+import sys
 from contextlib import ExitStack
 from pathlib import Path
 from threading import Lock
@@ -60,13 +63,24 @@ def _env_int(name: str, default: int) -> int:
 
 CACHE_GB = _env_float("QWEN36_CACHE_GB", 3.0)
 CACHE_BUDGET_BYTES = int(CACHE_GB * 1024 * 1024 * 1024)
+VRAM_GB = _env_float("QWEN36_VRAM_GB", 0.0)
+VRAM_CACHE_GB = _env_float("QWEN36_VRAM_CACHE_GB", 3.0)
+VRAM_CACHE_BUDGET_BYTES = int(VRAM_CACHE_GB * 1024 * 1024 * 1024)
 EXPERT_BONUS = _env_float("QWEN36_EXPERT_BONUS", 4.0)
 CACHE_LOG_INTERVAL = _env_int("QWEN36_CACHE_LOG_INTERVAL", 0)
-VRAM_GB = _env_float("QWEN36_VRAM_GB", 0.0)
+
+
+def _requested_device() -> str:
+    for index, arg in enumerate(sys.argv):
+        if arg == "--device" and index + 1 < len(sys.argv):
+            return sys.argv[index + 1].lower()
+        if arg.startswith("--device="):
+            return arg.split("=", 1)[1].lower()
+    return "cpu"
 
 
 def _configure_vram_limit(device: str) -> None:
-    """Optionally cap this process's CUDA allocator before any CUDA allocations."""
+    """Optionally cap this process's CUDA allocator before CUDA allocations."""
     if device != "cuda" or VRAM_GB <= 0:
         return
     if not torch.cuda.is_available():
@@ -81,9 +95,6 @@ def _configure_vram_limit(device: str) -> None:
             f"VRAM limit: requested {VRAM_GB:.2f} GiB >= detected "
             f"{total_gib:.2f} GiB; leaving allocator uncapped"
         )
-        return
-
-    if fraction <= 0.0:
         return
 
     torch.cuda.set_per_process_memory_fraction(fraction, 0)
@@ -108,20 +119,17 @@ def _is_expert_tensor(name: str) -> bool:
     except ValueError:
         return False
 
-    return parts[1] in {
-        "gate_proj",
-        "up_proj",
-        "down_proj",
-    }
+    return parts[1] in {"gate_proj", "up_proj", "down_proj"}
 
 
 class _PriorityTensorCache:
-    """Single shared RAM cache with soft priority for repeatedly used experts."""
+    """Generic soft-priority tensor cache for CPU or CUDA tensors."""
 
-    def __init__(self, max_bytes: int) -> None:
+    def __init__(self, max_bytes: int, name: str) -> None:
         self.max_bytes = max_bytes
+        self.name = name
 
-        self.items: dict[str, object] = {}
+        self.items: dict[str, torch.Tensor] = {}
         self.item_bytes: dict[str, int] = {}
         self.item_hits: dict[str, int] = {}
         self.item_last_access: dict[str, int] = {}
@@ -144,11 +152,10 @@ class _PriorityTensorCache:
         self.general_evictions = 0
         self.skipped_oversize = 0
         self.loads = 0
-
         self.lock = Lock()
 
     @staticmethod
-    def _tensor_bytes(tensor) -> int:
+    def _tensor_bytes(tensor: torch.Tensor) -> int:
         return int(tensor.numel()) * int(tensor.element_size())
 
     def _score(self, name: str) -> float:
@@ -156,7 +163,6 @@ class _PriorityTensorCache:
         last = self.item_last_access.get(name, 0)
         age = max(self.clock - last, 0)
         expert = self.item_expert.get(name, False)
-
         frequency = 3.0 * math.log1p(hits)
         recency = 8.0 / math.sqrt(1.0 + age)
         expert_bonus = EXPERT_BONUS if expert else 0.0
@@ -170,7 +176,6 @@ class _PriorityTensorCache:
     def _remove(self, name: str) -> tuple[int, bool]:
         size = self.item_bytes.pop(name, 0)
         expert = self.item_expert.pop(name, False)
-
         self.items.pop(name, None)
         self.item_hits.pop(name, None)
         self.item_last_access.pop(name, None)
@@ -180,14 +185,12 @@ class _PriorityTensorCache:
             self.expert_bytes -= size
         else:
             self.general_bytes -= size
-
         return size, expert
 
-    def get(self, name: str):
+    def get(self, name: str) -> torch.Tensor | None:
         with self.lock:
             self.clock += 1
             tensor = self.items.get(name)
-
             if tensor is None:
                 self.misses += 1
                 if _is_expert_tensor(name):
@@ -199,15 +202,13 @@ class _PriorityTensorCache:
             self.hits += 1
             self.item_hits[name] = self.item_hits.get(name, 0) + 1
             self.item_last_access[name] = self.clock
-
             if self.item_expert.get(name, False):
                 self.expert_hits += 1
             else:
                 self.general_hits += 1
-
             return tensor
 
-    def put(self, name: str, tensor) -> None:
+    def put(self, name: str, tensor: torch.Tensor) -> None:
         size = self._tensor_bytes(tensor)
         expert = _is_expert_tensor(name)
 
@@ -226,10 +227,8 @@ class _PriorityTensorCache:
                 victim = self._select_victim()
                 if victim is None:
                     break
-
                 _, victim_expert = self._remove(victim)
                 self.evictions += 1
-
                 if victim_expert:
                     self.expert_evictions += 1
                 else:
@@ -244,7 +243,6 @@ class _PriorityTensorCache:
             self.item_hits[name] = 0
             self.item_last_access[name] = self.clock
             self.item_expert[name] = expert
-
             self.bytes_used += size
             if expert:
                 self.expert_bytes += size
@@ -258,7 +256,6 @@ class _PriorityTensorCache:
             self.item_hits.clear()
             self.item_last_access.clear()
             self.item_expert.clear()
-
             self.bytes_used = 0
             self.expert_bytes = 0
             self.general_bytes = 0
@@ -266,27 +263,9 @@ class _PriorityTensorCache:
     def snapshot(self) -> dict[str, int | float]:
         with self.lock:
             total = self.hits + self.misses
-            hit_rate = self.hits / total * 100.0 if total else 0.0
-
             expert_total = self.expert_hits + self.expert_misses
-            expert_hit_rate = (
-                self.expert_hits / expert_total * 100.0 if expert_total else 0.0
-            )
-
             general_total = self.general_hits + self.general_misses
-            general_hit_rate = (
-                self.general_hits / general_total * 100.0 if general_total else 0.0
-            )
-
-            expert_items = sum(
-                1 for value in self.item_expert.values() if value
-            )
-            expert_share = (
-                self.expert_bytes / self.bytes_used * 100.0
-                if self.bytes_used
-                else 0.0
-            )
-
+            expert_items = sum(1 for value in self.item_expert.values() if value)
             return {
                 "items": len(self.items),
                 "expert_items": expert_items,
@@ -294,16 +273,16 @@ class _PriorityTensorCache:
                 "bytes": self.bytes_used,
                 "expert_bytes": self.expert_bytes,
                 "general_bytes": self.general_bytes,
-                "expert_share": expert_share,
+                "expert_share": self.expert_bytes / self.bytes_used * 100.0 if self.bytes_used else 0.0,
                 "hits": self.hits,
                 "misses": self.misses,
-                "hit_rate": hit_rate,
+                "hit_rate": self.hits / total * 100.0 if total else 0.0,
                 "expert_hits": self.expert_hits,
                 "expert_misses": self.expert_misses,
-                "expert_hit_rate": expert_hit_rate,
+                "expert_hit_rate": self.expert_hits / expert_total * 100.0 if expert_total else 0.0,
                 "general_hits": self.general_hits,
                 "general_misses": self.general_misses,
-                "general_hit_rate": general_hit_rate,
+                "general_hit_rate": self.general_hits / general_total * 100.0 if general_total else 0.0,
                 "evictions": self.evictions,
                 "expert_evictions": self.expert_evictions,
                 "general_evictions": self.general_evictions,
@@ -320,7 +299,8 @@ class _ShardStore:
         self.handles: dict[Path, object] = {}
         self.handle_opens = 0
         self.handle_hits = 0
-        self.cache = _PriorityTensorCache(CACHE_BUDGET_BYTES)
+        self.ram_cache = _PriorityTensorCache(CACHE_BUDGET_BYTES, "ram")
+        self.vram_cache = _PriorityTensorCache(VRAM_CACHE_BUDGET_BYTES, "vram")
         self._last_log_loads = 0
 
         index_path = self.root / "model.safetensors.index.json"
@@ -345,59 +325,70 @@ class _ShardStore:
         if CACHE_LOG_INTERVAL <= 0:
             return
 
-        stats = self.cache.snapshot()
-        if stats["loads"] - self._last_log_loads < CACHE_LOG_INTERVAL:
+        ram = self.ram_cache.snapshot()
+        vram = self.vram_cache.snapshot()
+        total_loads = int(ram["loads"] + vram["loads"])
+        if total_loads - self._last_log_loads < CACHE_LOG_INTERVAL:
             return
-
-        self._last_log_loads = int(stats["loads"])
-        used_mib = stats["bytes"] / (1024 * 1024)
-        budget_mib = self.cache.max_bytes / (1024 * 1024)
-        expert_mib = stats["expert_bytes"] / (1024 * 1024)
+        self._last_log_loads = total_loads
 
         print(
             "cache progress: "
-            f"loads={stats['loads']} | hits={stats['hits']} | "
-            f"misses={stats['misses']} | hit_rate={stats['hit_rate']:.1f}% | "
-            f"expert_hit={stats['expert_hit_rate']:.1f}% | "
-            f"general_hit={stats['general_hit_rate']:.1f}% | "
-            f"evictions={stats['evictions']} "
-            f"(expert={stats['expert_evictions']}, general={stats['general_evictions']}) | "
-            f"ram={used_mib:.1f}/{budget_mib:.1f} MiB | "
-            f"experts_ram={expert_mib:.1f} MiB "
-            f"({stats['expert_share']:.1f}%) | "
+            f"ram={ram['bytes'] / (1024 ** 2):.1f} MiB | "
+            f"vram={vram['bytes'] / (1024 ** 2):.1f} MiB | "
+            f"ram_hit={ram['hit_rate']:.1f}% | "
+            f"vram_hit={vram['hit_rate']:.1f}% | "
+            f"vram_expert={vram['expert_share']:.1f}% | "
+            f"evict_ram={ram['evictions']} | evict_vram={vram['evictions']} | "
             f"last={name}"
         )
 
-    def load(self, name: str, device: str):
-        cached = self.cache.get(name)
-        if cached is not None:
-            self._maybe_log_progress(name)
-            if device == "cpu":
-                return cached
-            return cached.to(device=device)
-
+    def _load_ssd(self, name: str) -> torch.Tensor:
         shard_name = self.weight_map.get(name)
-        if shard_name:
-            shards = [self.root / shard_name]
-        else:
-            shards = sorted(self.root.glob("*.safetensors"))
+        shards = [self.root / shard_name] if shard_name else sorted(self.root.glob("*.safetensors"))
 
         for shard in shards:
             if not shard.is_file():
                 continue
             handle = self._handle(shard)
             if name in handle.keys():
-                tensor = handle.get_tensor(name)
-                self.cache.put(name, tensor)
-                self._maybe_log_progress(name)
-                if device == "cpu":
-                    return tensor
-                return tensor.to(device=device)
+                return handle.get_tensor(name)
 
         raise KeyError(f"Tensor not found: {name}")
 
+    def load(self, name: str, device: str):
+        if device == "cuda":
+            gpu_cached = self.vram_cache.get(name)
+            if gpu_cached is not None:
+                self._maybe_log_progress(name)
+                return gpu_cached
+
+        cpu_cached = self.ram_cache.get(name)
+        if cpu_cached is not None:
+            if device == "cpu":
+                self._maybe_log_progress(name)
+                return cpu_cached
+
+            gpu_tensor = cpu_cached.to(device=device)
+            self.vram_cache.put(name, gpu_tensor)
+            self._maybe_log_progress(name)
+            return gpu_tensor
+
+        tensor = self._load_ssd(name)
+        self.ram_cache.put(name, tensor)
+
+        if device == "cpu":
+            self._maybe_log_progress(name)
+            return tensor
+
+        gpu_tensor = tensor.to(device=device)
+        self.vram_cache.put(name, gpu_tensor)
+        self._maybe_log_progress(name)
+        return gpu_tensor
+
     def close(self) -> None:
-        self.cache.clear()
+        self.vram_cache.clear()
+        self.ram_cache.clear()
         self.stack.close()
         self.handles.clear()
 
@@ -433,15 +424,14 @@ def _format_mib(value: int) -> str:
 
 
 def main() -> None:
-    import sys
-
-    device = "cuda" if "--device" in sys.argv and "cuda" in sys.argv else "cpu"
+    device = _requested_device()
     _configure_vram_limit(device)
 
     print(
-        "LRU config: "
-        f"budget={CACHE_GB:.2f} GiB | "
-        f"mode=global-soft-priority | "
+        "Cache config: "
+        f"ram={CACHE_GB:.2f} GiB | "
+        f"vram_cache={VRAM_CACHE_GB:.2f} GiB | "
+        f"mode=hierarchical-vram-ram-ssd | "
         f"expert_bonus={EXPERT_BONUS:.2f} | "
         f"vram_limit={VRAM_GB:.2f} GiB | "
         f"log_interval={CACHE_LOG_INTERVAL or 'off'}"
@@ -450,8 +440,10 @@ def main() -> None:
     base.main()
 
     for root, store in _stores.items():
-        stats = store.cache.snapshot()
-        total = stats["hits"] + stats["misses"]
+        ram = store.ram_cache.snapshot()
+        vram = store.vram_cache.snapshot()
+        total = int(ram["hits"] + ram["misses"])
+
         print(
             "cached reader: "
             f"root={root} | "
@@ -459,21 +451,32 @@ def main() -> None:
             f"cached handle hits={store.handle_hits}"
         )
         print(
-            "LRU summary: "
-            f"items={stats['items']} "
-            f"(expert={stats['expert_items']}, general={stats['general_items']}) | "
-            f"ram={_format_mib(int(stats['bytes']))}/"
-            f"{_format_mib(store.cache.max_bytes)} | "
-            f"expert_ram={_format_mib(int(stats['expert_bytes']))} "
-            f"({stats['expert_share']:.1f}%) | "
-            f"hits={stats['hits']} | misses={stats['misses']} | "
-            f"hit_rate={stats['hit_rate']:.2f}% | "
-            f"expert_hit_rate={stats['expert_hit_rate']:.2f}% | "
-            f"general_hit_rate={stats['general_hit_rate']:.2f}% | "
-            f"evictions={stats['evictions']} "
-            f"(expert={stats['expert_evictions']}, general={stats['general_evictions']}) | "
-            f"oversize_skips={stats['skipped_oversize']} | "
-            f"loads={stats['loads']} | lookups={total}"
+            "RAM cache: "
+            f"items={ram['items']} "
+            f"(expert={ram['expert_items']}, general={ram['general_items']}) | "
+            f"ram={_format_mib(int(ram['bytes']))}/{_format_mib(store.ram_cache.max_bytes)} | "
+            f"expert_ram={_format_mib(int(ram['expert_bytes']))} "
+            f"({ram['expert_share']:.1f}%) | "
+            f"hits={ram['hits']} | misses={ram['misses']} | "
+            f"hit_rate={ram['hit_rate']:.2f}% | "
+            f"expert_hit_rate={ram['expert_hit_rate']:.2f}% | "
+            f"evictions={ram['evictions']} "
+            f"(expert={ram['expert_evictions']}, general={ram['general_evictions']}) | "
+            f"loads={ram['loads']} | lookups={total}"
+        )
+        print(
+            "VRAM cache: "
+            f"items={vram['items']} "
+            f"(expert={vram['expert_items']}, general={vram['general_items']}) | "
+            f"vram={_format_mib(int(vram['bytes']))}/{_format_mib(store.vram_cache.max_bytes)} | "
+            f"expert_vram={_format_mib(int(vram['expert_bytes']))} "
+            f"({vram['expert_share']:.1f}%) | "
+            f"hits={vram['hits']} | misses={vram['misses']} | "
+            f"hit_rate={vram['hit_rate']:.2f}% | "
+            f"expert_hit_rate={vram['expert_hit_rate']:.2f}% | "
+            f"evictions={vram['evictions']} "
+            f"(expert={vram['expert_evictions']}, general={vram['general_evictions']}) | "
+            f"loads={vram['loads']}"
         )
 
 
