@@ -1,15 +1,6 @@
 from __future__ import annotations
 
-"""Batch mini-chat smoke test for Qwen3.6 hierarchical RAM/VRAM caches.
-
-This is designed for notebook/Kaggle environments where interactive input()
-is inconvenient. Pass one or more --prompt values. The RAM/VRAM caches stay
-alive across all prompts and generated tokens so we can observe reuse across
-both tiers.
-
-Important: the underlying runtime is still stateless across generated tokens;
-this is not yet a faithful Qwen3.6 KV-cache/DeltaNet-sequence decoder.
-"""
+"""Batch mini-chat smoke test for Qwen3.6 hierarchical RAM/VRAM caches."""
 
 import argparse
 import gc
@@ -104,24 +95,40 @@ def batched_moe_step(
     down_w = torch.stack(down_weights, dim=0)
 
     batch_x = moe_in.expand(len(expert_ids), -1)
-    gate = torch.bmm(gate_w, batch_x.unsqueeze(-1)).squeeze(-1)
-    up = torch.bmm(up_w, batch_x.unsqueeze(-1)).squeeze(-1)
-    hidden = F.silu(gate) * up
-    expert_out = torch.bmm(down_w, hidden.unsqueeze(-1)).squeeze(-1)
-    routing = torch.tensor(weights, device=device, dtype=expert_out.dtype).reshape(-1, 1)
-    routed_sum = (expert_out * routing).sum(dim=0, keepdim=True)
+    if device == "cuda":
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            gate = torch.bmm(gate_w, batch_x.unsqueeze(-1)).squeeze(-1)
+            up = torch.bmm(up_w, batch_x.unsqueeze(-1)).squeeze(-1)
+            hidden = F.silu(gate) * up
+            expert_out = torch.bmm(down_w, hidden.unsqueeze(-1)).squeeze(-1)
+            routing = torch.tensor(weights, device=device, dtype=expert_out.dtype).reshape(-1, 1)
+            routed_sum = (expert_out * routing).sum(dim=0, keepdim=True)
+    else:
+        gate = torch.bmm(gate_w, batch_x.unsqueeze(-1)).squeeze(-1)
+        up = torch.bmm(up_w, batch_x.unsqueeze(-1)).squeeze(-1)
+        hidden = F.silu(gate) * up
+        expert_out = torch.bmm(down_w, hidden.unsqueeze(-1)).squeeze(-1)
+        routing = torch.tensor(weights, device=device, dtype=expert_out.dtype).reshape(-1, 1)
+        routed_sum = (expert_out * routing).sum(dim=0, keepdim=True)
 
     shared_gate_w = base.load_layer_weight(root, layer, "mlp.shared_expert_gate.weight", device).float()
-    shared_gate = torch.sigmoid(F.linear(moe_in, shared_gate_w))
     shared_gate_proj = _projection(root, f"{prefix}mlp.shared_expert.gate_proj", device).float()
     shared_up_proj = _projection(root, f"{prefix}mlp.shared_expert.up_proj", device).float()
     shared_down_proj = _projection(root, f"{prefix}mlp.shared_expert.down_proj", device).float()
-    shared_hidden = F.silu(F.linear(moe_in, shared_gate_proj)) * F.linear(moe_in, shared_up_proj)
-    shared_out = F.linear(shared_hidden, shared_down_proj) * shared_gate
 
-    moe_out = routed_sum + shared_out
+    if device == "cuda":
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            shared_gate = torch.sigmoid(F.linear(moe_in, shared_gate_w))
+            shared_hidden = F.silu(F.linear(moe_in, shared_gate_proj)) * F.linear(moe_in, shared_up_proj)
+            shared_out = F.linear(shared_hidden, shared_down_proj) * shared_gate
+    else:
+        shared_gate = torch.sigmoid(F.linear(moe_in, shared_gate_w))
+        shared_hidden = F.silu(F.linear(moe_in, shared_gate_proj)) * F.linear(moe_in, shared_up_proj)
+        shared_out = F.linear(shared_hidden, shared_down_proj) * shared_gate
+
+    moe_out = routed_sum.float() + shared_out.float()
     layer_out = residual + moe_out
-    shared_gate_value = float(shared_gate.item())
+    shared_gate_value = float(shared_gate.float().item())
     moe_input_norm = float(torch.linalg.vector_norm(moe_in).item())
 
     del post_norm, moe_in, router_w, routed
@@ -160,19 +167,23 @@ def run_generated_token(
 
     if device == "cuda":
         final_norm_runtime = cached.cached_runtime_tensor(root, final_norm_name, device, dtype=torch.float32)
-        lm_head_runtime = cached.cached_runtime_tensor(root, lm_head_name, device, dtype=torch.float32)
+        lm_head_runtime = cached.cached_runtime_tensor(root, lm_head_name, device, dtype=torch.float16)
     else:
         final_norm_runtime = final_norm
         lm_head_runtime = lm_head
 
     x = base.rmsnorm(x, final_norm_runtime)
-    logits = F.linear(x, lm_head_runtime)
+    if device == "cuda":
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            logits = F.linear(x, lm_head_runtime)
+    else:
+        logits = F.linear(x, lm_head_runtime)
     next_id = sample_next(logits, temperature, sampling_top_k)
 
     if device == "cuda":
         torch.cuda.synchronize()
     elapsed = perf_counter() - start
-    peak_logit = float(torch.max(logits).item())
+    peak_logit = float(torch.max(logits.float()).item())
 
     del x, logits
     if device == "cuda":
@@ -211,15 +222,9 @@ def generate_response(
     for step in range(1, max_new_tokens + 1):
         before = cache_stats(root)
         next_id, elapsed, peak = run_generated_token(
-            root,
-            current_id,
-            final_norm,
-            lm_head,
-            final_norm_name,
-            lm_head_name,
-            device,
-            sampling_top_k,
-            temperature,
+            root, current_id, final_norm, lm_head,
+            final_norm_name, lm_head_name, device,
+            sampling_top_k, temperature,
         )
         after = cache_stats(root)
 
@@ -281,7 +286,7 @@ def main() -> None:
     print("warning=no DeltaNet recurrent state or full-attention KV cache yet")
     print("cache=hierarchical-vram-ram-ssd")
     print("vram_dequantized_cache=on")
-    print("moe=batched-top8-gpu")
+    print("cuda_compute=fp16-autocast")
     print(f"prompts={len(args.prompt)}")
     print(f"device={args.device}")
     print(f"max_new_tokens={args.max_new_tokens}")
@@ -295,14 +300,8 @@ def main() -> None:
     for index, prompt in enumerate(args.prompt, start=1):
         print(f"\n===== TURN {index}/{len(args.prompt)} =====")
         generate_response(
-            root,
-            prompt,
-            tokenizer,
-            lm_head=lm_head,
-            final_norm=final_norm,
-            final_norm_name=norm_name,
-            lm_head_name=lm_name,
-            device=args.device,
+            root, prompt, tokenizer, final_norm, lm_head,
+            norm_name, lm_name, args.device,
             max_new_tokens=args.max_new_tokens,
             sampling_top_k=args.top_k,
             temperature=args.temperature,
