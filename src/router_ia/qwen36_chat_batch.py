@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import gc
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from time import perf_counter
 
@@ -15,6 +17,7 @@ from . import qwen36_40layer_loop as base
 from .qwen36_mini_chat import load_final_norm, load_lm_head, load_tokenizer, sample_next
 
 DEFAULT_MAX_NEW_TOKENS = 4
+EXPERT_LOAD_WORKERS = max(1, int(os.getenv("QWEN36_EXPERT_LOAD_WORKERS", "8")))
 
 
 def cache_stats(root: Path) -> dict[str, int | float]:
@@ -77,6 +80,40 @@ def _projection(root: Path, prefix: str, device: str) -> torch.Tensor:
     return cached._cached_load_projection(root, prefix, device)
 
 
+def _expert_projection_triplet(
+    root: Path,
+    layer_prefix: str,
+    expert_id: int,
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    expert_prefix = f"{layer_prefix}mlp.experts.{expert_id}"
+    return (
+        _projection(root, expert_prefix + ".gate_proj", device),
+        _projection(root, expert_prefix + ".up_proj", device),
+        _projection(root, expert_prefix + ".down_proj", device),
+    )
+
+
+def _warm_expert_raw_cache(
+    root: Path,
+    layer_prefix: str,
+    expert_ids: list[int],
+) -> None:
+    """Ensure routed FP8 weights/scales are resident in RAM before GPU staging.
+
+    This keeps the threaded GPU staging phase away from first-touch shard opens.
+    """
+    store = cached._store(root)
+    for expert_id in expert_ids:
+        expert_prefix = f"{layer_prefix}mlp.experts.{expert_id}"
+        store.load(expert_prefix + ".gate_proj.weight", device="cpu")
+        store.load(expert_prefix + ".gate_proj.weight_scale_inv", device="cpu")
+        store.load(expert_prefix + ".up_proj.weight", device="cpu")
+        store.load(expert_prefix + ".up_proj.weight_scale_inv", device="cpu")
+        store.load(expert_prefix + ".down_proj.weight", device="cpu")
+        store.load(expert_prefix + ".down_proj.weight_scale_inv", device="cpu")
+
+
 def batched_moe_step(
     root: Path,
     layer: int,
@@ -94,14 +131,22 @@ def batched_moe_step(
     expert_ids = [int(v) for v in routed.expert_ids.detach().cpu().tolist()]
     weights = [float(v) for v in routed.weights.detach().cpu().tolist()]
 
-    gate_weights = []
-    up_weights = []
-    down_weights = []
-    for expert_id in expert_ids:
-        expert_prefix = f"{prefix}mlp.experts.{expert_id}"
-        gate_weights.append(_projection(root, expert_prefix + ".gate_proj", device))
-        up_weights.append(_projection(root, expert_prefix + ".up_proj", device))
-        down_weights.append(_projection(root, expert_prefix + ".down_proj", device))
+    # First make all routed raw tensors RAM-hot. Then stage the 24 dequantized
+    # matrices concurrently. The latter overlaps CPU-side orchestration and
+    # CUDA launches instead of serially feeding the GPU projection-by-projection.
+    if device == "cuda":
+        _warm_expert_raw_cache(root, prefix, expert_ids)
+
+    with ThreadPoolExecutor(max_workers=min(EXPERT_LOAD_WORKERS, len(expert_ids))) as pool:
+        futures = [
+            pool.submit(_expert_projection_triplet, root, prefix, expert_id, device)
+            for expert_id in expert_ids
+        ]
+        triplets = [future.result() for future in futures]
+
+    gate_weights = [triplet[0] for triplet in triplets]
+    up_weights = [triplet[1] for triplet in triplets]
+    down_weights = [triplet[2] for triplet in triplets]
 
     gate_w = torch.stack(gate_weights, dim=0)
     up_w = torch.stack(up_weights, dim=0)
@@ -147,11 +192,13 @@ def batched_moe_step(
     moe_input_norm = float(torch.linalg.vector_norm(moe_in).item())
 
     del post_norm, moe_in, router_w, routed
-    del gate_weights, up_weights, down_weights
+    del gate_weights, up_weights, down_weights, triplets
     del gate_w, up_w, down_w, batch_x, batch_x_compute, gate, up, hidden, expert_out, routing, routed_sum
     del shared_gate_w, shared_gate, shared_gate_proj, shared_up_proj, shared_down_proj
     del shared_hidden, shared_out, moe_out
-    gc.collect()
+    # Deliberately do not call gc.collect() here. Python GC between all 40
+    # layers forces the CPU to stop and starves the GPU; collection is deferred
+    # to the token boundary below.
     return layer_out, expert_ids, weights, shared_gate_value, moe_input_norm
 
 
@@ -305,6 +352,7 @@ def main() -> None:
     print("vram_policy=resident-60pct-hot-experts-20pct-stream-20pct")
     print("vram_dequantized_cache=fp16")
     print("cuda_compute=fp16-autocast")
+    print(f"expert_load_workers={EXPERT_LOAD_WORKERS}")
     print(f"prompts={len(args.prompt)}")
     print(f"device={args.device}")
     print(f"max_new_tokens={args.max_new_tokens}")
