@@ -7,7 +7,7 @@ CUDA cache layout:
     resident VRAM + hot-expert VRAM + streaming window -> RAM -> SSD shards
 
 The resident pool never evicts. The hot-expert pool evicts only experts.
-The streaming window is transient and is intended to feed the current layer.
+The streaming window is transient and is intended to feed routed experts.
 
 Environment variables:
     QWEN36_CACHE_GB: RAM cache budget, default 3.0 GiB.
@@ -347,7 +347,6 @@ class _ShardStore:
         self.vram_cache = _DualVRAMCache(VRAM_CACHE_BUDGET_BYTES)
         self.target_device = "cpu"
         self._last_log_loads = 0
-        self._stream_layer: int | None = None
 
         index_path = self.root / "model.safetensors.index.json"
         if index_path.is_file():
@@ -466,21 +465,9 @@ class _ShardStore:
         return out
 
     def stream_projection(self, prefix: str) -> torch.Tensor:
-        """Stream one expert projection from RAM into the rotating staging pool."""
+        """Stage one expert projection in the rotating staging pool across layers."""
         if self.target_device != "cuda":
             raise RuntimeError("stream_projection requires CUDA")
-
-        layer_prefix_marker = ".layers."
-        layer_id: int | None = None
-        if layer_prefix_marker in prefix:
-            try:
-                layer_id = int(prefix.split(layer_prefix_marker, 1)[1].split(".", 1)[0])
-            except (ValueError, IndexError):
-                layer_id = None
-
-        if layer_id is not None and layer_id != self._stream_layer:
-            self.vram_cache.clear_stream()
-            self._stream_layer = layer_id
 
         stream_key = prefix + ".__stream__"
         cached_stream = self.vram_cache.get_stream(stream_key)
@@ -505,7 +492,6 @@ class _ShardStore:
 
     def clear_stream(self) -> None:
         self.vram_cache.clear_stream()
-        self._stream_layer = None
 
     def runtime_tensor(
         self,
@@ -648,14 +634,10 @@ def main() -> None:
         print(
             "VRAM cache: "
             f"items={vram['items']} | total={_format_mib(int(vram['bytes']))}/{_format_mib(store.vram_cache.max_bytes)} | "
-            f"resident={_format_mib(int(vram['resident_bytes']))}/{_format_mib(RESIDENT_VRAM_BUDGET_BYTES)} | "
-            f"experts={_format_mib(int(vram['expert_bytes']))}/{_format_mib(EXPERT_VRAM_BUDGET_BYTES)} | "
-            f"stream={_format_mib(int(vram['stream_bytes']))}/{_format_mib(STREAM_BUDGET_BYTES)} | "
-            f"hit_rate={vram['hit_rate']:.2f}% | expert_hit_rate={vram['expert_pool_hit_rate']:.2f}% | "
-            f"stream_hit_rate={vram['stream_hit_rate']:.2f}% | expert_evictions={vram['expert_evictions']} | "
-            f"stream_evictions={vram['stream_evictions']}"
+            f"resident={_format_mib(int(vram['resident_bytes']))}/{_format_mib(int(vram['resident_budget_bytes']))} | "
+            f"experts={_format_mib(int(vram['expert_bytes']))}/{_format_mib(int(vram['expert_budget_bytes']))} | "
+            f"stream={_format_mib(int(vram['stream_bytes']))}/{_format_mib(int(vram['stream_budget_bytes']))} | "
+            f"hits={vram['hits']} | misses={vram['misses']} | hit_rate={vram['hit_rate']:.2f}% | "
+            f"expert_hit_rate={vram['expert_pool_hit_rate']:.2f}% | stream_hit_rate={vram['stream_hit_rate']:.2f}% | "
+            f"expert_evictions={vram['expert_evictions']} | stream_evictions={vram['stream_evictions']}"
         )
-
-
-if __name__ == "__main__":
-    main()
