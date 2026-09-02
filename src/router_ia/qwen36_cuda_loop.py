@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-"""CUDA-first single-token Qwen3.6 reference runner with compact CPU expert cache."""
+"""CUDA-first single-token Qwen3.6 reference runner with a safe CPU FP8 expert cache."""
 
 import argparse
+import ctypes
 import gc
+import os
 from collections import OrderedDict
 from pathlib import Path
 from time import perf_counter
@@ -12,7 +14,7 @@ import torch
 import torch.nn.functional as F
 
 from .qwen36_gated_norm_probe import gated_rmsnorm
-from .qwen36_op_probe import BLOCK, HEAD_DIM, dequantize_fp8_blockwise, load_embedding_row, load_tensor, rmsnorm
+from .qwen36_op_probe import BLOCK, dequantize_fp8_blockwise, load_embedding_row, load_tensor, rmsnorm
 from .qwen36_router import route
 
 HIDDEN = 2048
@@ -27,11 +29,43 @@ FULL_Q_DIM = FULL_NUM_HEADS * FULL_HEAD_DIM
 FULL_NUM_KV_GROUPS = FULL_NUM_HEADS // FULL_NUM_KV_HEADS
 EPS = 1e-6
 DEFAULT_LAYERS = 40
-DEFAULT_CACHE_MIB = 1536.0
+# 256 MiB is deliberately conservative for an 8 GiB machine.
+DEFAULT_CACHE_MIB = 256.0
+SAFE_CACHE_LIMIT_MIB = 512.0
+
+
+def available_system_memory_bytes() -> int | None:
+    """Return currently available system RAM without adding a dependency."""
+    if os.name == "nt":
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MEMORYSTATUSEX()
+        status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return int(status.ullAvailPhys)
+        return None
+
+    try:
+        pages = os.sysconf("SC_AVPHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        return int(pages * page_size)
+    except (AttributeError, ValueError, OSError):
+        return None
 
 
 class CPUWeightCache:
-    """LRU cache in system RAM, keeping expert weights in their compact FP8 form."""
+    """LRU cache in system RAM, retaining expert weights in compact FP8 form."""
 
     def __init__(self, budget_mib: float) -> None:
         if budget_mib < 0:
@@ -64,10 +98,10 @@ class CPUWeightCache:
         self.hits += 1
         return weight, scale
 
-    def put(self, key: str, weight: torch.Tensor, scale: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def put(self, key: str, weight: torch.Tensor, scale: torch.Tensor | None) -> None:
         size = self.item_nbytes(weight, scale)
         if self.budget_bytes == 0 or size > self.budget_bytes:
-            return weight, scale
+            return
 
         old = self.items.pop(key, None)
         if old is not None:
@@ -81,7 +115,6 @@ class CPUWeightCache:
 
         self.items[key] = (weight, scale, size)
         self.used_bytes += size
-        return weight, scale
 
     def stats(self) -> tuple[int, int, int, int]:
         return self.used_bytes, len(self.items), self.hits, self.misses
@@ -134,6 +167,8 @@ def attention_type(root: Path, layer: int) -> str:
 def dequantize_fp8_target(weight: torch.Tensor, scale_inv: torch.Tensor, device: str) -> torch.Tensor:
     if device != "cuda":
         return dequantize_fp8_blockwise(weight, scale_inv)
+    # Only the compact FP8 source is kept in RAM. The expanded FP32 tensor is
+    # temporary on the GPU and is released as soon as the projection finishes.
     w = weight.to(device=device, non_blocking=True)
     s = scale_inv.to(device=device, non_blocking=True).float()
     expanded = s.repeat_interleave(BLOCK, dim=0).repeat_interleave(BLOCK, dim=1)
@@ -144,6 +179,7 @@ def dequantize_fp8_target(weight: torch.Tensor, scale_inv: torch.Tensor, device:
 
 def load_fp8_projection_target(root: Path, prefix: str, device: str) -> torch.Tensor:
     cache_key = prefix if should_cache_projection(prefix) and device == "cuda" else None
+
     if cache_key is not None and _CPU_CACHE is not None:
         cached = _CPU_CACHE.get(cache_key)
         if cached is not None:
@@ -310,14 +346,38 @@ def main() -> None:
     parser.add_argument("--start-layer", type=int, default=0)
     parser.add_argument("--end-layer", type=int, default=DEFAULT_LAYERS - 1)
     parser.add_argument("--top-k", type=int, default=8)
-    parser.add_argument("--cache-mib", type=float, default=DEFAULT_CACHE_MIB, help="system RAM cache budget for compact FP8 expert weights")
+    parser.add_argument("--cache-mib", type=float, default=DEFAULT_CACHE_MIB, help="CPU FP8 cache size in MiB")
+    parser.add_argument("--allow-large-cache", action="store_true", help="allow cache sizes above the conservative 512 MiB safety limit")
     args = parser.parse_args()
+
     if not torch.cuda.is_available():
         raise SystemExit("CUDA unavailable")
     if not 0 <= args.start_layer <= args.end_layer < DEFAULT_LAYERS:
         raise SystemExit(f"layer range must be inside 0..{DEFAULT_LAYERS - 1}")
     if args.cache_mib < 0:
         raise SystemExit("cache-mib must be non-negative")
+    if args.cache_mib > SAFE_CACHE_LIMIT_MIB and not args.allow_large_cache:
+        raise SystemExit(
+            f"cache-mib={args.cache_mib:.1f} is above the safe default limit of "
+            f"{SAFE_CACHE_LIMIT_MIB:.0f} MiB for low-RAM systems. "
+            "Use a smaller cache or explicitly pass --allow-large-cache."
+        )
+
+    available = available_system_memory_bytes()
+    requested_bytes = int(args.cache_mib * 1024**2)
+    if available is not None and requested_bytes > 0:
+        # Never reserve more than 20% of RAM that is free when the process starts.
+        # This is a guard against turning a cache benchmark into system-wide memory pressure.
+        available_limit = int(available * 0.20)
+        if requested_bytes > available_limit and not args.allow_large_cache:
+            effective_bytes = max(0, available_limit)
+            effective_mib = effective_bytes / 1024**2
+            print(
+                f"Requested CPU cache: {args.cache_mib:.1f} MiB; "
+                f"available RAM: {available / 1024**2:.1f} MiB; "
+                f"using safe cache: {effective_mib:.1f} MiB"
+            )
+            args.cache_mib = effective_mib
 
     root = args.root.resolve()
     device = "cuda"
@@ -326,7 +386,9 @@ def main() -> None:
 
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"PyTorch CUDA: {torch.version.cuda}")
-    print(f"RAM FP8 cache budget: {args.cache_mib:.1f} MiB")
+    print(f"CPU FP8 cache budget: {args.cache_mib:.1f} MiB")
+    if available is not None:
+        print(f"Initial available RAM: {available / 1024**2:.1f} MiB")
 
     x = load_embedding_row(root, args.token_id).reshape(1, HIDDEN).to(device).float()
     torch.cuda.synchronize()
@@ -344,7 +406,6 @@ def main() -> None:
         torch.cuda.synchronize()
         layer_ms = (perf_counter() - start_layer) * 1000.0
         used_bytes, entries, hits, misses = cache.stats()
-
         print(f"layer {layer} ({kind}):")
         print(f"  router top-{args.top_k}: {expert_ids}")
         print(f"  router weights: {[round(v, 8) for v in weights]}")
@@ -360,7 +421,6 @@ def main() -> None:
         print(f"  cache misses: {misses}")
         print(f"  cache evictions: {cache.evictions}")
         print(f"  time: {layer_ms:.3f} ms")
-
         del residual
         gc.collect()
 
@@ -372,8 +432,8 @@ def main() -> None:
     print(f"final output min: {x.min().item():.8f}")
     print(f"final output max: {x.max().item():.8f}")
     print(f"total time: {total_ms:.3f} ms")
-    print(f"final RAM cache size: {cache.used_bytes / 1024**2:.1f} MiB")
-    print(f"final RAM cache entries: {len(cache.items)}")
+    print(f"final cache size: {cache.used_bytes / 1024**2:.1f} MiB")
+    print(f"final cache entries: {len(cache.items)}")
     print(f"final cache hits: {cache.hits}")
     print(f"final cache misses: {cache.misses}")
     print(f"final cache evictions: {cache.evictions}")
