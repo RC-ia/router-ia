@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-"""Batch mini-chat smoke test for Qwen3.6 router + LRU.
+"""Batch mini-chat smoke test for Qwen3.6 hierarchical RAM/VRAM caches.
 
 This is designed for notebook/Kaggle environments where interactive input()
-is inconvenient. Pass one or more --prompt values. The LRU stays alive across
-all prompts and generated tokens so we can observe cache reuse with different
-inputs.
+is inconvenient. Pass one or more --prompt values. The RAM/VRAM caches stay
+alive across all prompts and generated tokens so we can observe reuse across
+both tiers.
 
 Important: the underlying runtime is still stateless across generated tokens;
 this is not yet a faithful Qwen3.6 KV-cache/DeltaNet-sequence decoder.
@@ -21,34 +21,55 @@ import torch.nn.functional as F
 
 from . import qwen36_cached_loop as cached
 from . import qwen36_40layer_loop as base
-from .qwen36_mini_chat import (
-    find_tensor_name,
-    load_final_norm,
-    load_lm_head,
-    load_tokenizer,
-    sample_next,
-)
+from .qwen36_mini_chat import load_final_norm, load_lm_head, load_tokenizer, sample_next
 
 DEFAULT_MAX_NEW_TOKENS = 4
 
 
 def cache_stats(root: Path) -> dict[str, int | float]:
+    """Return aggregated RAM+VRAM stats plus per-tier metrics."""
     store = cached._stores.get(root.resolve())
-    return store.cache.snapshot() if store is not None else {}
+    if store is None:
+        return {}
+
+    ram = store.ram_cache.snapshot()
+    vram = store.vram_cache.snapshot()
+    hits = int(ram["hits"] + vram["hits"])
+    misses = int(ram["misses"] + vram["misses"])
+    total = hits + misses
+
+    return {
+        "hits": hits,
+        "misses": misses,
+        "hit_rate": hits / total * 100.0 if total else 0.0,
+        "ram_items": int(ram["items"]),
+        "ram_bytes": int(ram["bytes"]),
+        "ram_hit_rate": float(ram["hit_rate"]),
+        "ram_evictions": int(ram["evictions"]),
+        "vram_items": int(vram["items"]),
+        "vram_bytes": int(vram["bytes"]),
+        "vram_hit_rate": float(vram["hit_rate"]),
+        "vram_evictions": int(vram["evictions"]),
+        "vram_expert_hit_rate": float(vram["expert_hit_rate"]),
+        "vram_expert_share": float(vram["expert_share"]),
+    }
 
 
 def print_cache(root: Path, label: str) -> None:
     stats = cache_stats(root)
     if not stats:
-        print(f"  LRU {label}: unavailable")
+        print(f"  cache {label}: unavailable")
         return
+
     print(
-        f"  LRU {label}: "
-        f"items={stats['items']} | "
-        f"ram={stats['bytes'] / 1024**2:.1f}/{cached.CACHE_BUDGET_BYTES / 1024**2:.1f} MiB | "
-        f"hits={stats['hits']} | misses={stats['misses']} | "
+        f"  cache {label}: "
+        f"ram={stats['ram_bytes'] / 1024**2:.1f}/{cached.CACHE_BUDGET_BYTES / 1024**2:.1f} MiB | "
+        f"vram={stats['vram_bytes'] / 1024**2:.1f}/{cached.VRAM_CACHE_BUDGET_BYTES / 1024**2:.1f} MiB | "
         f"hit_rate={stats['hit_rate']:.2f}% | "
-        f"evictions={stats['evictions']}"
+        f"ram_hit={stats['ram_hit_rate']:.2f}% | "
+        f"vram_hit={stats['vram_hit_rate']:.2f}% | "
+        f"vram_expert={stats['vram_expert_share']:.1f}% | "
+        f"evictions=ram:{stats['ram_evictions']} vram:{stats['vram_evictions']}"
     )
 
 
@@ -105,8 +126,6 @@ def generate_response(
         print("IA> [nenhum token produzido pelo tokenizer]")
         return
 
-    # The current runtime cannot preserve sequence state yet. Use the final
-    # prompt token as the seed while keeping the LRU alive across turns.
     current_id = int(prompt_ids[-1])
     eos_id = getattr(tokenizer, "eos_token_id", None)
     generated: list[int] = []
@@ -119,13 +138,7 @@ def generate_response(
     for step in range(1, max_new_tokens + 1):
         before = cache_stats(root)
         next_id, elapsed, peak = run_generated_token(
-            root,
-            current_id,
-            final_norm,
-            lm_head,
-            device,
-            sampling_top_k,
-            temperature,
+            root, current_id, final_norm, lm_head, device, sampling_top_k, temperature
         )
         after = cache_stats(root)
 
@@ -142,6 +155,8 @@ def generate_response(
             f"time={elapsed:.3f}s | "
             f"step_hit_rate={step_hit_rate:.1f}% | "
             f"global_hit_rate={after.get('hit_rate', 0.0):.2f}% | "
+            f"ram_hit={after.get('ram_hit_rate', 0.0):.2f}% | "
+            f"vram_hit={after.get('vram_hit_rate', 0.0):.2f}% | "
             f"hits+{delta_hits} misses+{delta_misses} | "
             f"peak_logit={peak:.4f}",
             flush=True,
@@ -161,12 +176,8 @@ def generate_response(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Batch Qwen3.6 router mini-chat test")
     parser.add_argument("root", type=Path)
-    parser.add_argument(
-        "--prompt",
-        action="append",
-        required=True,
-        help="Prompt to test; repeat --prompt for multiple turns",
-    )
+    parser.add_argument("--prompt", action="append", required=True,
+                        help="Prompt to test; repeat --prompt for multiple turns")
     parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-k", type=int, default=20, help="Sampling top-k")
@@ -185,9 +196,13 @@ def main() -> None:
     lm_name, lm_head, _ = load_lm_head(root)
     norm_name, final_norm = load_final_norm(root)
 
+    if args.device == "cuda":
+        cached._configure_vram_limit("cuda")
+
     print("op=batch-mini-chat")
     print("mode=experimental-stateless-autoregressive")
     print("warning=no DeltaNet recurrent state or full-attention KV cache yet")
+    print("cache=hierarchical-vram-ram-ssd")
     print(f"prompts={len(args.prompt)}")
     print(f"device={args.device}")
     print(f"max_new_tokens={args.max_new_tokens}")
@@ -201,15 +216,10 @@ def main() -> None:
     for index, prompt in enumerate(args.prompt, start=1):
         print(f"\n===== TURN {index}/{len(args.prompt)} =====")
         generate_response(
-            root,
-            prompt,
-            tokenizer,
-            final_norm,
-            lm_head,
-            args.device,
-            args.max_new_tokens,
-            args.top_k,
-            args.temperature,
+            root, prompt, tokenizer, final_norm, lm_head, args.device,
+            max_new_tokens=args.max_new_tokens,
+            sampling_top_k=args.top_k,
+            temperature=args.temperature,
         )
 
     print("\n===== SUMMARY =====")
