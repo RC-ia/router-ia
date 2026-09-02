@@ -4,23 +4,17 @@ from __future__ import annotations
 
 CUDA cache layout:
 
-    resident VRAM + hot-expert VRAM + 300 MiB streaming window -> RAM -> SSD
+    resident VRAM + hot-expert VRAM + streaming window -> RAM -> SSD shards
 
-The resident pool never evicts. The hot-expert pool evicts only experts. On an
-expert cache miss the CUDA path streams the raw FP8 weight and its scale from
-RAM, dequantizes on the GPU, computes with it, and rotates the staging window
-when the routed layer changes.
-
-The default 3 GiB VRAM cache is split into 1.8 GiB resident, 0.9 GiB hot
-experts, and 0.3 GiB for the rotating streaming window. The process-level CUDA
-limit can still be higher (for example 3.5 GiB) to leave allocator headroom.
+The resident pool never evicts. The hot-expert pool evicts only experts.
+The streaming window is transient and is intended to feed the current layer.
 
 Environment variables:
     QWEN36_CACHE_GB: RAM cache budget, default 3.0 GiB.
     QWEN36_VRAM_GB: optional CUDA allocator limit, default 0 (disabled).
-    QWEN36_VRAM_CACHE_GB: total persistent VRAM cache budget, default 3.0 GiB.
-    QWEN36_RESIDENT_VRAM_RATIO: persistent resident share, default 0.60.
-    QWEN36_VRAM_STREAM_GB: rotating RAM->GPU staging budget, default 0.30 GiB.
+    QWEN36_VRAM_CACHE_GB: persistent VRAM cache budget, default 3.0 GiB.
+    QWEN36_RESIDENT_VRAM_RATIO: resident share, default 0.60.
+    QWEN36_VRAM_STREAM_GB: streaming window, default 0.60 GiB.
     QWEN36_EXPERT_BONUS: hot-expert priority bonus, default 4.0.
     QWEN36_CACHE_LOG_INTERVAL: progress interval, default 0.
 """
@@ -58,7 +52,12 @@ VRAM_GB = _env_float("QWEN36_VRAM_GB", 0.0)
 VRAM_CACHE_GB = _env_float("QWEN36_VRAM_CACHE_GB", 3.0)
 VRAM_CACHE_BUDGET_BYTES = int(VRAM_CACHE_GB * 1024**3)
 RESIDENT_VRAM_RATIO = min(_env_float("QWEN36_RESIDENT_VRAM_RATIO", 0.60), 0.95)
-STREAM_GB = min(_env_float("QWEN36_VRAM_STREAM_GB", 0.30), max(VRAM_CACHE_GB * 0.5, 0.01))
+# Give the streaming path more VRAM and deliberately keep only a small
+# persistent expert pool. This favors RAM -> GPU -> compute over expert churn.
+STREAM_GB = min(
+    _env_float("QWEN36_VRAM_STREAM_GB", 0.60),
+    max(VRAM_CACHE_GB - 0.10, 0.01),
+)
 STREAM_BUDGET_BYTES = int(STREAM_GB * 1024**3)
 RESIDENT_VRAM_BUDGET_BYTES = int(VRAM_CACHE_BUDGET_BYTES * RESIDENT_VRAM_RATIO)
 EXPERT_VRAM_BUDGET_BYTES = max(
@@ -79,7 +78,6 @@ def _requested_device() -> str:
 
 
 def _configure_vram_limit(device: str) -> None:
-    """Optionally cap this process's CUDA allocator before CUDA allocations."""
     if device != "cuda" or VRAM_GB <= 0:
         return
     if not torch.cuda.is_available():
@@ -118,8 +116,6 @@ def _is_expert_tensor(name: str) -> bool:
 
 
 class _PriorityTensorCache:
-    """Soft-priority cache; eviction can be disabled for resident tensors."""
-
     def __init__(self, max_bytes: int, name: str, evict: bool = True) -> None:
         self.max_bytes = max_bytes
         self.name = name
@@ -224,7 +220,9 @@ class _PriorityTensorCache:
             expert_total = self.expert_hits + self.expert_misses
             expert_items = sum(self.item_expert.values())
             expert_bytes = sum(
-                self.item_bytes[name] for name, value in self.item_expert.items() if value
+                self.item_bytes[name]
+                for name, value in self.item_expert.items()
+                if value
             )
             general_bytes = self.bytes_used - expert_bytes
             return {
@@ -250,7 +248,7 @@ class _PriorityTensorCache:
 
 
 class _DualVRAMCache:
-    """Resident cache + hot-expert cache + rotating streaming window."""
+    """Resident pool + small expert cache + larger rotating stream pool."""
 
     def __init__(self, total_bytes: int) -> None:
         self.resident = _PriorityTensorCache(
@@ -320,7 +318,11 @@ class _DualVRAMCache:
             "expert_evictions": int(experts["evictions"]),
             "general_evictions": 0,
             "stream_evictions": int(stream["evictions"]),
-            "skipped_oversize": int(resident["skipped_oversize"] + experts["skipped_oversize"] + stream["skipped_oversize"]),
+            "skipped_oversize": int(
+                resident["skipped_oversize"]
+                + experts["skipped_oversize"]
+                + stream["skipped_oversize"]
+            ),
             "loads": int(resident["loads"] + experts["loads"] + stream["loads"]),
             "resident_items": int(resident["items"]),
             "resident_bytes": int(resident["bytes"]),
@@ -357,7 +359,9 @@ class _ShardStore:
         if handle is not None:
             self.handle_hits += 1
             return handle
-        handle = self.stack.enter_context(safe_open(str(shard), framework="pt", device="cpu"))
+        handle = self.stack.enter_context(
+            safe_open(str(shard), framework="pt", device="cpu")
+        )
         self.handles[shard] = handle
         self.handle_opens += 1
         return handle
@@ -381,12 +385,15 @@ class _ShardStore:
             f"ram_hit={ram['hit_rate']:.1f}% | vram_hit={vram['hit_rate']:.1f}% | "
             f"expert_vram_hit={vram['expert_pool_hit_rate']:.1f}% | "
             f"stream_hit={vram['stream_hit_rate']:.1f}% | "
-            f"expert_evict={vram['expert_evictions']} | stream_evict={vram['stream_evictions']} | last={name}"
+            f"expert_evict={vram['expert_evictions']} | "
+            f"stream_evict={vram['stream_evictions']} | last={name}"
         )
 
     def _load_ssd(self, name: str) -> torch.Tensor:
         shard_name = self.weight_map.get(name)
-        shards = [self.root / shard_name] if shard_name else sorted(self.root.glob("*.safetensors"))
+        shards = [self.root / shard_name] if shard_name else sorted(
+            self.root.glob("*.safetensors")
+        )
         for shard in shards:
             if not shard.is_file():
                 continue
@@ -459,7 +466,7 @@ class _ShardStore:
         return out
 
     def stream_projection(self, prefix: str) -> torch.Tensor:
-        """Stream an expert from RAM into CUDA and dequantize there."""
+        """Stream one expert projection from RAM into the rotating staging pool."""
         if self.target_device != "cuda":
             raise RuntimeError("stream_projection requires CUDA")
 
@@ -470,14 +477,10 @@ class _ShardStore:
                 layer_id = int(prefix.split(layer_prefix_marker, 1)[1].split(".", 1)[0])
             except (ValueError, IndexError):
                 layer_id = None
+
         if layer_id is not None and layer_id != self._stream_layer:
             self.vram_cache.clear_stream()
             self._stream_layer = layer_id
-
-        persistent_key = prefix + ".__projection__"
-        cached = self.vram_cache.get(persistent_key)
-        if cached is not None:
-            return cached
 
         stream_key = prefix + ".__stream__"
         cached_stream = self.vram_cache.get_stream(stream_key)
@@ -496,10 +499,6 @@ class _ShardStore:
             gpu_out = weight.to(device="cuda", dtype=torch.float16)
             del weight
 
-        # Promotion uses the same tensor object, so a successful hot-cache
-        # promotion does not duplicate VRAM. The streaming reference keeps it
-        # alive for the current layer even when the hot pool is full.
-        self.vram_cache.put(persistent_key, gpu_out)
         self.vram_cache.put_stream(stream_key, gpu_out)
         self._maybe_log_progress(stream_key)
         return gpu_out
@@ -508,7 +507,12 @@ class _ShardStore:
         self.vram_cache.clear_stream()
         self._stream_layer = None
 
-    def runtime_tensor(self, name: str, device: str, dtype: torch.dtype | None = torch.float32) -> torch.Tensor:
+    def runtime_tensor(
+        self,
+        name: str,
+        device: str,
+        dtype: torch.dtype | None = torch.float32,
+    ) -> torch.Tensor:
         self.target_device = device
         cache_key = name + ".__runtime__"
         if device == "cuda":
@@ -550,39 +554,51 @@ def _cached_load_tensor(root: Path, name: str, device: str = "cpu"):
     return tensor
 
 
+def _dequantize_for_store(
+    store: _ShardStore,
+    weight: torch.Tensor,
+    scale_inv: torch.Tensor,
+    cache_key: str,
+) -> torch.Tensor:
+    if store.target_device != "cuda":
+        return dequantize_fp8_blockwise(weight, scale_inv)
+
+    cached_tensor = store.vram_cache.get(cache_key)
+    if cached_tensor is not None:
+        return cached_tensor
+
+    gpu_weight = weight.to(device="cuda")
+    gpu_scale = scale_inv.to(device="cuda")
+    gpu_out = dequantize_fp8_blockwise(gpu_weight, gpu_scale).to(dtype=torch.float16)
+    del gpu_weight, gpu_scale
+    store.vram_cache.put(cache_key, gpu_out)
+    store._maybe_log_progress(cache_key)
+    return gpu_out
+
+
 def _cached_dequantize(weight: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
     origin = _tensor_origins.get(id(weight))
     if origin is None:
         return dequantize_fp8_blockwise(weight, scale_inv)
     root, name = origin
     store = _store(root)
-    cache_key = name + ".__dequant__"
-    if store.target_device == "cuda":
-        gpu_weight = weight.to(device="cuda")
-        gpu_scale = scale_inv.to(device="cuda")
-        out = dequantize_fp8_blockwise(gpu_weight, gpu_scale).to(dtype=torch.float16)
-        del gpu_weight, gpu_scale
-        store.vram_cache.put(cache_key, out)
-        return out
-    return dequantize_fp8_blockwise(weight, scale_inv)
+    return _dequantize_for_store(store, weight, scale_inv, name + ".__dequant__")
 
 
 def _cached_load_projection(root: Path, prefix: str, device: str) -> torch.Tensor:
+    store = _store(root)
     if device == "cuda" and _is_expert_tensor(prefix + ".weight"):
-        return _store(root).stream_projection(prefix)
-    return _store(root).load_projection(prefix, device)
+        return store.stream_projection(prefix)
+    return store.load_projection(prefix, device)
 
 
-def cached_runtime_tensor(root: Path, name: str, device: str, dtype: torch.dtype | None = torch.float32) -> torch.Tensor:
+def cached_runtime_tensor(
+    root: Path,
+    name: str,
+    device: str,
+    dtype: torch.dtype | None = torch.float32,
+) -> torch.Tensor:
     return _store(root).runtime_tensor(name, device, dtype)
-
-
-def cached_stream_projection(root: Path, prefix: str) -> torch.Tensor:
-    return _store(root).stream_projection(prefix)
-
-
-def clear_cuda_stream(root: Path) -> None:
-    _store(root).clear_stream()
 
 
 base.load_tensor = _cached_load_tensor
@@ -603,6 +619,7 @@ def _format_mib(value: int) -> str:
 def main() -> None:
     device = _requested_device()
     _configure_vram_limit(device)
+
     print(
         "Cache config: "
         f"ram={CACHE_GB:.2f} GiB | "
@@ -610,9 +627,10 @@ def main() -> None:
         f"resident={RESIDENT_VRAM_BUDGET_BYTES / 1024**3:.2f} GiB | "
         f"hot_experts={EXPERT_VRAM_BUDGET_BYTES / 1024**3:.2f} GiB | "
         f"stream={STREAM_GB:.2f} GiB | "
-        f"mode=resident-plus-hot-experts-plus-stream | fp16_vram=on | "
+        f"mode=resident-hot-stream | fp16_vram=on | "
         f"expert_bonus={EXPERT_BONUS:.2f}"
     )
+
     base.main()
 
     for root, store in _stores.items():
