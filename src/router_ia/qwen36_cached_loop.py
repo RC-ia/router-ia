@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-"""Qwen3.6 loop with a persistent Safetensors shard reader.
+"""Qwen3.6 loop with optimized Safetensors I/O and FP8 dequantization.
 
-This wrapper keeps the reference math in qwen36_40layer_loop.py unchanged and
-only replaces its tensor-loading backend. The model index is parsed once and
-Safetensors shards are opened lazily and kept open for the lifetime of the run.
-Individual tensors are still materialized only when requested, so this is not a
-whole-model RAM cache.
+This wrapper keeps the reference math in qwen36_40layer_loop.py unchanged while
+replacing only the tensor-loading backend and FP8 dequantizer. Safetensors
+shards are opened lazily and kept open for the lifetime of the run. FP8 scales
+are broadcast over quantization blocks without materializing a full-size scale
+matrix.
 """
 
 import atexit
@@ -17,6 +17,7 @@ from pathlib import Path
 from safetensors import safe_open
 
 from . import qwen36_40layer_loop as base
+from .qwen36_dequant import dequantize_fp8_blockwise
 
 
 class _ShardStore:
@@ -83,10 +84,11 @@ def _cached_load_tensor(root: Path, name: str, device: str = "cpu"):
     return _store(root).load(name, device)
 
 
-# Functions in qwen36_40layer_loop resolve load_tensor through that module's
-# globals. Patching this symbol therefore changes only the I/O backend while
-# preserving the exact reference computation.
+# qwen36_40layer_loop resolves both names through its module globals. Patching
+# them here preserves the exact reference computation and changes only the
+# I/O/dequantization implementation.
 base.load_tensor = _cached_load_tensor
+base.dequantize_fp8_blockwise = dequantize_fp8_blockwise
 
 
 @atexit.register
@@ -96,7 +98,6 @@ def _close_stores() -> None:
 
 
 def main() -> None:
-    # Execute the unchanged reference runner using the cached reader above.
     base.main()
 
     for root, store in _stores.items():
