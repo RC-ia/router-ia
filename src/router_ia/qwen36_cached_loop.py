@@ -6,9 +6,9 @@ Cache hierarchy for CUDA runs:
 
     VRAM cache -> RAM cache -> SSD shards
 
-The VRAM cache keeps raw weight tensors resident on the GPU when possible.
-The RAM cache remains the larger fallback tier. Both caches use a soft
-frequency/recency priority score, with a preservation bonus for MoE experts.
+FP8 weights are kept raw in RAM, while the dequantized tensors used by the
+GPU compute path can remain resident in the VRAM cache. This makes repeated
+expert/projection accesses avoid SSD I/O, CPU->GPU transfer and dequantization.
 
 Environment variables:
     QWEN36_CACHE_GB:
@@ -128,25 +128,21 @@ class _PriorityTensorCache:
     def __init__(self, max_bytes: int, name: str) -> None:
         self.max_bytes = max_bytes
         self.name = name
-
         self.items: dict[str, torch.Tensor] = {}
         self.item_bytes: dict[str, int] = {}
         self.item_hits: dict[str, int] = {}
         self.item_last_access: dict[str, int] = {}
         self.item_expert: dict[str, bool] = {}
         self.clock = 0
-
         self.bytes_used = 0
         self.expert_bytes = 0
         self.general_bytes = 0
-
         self.hits = 0
         self.misses = 0
         self.expert_hits = 0
         self.expert_misses = 0
         self.general_hits = 0
         self.general_misses = 0
-
         self.evictions = 0
         self.expert_evictions = 0
         self.general_evictions = 0
@@ -179,7 +175,6 @@ class _PriorityTensorCache:
         self.items.pop(name, None)
         self.item_hits.pop(name, None)
         self.item_last_access.pop(name, None)
-
         self.bytes_used -= size
         if expert:
             self.expert_bytes -= size
@@ -215,10 +210,8 @@ class _PriorityTensorCache:
         with self.lock:
             self.clock += 1
             self.loads += 1
-
             if name in self.items:
                 self._remove(name)
-
             if size > self.max_bytes:
                 self.skipped_oversize += 1
                 return
@@ -301,6 +294,7 @@ class _ShardStore:
         self.handle_hits = 0
         self.ram_cache = _PriorityTensorCache(CACHE_BUDGET_BYTES, "ram")
         self.vram_cache = _PriorityTensorCache(VRAM_CACHE_BUDGET_BYTES, "vram")
+        self.target_device = "cpu"
         self._last_log_loads = 0
 
         index_path = self.root / "model.safetensors.index.json"
@@ -358,6 +352,7 @@ class _ShardStore:
 
     def load(self, name: str, device: str):
         if device == "cuda":
+            self.target_device = "cuda"
             gpu_cached = self.vram_cache.get(name)
             if gpu_cached is not None:
                 self._maybe_log_progress(name)
@@ -386,6 +381,47 @@ class _ShardStore:
         self._maybe_log_progress(name)
         return gpu_tensor
 
+    def load_projection(self, prefix: str, device: str) -> torch.Tensor:
+        self.target_device = device
+        weight_name = prefix + ".weight"
+        cache_key = prefix + ".__projection__"
+
+        if device == "cuda":
+            cached_projection = self.vram_cache.get(cache_key)
+            if cached_projection is not None:
+                self._maybe_log_progress(cache_key)
+                return cached_projection
+
+        weight = self.load(weight_name, device="cpu")
+        if weight.dtype == torch.float8_e4m3fn:
+            scale = self.load(prefix + ".weight_scale_inv", device="cpu")
+            out = _dequantize_for_store(self, weight, scale, cache_key)
+            del scale, weight
+            return out
+
+        out = weight.float().to(device)
+        if device == "cuda":
+            self.vram_cache.put(cache_key, out)
+        del weight
+        self._maybe_log_progress(cache_key)
+        return out
+
+    def runtime_tensor(self, name: str, device: str, dtype: torch.dtype | None = torch.float32) -> torch.Tensor:
+        self.target_device = device
+        cache_key = name + ".__runtime__"
+        if device == "cuda":
+            cached_tensor = self.vram_cache.get(cache_key)
+            if cached_tensor is not None:
+                return cached_tensor
+
+        tensor = self.load(name, device="cpu")
+        if dtype is not None:
+            tensor = tensor.float() if dtype == torch.float32 else tensor.to(dtype=dtype)
+        out = tensor.to(device)
+        if device == "cuda":
+            self.vram_cache.put(cache_key, out)
+        return out
+
     def close(self) -> None:
         self.vram_cache.clear()
         self.ram_cache.clear()
@@ -394,6 +430,7 @@ class _ShardStore:
 
 
 _stores: dict[Path, _ShardStore] = {}
+_tensor_origins: dict[int, tuple[Path, str]] = {}
 
 
 def _store(root: Path) -> _ShardStore:
@@ -406,11 +443,57 @@ def _store(root: Path) -> _ShardStore:
 
 
 def _cached_load_tensor(root: Path, name: str, device: str = "cpu"):
-    return _store(root).load(name, device)
+    store = _store(root)
+    tensor = store.load(name, device)
+    _tensor_origins[id(tensor)] = (root.resolve(), name)
+    return tensor
+
+
+def _dequantize_for_store(
+    store: _ShardStore,
+    weight: torch.Tensor,
+    scale_inv: torch.Tensor,
+    cache_key: str,
+) -> torch.Tensor:
+    if store.target_device != "cuda":
+        return dequantize_fp8_blockwise(weight, scale_inv)
+
+    cached_tensor = store.vram_cache.get(cache_key)
+    if cached_tensor is not None:
+        return cached_tensor
+
+    cpu_out = dequantize_fp8_blockwise(weight, scale_inv)
+    gpu_out = cpu_out.to(device="cuda")
+    del cpu_out
+    store.vram_cache.put(cache_key, gpu_out)
+    store._maybe_log_progress(cache_key)
+    return gpu_out
+
+
+def _cached_dequantize(weight: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
+    origin = _tensor_origins.get(id(weight))
+    if origin is None:
+        return dequantize_fp8_blockwise(weight, scale_inv)
+
+    root, name = origin
+    store = _store(root)
+    cache_key = name + ".__dequant__"
+    return _dequantize_for_store(store, weight, scale_inv, cache_key)
+
+
+def _cached_load_projection(root: Path, prefix: str, device: str) -> torch.Tensor:
+    store = _store(root)
+    return store.load_projection(prefix, device)
+
+
+def cached_runtime_tensor(root: Path, name: str, device: str, dtype: torch.dtype | None = torch.float32) -> torch.Tensor:
+    """Load a runtime tensor through the hierarchical cache."""
+    return _store(root).runtime_tensor(name, device, dtype)
 
 
 base.load_tensor = _cached_load_tensor
-base.dequantize_fp8_blockwise = dequantize_fp8_blockwise
+base.load_projection = _cached_load_projection
+base.dequantize_fp8_blockwise = _cached_dequantize
 
 
 @atexit.register
@@ -432,6 +515,7 @@ def main() -> None:
         f"ram={CACHE_GB:.2f} GiB | "
         f"vram_cache={VRAM_CACHE_GB:.2f} GiB | "
         f"mode=hierarchical-vram-ram-ssd | "
+        f"dequantized_vram_cache=on | "
         f"expert_bonus={EXPERT_BONUS:.2f} | "
         f"vram_limit={VRAM_GB:.2f} GiB | "
         f"log_interval={CACHE_LOG_INTERVAL or 'off'}"
