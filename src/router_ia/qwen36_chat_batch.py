@@ -1,6 +1,15 @@
 from __future__ import annotations
 
-"""Batch mini-chat smoke test for Qwen3.6 hierarchical RAM/VRAM caches."""
+"""Batch mini-chat smoke test for Qwen3.6 hierarchical RAM/VRAM caches.
+
+This is designed for notebook/Kaggle environments where interactive input()
+is inconvenient. Pass one or more --prompt values. The RAM/VRAM caches stay
+alive across all prompts and generated tokens so we can observe reuse across
+both tiers.
+
+Important: the underlying runtime is still stateless across generated tokens;
+this is not yet a faithful Qwen3.6 KV-cache/DeltaNet-sequence decoder.
+"""
 
 import argparse
 import gc
@@ -59,6 +68,73 @@ def print_cache(root: Path, label: str) -> None:
     )
 
 
+def _projection(root: Path, prefix: str, device: str) -> torch.Tensor:
+    """Load a dequantized projection through the hierarchical cache."""
+    return cached._cached_load_projection(root, prefix, device)
+
+
+def batched_moe_step(
+    root: Path,
+    layer: int,
+    residual: torch.Tensor,
+    top_k: int,
+    device: str,
+) -> tuple[torch.Tensor, list[int], list[float], float, float]:
+    """Run the selected routed experts as one batched GPU workload."""
+    prefix = base.layer_prefix(layer)
+    post_norm = base.load_layer_weight(root, layer, "post_attention_layernorm.weight", device)
+    moe_in = base.rmsnorm(residual, post_norm).reshape(1, base.HIDDEN).float()
+    router_w = base.load_layer_weight(root, layer, "mlp.gate.weight", device).float()
+
+    routed = base.route(moe_in.reshape(-1), router_w, top_k=top_k)
+    expert_ids = [int(v) for v in routed.expert_ids.detach().cpu().tolist()]
+    weights = [float(v) for v in routed.weights.detach().cpu().tolist()]
+
+    gate_weights = []
+    up_weights = []
+    down_weights = []
+    for expert_id in expert_ids:
+        expert_prefix = f"{prefix}mlp.experts.{expert_id}"
+        gate_weights.append(_projection(root, expert_prefix + ".gate_proj", device).float())
+        up_weights.append(_projection(root, expert_prefix + ".up_proj", device).float())
+        down_weights.append(_projection(root, expert_prefix + ".down_proj", device).float())
+
+    gate_w = torch.stack(gate_weights, dim=0)
+    up_w = torch.stack(up_weights, dim=0)
+    down_w = torch.stack(down_weights, dim=0)
+
+    batch_x = moe_in.expand(len(expert_ids), -1)
+    gate = torch.bmm(gate_w, batch_x.unsqueeze(-1)).squeeze(-1)
+    up = torch.bmm(up_w, batch_x.unsqueeze(-1)).squeeze(-1)
+    hidden = F.silu(gate) * up
+    expert_out = torch.bmm(down_w, hidden.unsqueeze(-1)).squeeze(-1)
+    routing = torch.tensor(weights, device=device, dtype=expert_out.dtype).reshape(-1, 1)
+    routed_sum = (expert_out * routing).sum(dim=0, keepdim=True)
+
+    shared_gate_w = base.load_layer_weight(root, layer, "mlp.shared_expert_gate.weight", device).float()
+    shared_gate = torch.sigmoid(F.linear(moe_in, shared_gate_w))
+    shared_gate_proj = _projection(root, f"{prefix}mlp.shared_expert.gate_proj", device).float()
+    shared_up_proj = _projection(root, f"{prefix}mlp.shared_expert.up_proj", device).float()
+    shared_down_proj = _projection(root, f"{prefix}mlp.shared_expert.down_proj", device).float()
+    shared_hidden = F.silu(F.linear(moe_in, shared_gate_proj)) * F.linear(moe_in, shared_up_proj)
+    shared_out = F.linear(shared_hidden, shared_down_proj) * shared_gate
+
+    moe_out = routed_sum + shared_out
+    layer_out = residual + moe_out
+    shared_gate_value = float(shared_gate.item())
+    moe_input_norm = float(torch.linalg.vector_norm(moe_in).item())
+
+    del post_norm, moe_in, router_w, routed
+    del gate_weights, up_weights, down_weights
+    del gate_w, up_w, down_w, batch_x, gate, up, hidden, expert_out, routing, routed_sum
+    del shared_gate_w, shared_gate, shared_gate_proj, shared_up_proj, shared_down_proj
+    del shared_hidden, shared_out, moe_out
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    return layer_out, expert_ids, weights, shared_gate_value, moe_input_norm
+
+
 def run_generated_token(
     root: Path,
     token_id: int,
@@ -79,7 +155,7 @@ def run_generated_token(
             residual = base.linear_attention_step(root, layer, x, device)
         else:
             residual = base.full_attention_step(root, layer, x, device)
-        x, *_ = base.moe_step(root, layer, residual, top_k=8, device=device)
+        x, *_ = batched_moe_step(root, layer, residual, top_k=8, device=device)
         del residual
 
     if device == "cuda":
@@ -205,6 +281,7 @@ def main() -> None:
     print("warning=no DeltaNet recurrent state or full-attention KV cache yet")
     print("cache=hierarchical-vram-ram-ssd")
     print("vram_dequantized_cache=on")
+    print("moe=batched-top8-gpu")
     print(f"prompts={len(args.prompt)}")
     print(f"device={args.device}")
     print(f"max_new_tokens={args.max_new_tokens}")
@@ -221,11 +298,11 @@ def main() -> None:
             root,
             prompt,
             tokenizer,
-            final_norm,
-            lm_head,
-            norm_name,
-            lm_name,
-            args.device,
+            lm_head=lm_head,
+            final_norm=final_norm,
+            final_norm_name=norm_name,
+            lm_head_name=lm_name,
+            device=args.device,
             max_new_tokens=args.max_new_tokens,
             sampling_top_k=args.top_k,
             temperature=args.temperature,
