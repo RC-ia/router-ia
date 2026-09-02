@@ -39,6 +39,12 @@ def cache_stats(root: Path) -> dict[str, int | float]:
         "vram_hit_rate": float(vram["hit_rate"]),
         "vram_evictions": int(vram["evictions"]),
         "vram_expert_share": float(vram["expert_share"]),
+        "vram_resident_bytes": int(vram["resident_bytes"]),
+        "vram_resident_budget": int(vram["resident_budget_bytes"]),
+        "vram_expert_bytes": int(vram["expert_bytes"]),
+        "vram_expert_budget": int(vram["expert_budget_bytes"]),
+        "vram_expert_hit_rate": float(vram["expert_pool_hit_rate"]),
+        "vram_expert_evictions": int(vram["expert_evictions"]),
     }
 
 
@@ -51,11 +57,13 @@ def print_cache(root: Path, label: str) -> None:
         f"  cache {label}: "
         f"ram={stats['ram_bytes'] / 1024**2:.1f}/{cached.CACHE_BUDGET_BYTES / 1024**2:.1f} MiB | "
         f"vram={stats['vram_bytes'] / 1024**2:.1f}/{cached.VRAM_CACHE_BUDGET_BYTES / 1024**2:.1f} MiB | "
+        f"resident={stats['vram_resident_bytes'] / 1024**2:.1f}/{stats['vram_resident_budget'] / 1024**2:.1f} MiB | "
+        f"experts={stats['vram_expert_bytes'] / 1024**2:.1f}/{stats['vram_expert_budget'] / 1024**2:.1f} MiB | "
         f"hit_rate={stats['hit_rate']:.2f}% | "
         f"ram_hit={stats['ram_hit_rate']:.2f}% | "
         f"vram_hit={stats['vram_hit_rate']:.2f}% | "
-        f"vram_expert={stats['vram_expert_share']:.1f}% | "
-        f"evictions=ram:{stats['ram_evictions']} vram:{stats['vram_evictions']}"
+        f"expert_vram_hit={stats['vram_expert_hit_rate']:.2f}% | "
+        f"expert_evictions={stats['vram_expert_evictions']}"
     )
 
 
@@ -71,7 +79,7 @@ def batched_moe_step(
     top_k: int,
     device: str,
 ) -> tuple[torch.Tensor, list[int], list[float], float, float]:
-    """Run the selected routed experts as one batched GPU workload."""
+    """Run selected routed experts as one batched GPU workload."""
     prefix = base.layer_prefix(layer)
     post_norm = base.load_layer_weight(root, layer, "post_attention_layernorm.weight", device)
     moe_in = base.rmsnorm(residual, post_norm).reshape(1, base.HIDDEN).float()
@@ -86,9 +94,9 @@ def batched_moe_step(
     down_weights = []
     for expert_id in expert_ids:
         expert_prefix = f"{prefix}mlp.experts.{expert_id}"
-        gate_weights.append(_projection(root, expert_prefix + ".gate_proj", device).float())
-        up_weights.append(_projection(root, expert_prefix + ".up_proj", device).float())
-        down_weights.append(_projection(root, expert_prefix + ".down_proj", device).float())
+        gate_weights.append(_projection(root, expert_prefix + ".gate_proj", device))
+        up_weights.append(_projection(root, expert_prefix + ".up_proj", device))
+        down_weights.append(_projection(root, expert_prefix + ".down_proj", device))
 
     gate_w = torch.stack(gate_weights, dim=0)
     up_w = torch.stack(up_weights, dim=0)
@@ -97,8 +105,9 @@ def batched_moe_step(
     batch_x = moe_in.expand(len(expert_ids), -1)
     if device == "cuda":
         with torch.autocast(device_type="cuda", dtype=torch.float16):
-            gate = torch.bmm(gate_w, batch_x.unsqueeze(-1)).squeeze(-1)
-            up = torch.bmm(up_w, batch_x.unsqueeze(-1)).squeeze(-1)
+            batch_x_compute = batch_x.to(dtype=torch.float16)
+            gate = torch.bmm(gate_w, batch_x_compute.unsqueeze(-1)).squeeze(-1)
+            up = torch.bmm(up_w, batch_x_compute.unsqueeze(-1)).squeeze(-1)
             hidden = F.silu(gate) * up
             expert_out = torch.bmm(down_w, hidden.unsqueeze(-1)).squeeze(-1)
             routing = torch.tensor(weights, device=device, dtype=expert_out.dtype).reshape(-1, 1)
@@ -110,16 +119,17 @@ def batched_moe_step(
         expert_out = torch.bmm(down_w, hidden.unsqueeze(-1)).squeeze(-1)
         routing = torch.tensor(weights, device=device, dtype=expert_out.dtype).reshape(-1, 1)
         routed_sum = (expert_out * routing).sum(dim=0, keepdim=True)
+        batch_x_compute = batch_x
 
     shared_gate_w = base.load_layer_weight(root, layer, "mlp.shared_expert_gate.weight", device).float()
-    shared_gate_proj = _projection(root, f"{prefix}mlp.shared_expert.gate_proj", device).float()
-    shared_up_proj = _projection(root, f"{prefix}mlp.shared_expert.up_proj", device).float()
-    shared_down_proj = _projection(root, f"{prefix}mlp.shared_expert.down_proj", device).float()
+    shared_gate_proj = _projection(root, f"{prefix}mlp.shared_expert.gate_proj", device)
+    shared_up_proj = _projection(root, f"{prefix}mlp.shared_expert.up_proj", device)
+    shared_down_proj = _projection(root, f"{prefix}mlp.shared_expert.down_proj", device)
 
     if device == "cuda":
         with torch.autocast(device_type="cuda", dtype=torch.float16):
             shared_gate = torch.sigmoid(F.linear(moe_in, shared_gate_w))
-            shared_hidden = F.silu(F.linear(moe_in, shared_gate_proj)) * F.linear(moe_in, shared_up_proj)
+            shared_hidden = F.silu(F.linear(moe_in.to(shared_gate_proj.dtype), shared_gate_proj)) * F.linear(moe_in.to(shared_up_proj.dtype), shared_up_proj)
             shared_out = F.linear(shared_hidden, shared_down_proj) * shared_gate
     else:
         shared_gate = torch.sigmoid(F.linear(moe_in, shared_gate_w))
@@ -133,12 +143,10 @@ def batched_moe_step(
 
     del post_norm, moe_in, router_w, routed
     del gate_weights, up_weights, down_weights
-    del gate_w, up_w, down_w, batch_x, gate, up, hidden, expert_out, routing, routed_sum
+    del gate_w, up_w, down_w, batch_x, batch_x_compute, gate, up, hidden, expert_out, routing, routed_sum
     del shared_gate_w, shared_gate, shared_gate_proj, shared_up_proj, shared_down_proj
     del shared_hidden, shared_out, moe_out
     gc.collect()
-    if device == "cuda":
-        torch.cuda.empty_cache()
     return layer_out, expert_ids, weights, shared_gate_value, moe_input_norm
 
 
@@ -243,6 +251,7 @@ def generate_response(
             f"global_hit_rate={after.get('hit_rate', 0.0):.2f}% | "
             f"ram_hit={after.get('ram_hit_rate', 0.0):.2f}% | "
             f"vram_hit={after.get('vram_hit_rate', 0.0):.2f}% | "
+            f"expert_vram_hit={after.get('vram_expert_hit_rate', 0.0):.2f}% | "
             f"hits+{delta_hits} misses+{delta_misses} | "
             f"peak_logit={peak:.4f}",
             flush=True,
@@ -280,12 +289,16 @@ def main() -> None:
 
     if args.device == "cuda":
         cached._configure_vram_limit("cuda")
+        # Pin the two tensors with the highest reuse before layer projections fill the resident pool.
+        cached.cached_runtime_tensor(root, norm_name, "cuda", dtype=torch.float32)
+        cached.cached_runtime_tensor(root, lm_name, "cuda", dtype=torch.float16)
 
     print("op=batch-mini-chat")
     print("mode=experimental-stateless-autoregressive")
     print("warning=no DeltaNet recurrent state or full-attention KV cache yet")
     print("cache=hierarchical-vram-ram-ssd")
-    print("vram_dequantized_cache=on")
+    print("vram_policy=resident-60pct-hot-experts-40pct")
+    print("vram_dequantized_cache=fp16")
     print("cuda_compute=fp16-autocast")
     print(f"prompts={len(args.prompt)}")
     print(f"device={args.device}")
