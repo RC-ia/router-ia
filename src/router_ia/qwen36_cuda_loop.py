@@ -4,15 +4,17 @@ from __future__ import annotations
 
 The existing qwen36_40layer_loop.py remains the CPU/reference implementation.
 This variant keeps FP8 weights compact while transferring them to the target
-GPU, then performs the blockwise dequantization on the target device.  It is
-intended for older CUDA GPUs such as Pascal, so all math is performed in
-float32 after dequantization rather than relying on native FP8 arithmetic.
+GPU, then performs the blockwise dequantization on the target device. It also
+supports a conservative LRU cache for already-used MoE/shared-expert weights
+so repeated tokens can reuse GPU-resident weights without prefetching whole
+layers.
 
 Full-attention KV cache is still intentionally limited to position 0.
 """
 
 import argparse
 import gc
+from collections import OrderedDict
 from pathlib import Path
 from time import perf_counter
 
@@ -25,7 +27,6 @@ from .qwen36_op_probe import (
     HEAD_DIM,
     dequantize_fp8_blockwise,
     load_embedding_row,
-    load_projection,
     load_tensor,
     rmsnorm,
 )
@@ -43,6 +44,70 @@ FULL_Q_DIM = FULL_NUM_HEADS * FULL_HEAD_DIM
 FULL_NUM_KV_GROUPS = FULL_NUM_HEADS // FULL_NUM_KV_HEADS
 EPS = 1e-6
 DEFAULT_LAYERS = 40
+DEFAULT_CACHE_MIB = 512.0
+
+
+class GPUWeightCache:
+    """Conservative LRU cache for dequantized MoE weights on the GPU."""
+
+    def __init__(self, budget_mib: float) -> None:
+        if budget_mib < 0:
+            raise ValueError("cache budget must be non-negative")
+        self.budget_bytes = int(budget_mib * 1024**2)
+        self.used_bytes = 0
+        self.items: OrderedDict[str, tuple[torch.Tensor, int]] = OrderedDict()
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+
+    @staticmethod
+    def nbytes(tensor: torch.Tensor) -> int:
+        return int(tensor.numel() * tensor.element_size())
+
+    def get(self, key: str) -> torch.Tensor | None:
+        item = self.items.get(key)
+        if item is None:
+            self.misses += 1
+            return None
+        tensor, _ = item
+        self.items.move_to_end(key)
+        self.hits += 1
+        return tensor
+
+    def put(self, key: str, tensor: torch.Tensor) -> torch.Tensor:
+        size = self.nbytes(tensor)
+        if self.budget_bytes == 0 or size > self.budget_bytes:
+            return tensor
+
+        old = self.items.pop(key, None)
+        if old is not None:
+            self.used_bytes -= old[1]
+
+        while self.items and self.used_bytes + size > self.budget_bytes:
+            _, (evicted, evicted_size) = self.items.popitem(last=False)
+            self.used_bytes -= evicted_size
+            self.evictions += 1
+            del evicted
+
+        self.items[key] = (tensor, size)
+        self.used_bytes += size
+        return tensor
+
+    def clear(self) -> None:
+        self.items.clear()
+        self.used_bytes = 0
+
+
+_GPU_CACHE: GPUWeightCache | None = None
+
+
+def set_gpu_cache(cache: GPUWeightCache | None) -> None:
+    global _GPU_CACHE
+    _GPU_CACHE = cache
+
+
+def should_cache_projection(prefix: str) -> bool:
+    return ".mlp.experts." in prefix or ".mlp.shared_expert." in prefix
 
 
 def layer_prefix(layer: int) -> str:
@@ -74,26 +139,24 @@ def attention_type(root: Path, layer: int) -> str:
 
 
 def dequantize_fp8_target(weight: torch.Tensor, scale_inv: torch.Tensor, device: str) -> torch.Tensor:
-    """Move compact FP8+scales to target and dequantize there.
-
-    The fallback is deliberately kept for CUDA builds where FP8->FP32
-    conversion is not implemented for the active GPU architecture.
-    """
     if device != "cuda":
         return dequantize_fp8_blockwise(weight, scale_inv)
 
-    try:
-        w = weight.to(device=device, non_blocking=True)
-        s = scale_inv.to(device=device, non_blocking=True).float()
-        expanded = s.repeat_interleave(BLOCK, dim=0).repeat_interleave(BLOCK, dim=1)
-        out = w.float() * expanded[: w.shape[0], : w.shape[1]]
-        return out
-    except (RuntimeError, NotImplementedError):
-        del weight, scale_inv
-        raise
+    w = weight.to(device=device, non_blocking=True)
+    s = scale_inv.to(device=device, non_blocking=True).float()
+    expanded = s.repeat_interleave(BLOCK, dim=0).repeat_interleave(BLOCK, dim=1)
+    out = w.float() * expanded[: w.shape[0], : w.shape[1]]
+    del w, s, expanded
+    return out
 
 
 def load_fp8_projection_target(root: Path, prefix: str, device: str) -> torch.Tensor:
+    cache_key = prefix if should_cache_projection(prefix) and device == "cuda" else None
+    if cache_key is not None and _GPU_CACHE is not None:
+        cached = _GPU_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
     weight = load_tensor(root, prefix + ".weight", device="cpu")
     if weight.dtype == torch.float8_e4m3fn:
         scale = load_tensor(root, prefix + ".weight_scale_inv", device="cpu")
@@ -102,6 +165,9 @@ def load_fp8_projection_target(root: Path, prefix: str, device: str) -> torch.Te
     else:
         out = weight.float().to(device)
     del weight
+
+    if cache_key is not None and _GPU_CACHE is not None:
+        out = _GPU_CACHE.put(cache_key, out)
     return out
 
 
@@ -271,17 +337,31 @@ def main() -> None:
     parser.add_argument("--start-layer", type=int, default=0)
     parser.add_argument("--end-layer", type=int, default=DEFAULT_LAYERS - 1)
     parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument(
+        "--cache-mib",
+        type=float,
+        default=DEFAULT_CACHE_MIB,
+        help="GPU LRU cache budget for used MoE/shared-expert weights; 0 disables it",
+    )
+    if False:
+        parser.add_argument("--unused", action="store_true")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA unavailable")
     if not 0 <= args.start_layer <= args.end_layer < DEFAULT_LAYERS:
         raise SystemExit(f"layer range must be inside 0..{DEFAULT_LAYERS - 1}")
+    if args.cache_mib < 0:
+        raise SystemExit("cache-mib must be non-negative")
 
     root = args.root.resolve()
     device = "cuda"
+    cache = GPUWeightCache(args.cache_mib)
+    set_gpu_cache(cache)
+
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"PyTorch CUDA: {torch.version.cuda}")
+    print(f"GPU cache budget: {args.cache_mib:.1f} MiB")
 
     x = load_embedding_row(root, args.token_id).reshape(1, HIDDEN).to(device).float()
     torch.cuda.synchronize()
@@ -305,6 +385,7 @@ def main() -> None:
         torch.cuda.synchronize()
         layer_ms = (perf_counter() - start_layer) * 1000.0
 
+        used_bytes, entries, hits, misses = cache.stats()
         print(f"layer {layer} ({kind}):")
         print(f"  router top-{args.top_k}: {expert_ids}")
         print(f"  router weights: {[round(v, 8) for v in weights]}")
@@ -315,6 +396,7 @@ def main() -> None:
         print(f"  output mean: {x.mean().item():.8f}")
         print(f"  VRAM allocated: {torch.cuda.memory_allocated() / 1024**2:.1f} MiB")
         print(f"  VRAM reserved: {torch.cuda.memory_reserved() / 1024**2:.1f} MiB")
+        print(f"  cache: {used_bytes / 1024**2:.1f} MiB, entries={entries}, hits={hits}, misses={misses}, evictions={cache.evictions}")
         print(f"  time: {layer_ms:.3f} ms")
 
         del residual
@@ -329,6 +411,15 @@ def main() -> None:
     print(f"final output min: {x.min().item():.8f}")
     print(f"final output max: {x.max().item():.8f}")
     print(f"total time: {total_ms:.3f} ms")
+    used_bytes, entries, hits, misses = cache.stats()
+    print(f"cache summary: {used_bytes / 1024**2:.1f} MiB / {args.cache_mib:.1f} MiB")
+    print(f"cache summary: entries={entries}, hits={hits}, misses={misses}, evictions={cache.evictions}")
+
+    del x
+    cache.clear()
+    set_gpu_cache(None)
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
