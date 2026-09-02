@@ -4,18 +4,19 @@ from __future__ import annotations
 
 CUDA cache layout:
 
-    resident VRAM + hot-expert VRAM + streaming window -> RAM -> SSD shards
+    resident VRAM + streaming window -> RAM -> SSD shards
 
-The resident pool never evicts. The hot-expert pool evicts only experts.
-The streaming window is transient and is intended to feed routed experts.
+The resident pool never evicts. The streaming window is the rotating expert
+staging area and receives all VRAM previously reserved for the hot-expert pool.
 
 Environment variables:
     QWEN36_CACHE_GB: RAM cache budget, default 3.0 GiB.
     QWEN36_VRAM_GB: optional CUDA allocator limit, default 0 (disabled).
     QWEN36_VRAM_CACHE_GB: persistent VRAM cache budget, default 3.0 GiB.
     QWEN36_RESIDENT_VRAM_RATIO: resident share, default 0.60.
-    QWEN36_VRAM_STREAM_GB: streaming window, default 0.60 GiB.
-    QWEN36_EXPERT_BONUS: hot-expert priority bonus, default 4.0.
+    QWEN36_VRAM_STREAM_GB: optional stream budget override, default uses all
+        remaining VRAM after the resident pool.
+    QWEN36_EXPERT_BONUS: retained for cache compatibility, default 4.0.
     QWEN36_CACHE_LOG_INTERVAL: progress interval, default 0.
 """
 
@@ -52,18 +53,24 @@ VRAM_GB = _env_float("QWEN36_VRAM_GB", 0.0)
 VRAM_CACHE_GB = _env_float("QWEN36_VRAM_CACHE_GB", 3.0)
 VRAM_CACHE_BUDGET_BYTES = int(VRAM_CACHE_GB * 1024**3)
 RESIDENT_VRAM_RATIO = min(_env_float("QWEN36_RESIDENT_VRAM_RATIO", 0.60), 0.95)
-# Give the streaming path more VRAM and deliberately keep only a small
-# persistent expert pool. This favors RAM -> GPU -> compute over expert churn.
-STREAM_GB = min(
-    _env_float("QWEN36_VRAM_STREAM_GB", 0.60),
-    max(VRAM_CACHE_GB - 0.10, 0.01),
-)
-STREAM_BUDGET_BYTES = int(STREAM_GB * 1024**3)
 RESIDENT_VRAM_BUDGET_BYTES = int(VRAM_CACHE_BUDGET_BYTES * RESIDENT_VRAM_RATIO)
-EXPERT_VRAM_BUDGET_BYTES = max(
-    VRAM_CACHE_BUDGET_BYTES - RESIDENT_VRAM_BUDGET_BYTES - STREAM_BUDGET_BYTES,
-    0,
-)
+# The old hot-expert pool was consistently unused. Reclaim all of that space
+# for the rotating stream so the FP16 expert working set can grow to the full
+# non-resident VRAM budget.
+EXPERT_VRAM_BUDGET_BYTES = 0
+_default_stream_bytes = max(VRAM_CACHE_BUDGET_BYTES - RESIDENT_VRAM_BUDGET_BYTES, 0)
+_requested_stream_gb = os.getenv("QWEN36_VRAM_STREAM_GB")
+if _requested_stream_gb is None:
+    STREAM_BUDGET_BYTES = _default_stream_bytes
+else:
+    try:
+        STREAM_BUDGET_BYTES = min(
+            max(int(float(_requested_stream_gb) * 1024**3), 1),
+            _default_stream_bytes,
+        )
+    except ValueError:
+        STREAM_BUDGET_BYTES = _default_stream_bytes
+STREAM_GB = STREAM_BUDGET_BYTES / 1024**3
 EXPERT_BONUS = _env_float("QWEN36_EXPERT_BONUS", 4.0)
 CACHE_LOG_INTERVAL = int(_env_float("QWEN36_CACHE_LOG_INTERVAL", 0.0))
 
@@ -248,7 +255,7 @@ class _PriorityTensorCache:
 
 
 class _DualVRAMCache:
-    """Resident pool + small expert cache + larger rotating stream pool."""
+    """Resident pool + zero-size legacy expert pool + full rotating stream."""
 
     def __init__(self, total_bytes: int) -> None:
         self.resident = _PriorityTensorCache(
@@ -465,7 +472,7 @@ class _ShardStore:
         return out
 
     def stream_projection(self, prefix: str) -> torch.Tensor:
-        """Stage one expert projection in the rotating staging pool across layers."""
+        """Stage one expert projection in the full rotating staging pool."""
         if self.target_device != "cuda":
             raise RuntimeError("stream_projection requires CUDA")
 
@@ -613,7 +620,7 @@ def main() -> None:
         f"resident={RESIDENT_VRAM_BUDGET_BYTES / 1024**3:.2f} GiB | "
         f"hot_experts={EXPERT_VRAM_BUDGET_BYTES / 1024**3:.2f} GiB | "
         f"stream={STREAM_GB:.2f} GiB | "
-        f"mode=resident-hot-stream | fp16_vram=on | "
+        f"mode=resident-stream | fp16_vram=on | "
         f"expert_bonus={EXPERT_BONUS:.2f}"
     )
 
