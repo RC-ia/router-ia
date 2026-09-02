@@ -45,6 +45,9 @@ def cache_stats(root: Path) -> dict[str, int | float]:
         "vram_expert_budget": int(vram["expert_budget_bytes"]),
         "vram_expert_hit_rate": float(vram["expert_pool_hit_rate"]),
         "vram_expert_evictions": int(vram["expert_evictions"]),
+        "vram_stream_bytes": int(vram["stream_bytes"]),
+        "vram_stream_budget": int(vram["stream_budget_bytes"]),
+        "vram_stream_hit_rate": float(vram["stream_hit_rate"]),
     }
 
 
@@ -59,10 +62,12 @@ def print_cache(root: Path, label: str) -> None:
         f"vram={stats['vram_bytes'] / 1024**2:.1f}/{cached.VRAM_CACHE_BUDGET_BYTES / 1024**2:.1f} MiB | "
         f"resident={stats['vram_resident_bytes'] / 1024**2:.1f}/{stats['vram_resident_budget'] / 1024**2:.1f} MiB | "
         f"experts={stats['vram_expert_bytes'] / 1024**2:.1f}/{stats['vram_expert_budget'] / 1024**2:.1f} MiB | "
+        f"stream={stats['vram_stream_bytes'] / 1024**2:.1f}/{stats['vram_stream_budget'] / 1024**2:.1f} MiB | "
         f"hit_rate={stats['hit_rate']:.2f}% | "
         f"ram_hit={stats['ram_hit_rate']:.2f}% | "
         f"vram_hit={stats['vram_hit_rate']:.2f}% | "
         f"expert_vram_hit={stats['vram_expert_hit_rate']:.2f}% | "
+        f"stream_hit={stats['vram_stream_hit_rate']:.2f}% | "
         f"expert_evictions={stats['vram_expert_evictions']}"
     )
 
@@ -252,6 +257,7 @@ def generate_response(
             f"ram_hit={after.get('ram_hit_rate', 0.0):.2f}% | "
             f"vram_hit={after.get('vram_hit_rate', 0.0):.2f}% | "
             f"expert_vram_hit={after.get('vram_expert_hit_rate', 0.0):.2f}% | "
+            f"stream_hit={after.get('vram_stream_hit_rate', 0.0):.2f}% | "
             f"hits+{delta_hits} misses+{delta_misses} | "
             f"peak_logit={peak:.4f}",
             flush=True,
@@ -289,7 +295,6 @@ def main() -> None:
 
     if args.device == "cuda":
         cached._configure_vram_limit("cuda")
-        # Pin the two tensors with the highest reuse before layer projections fill the resident pool.
         cached.cached_runtime_tensor(root, norm_name, "cuda", dtype=torch.float32)
         cached.cached_runtime_tensor(root, lm_name, "cuda", dtype=torch.float16)
 
@@ -297,7 +302,7 @@ def main() -> None:
     print("mode=experimental-stateless-autoregressive")
     print("warning=no DeltaNet recurrent state or full-attention KV cache yet")
     print("cache=hierarchical-vram-ram-ssd")
-    print("vram_policy=resident-60pct-hot-experts-40pct")
+    print("vram_policy=resident-60pct-hot-experts-20pct-stream-20pct")
     print("vram_dequantized_cache=fp16")
     print("cuda_compute=fp16-autocast")
     print(f"prompts={len(args.prompt)}")
