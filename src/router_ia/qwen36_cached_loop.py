@@ -1,19 +1,24 @@
 from __future__ import annotations
 
-"""Qwen3.6 loop with persistent shards and priority-aware RAM tensor cache.
+"""Qwen3.6 loop with persistent shards and a soft priority-aware RAM cache.
 
-The cache keeps raw CPU tensors and uses two residency pools:
-- expert tensors: reserved budget, scored by frequency + recency + expert bonus;
-- general tensors: normal recency/frequency scoring.
+The cache keeps raw CPU tensors and uses the full RAM budget as one shared pool.
+Eviction is global, but expert tensors receive a strong preservation bonus so
+frequently reused MoE weights are less likely to be evicted than ordinary
+attention/norm tensors.
 
-This avoids evicting frequently reused MoE expert weights merely because many
-attention/norm tensors were touched afterward.
+This intentionally avoids a hard expert/general partition: a hot expert may
+consume free capacity that would otherwise be unused, while a cold expert can
+still be evicted when a more valuable general tensor needs space.
 
 Environment variables:
-    QWEN36_CACHE_GB: total RAM budget for raw tensor cache, default 2.5 GiB.
-    QWEN36_EXPERT_CACHE_RATIO: fraction reserved for expert tensors, default 0.80.
-    QWEN36_CACHE_LOG_INTERVAL: print cache progress every N tensor loads,
-        default 0 (disabled).
+    QWEN36_CACHE_GB:
+        Total RAM budget for raw tensor cache, default 2.5 GiB.
+    QWEN36_EXPERT_BONUS:
+        Preservation bonus for expert tensors in the eviction score,
+        default 4.0.
+    QWEN36_CACHE_LOG_INTERVAL:
+        Print cache progress every N cache inserts, default 0 (disabled).
 """
 
 import atexit
@@ -54,9 +59,7 @@ def _env_int(name: str, default: int) -> int:
 
 CACHE_GB = _env_float("QWEN36_CACHE_GB", 2.5)
 CACHE_BUDGET_BYTES = int(CACHE_GB * 1024 * 1024 * 1024)
-EXPERT_CACHE_RATIO = min(_env_float("QWEN36_EXPERT_CACHE_RATIO", 0.80), 0.95)
-EXPERT_CACHE_BUDGET_BYTES = int(CACHE_BUDGET_BYTES * EXPERT_CACHE_RATIO)
-GENERAL_CACHE_BUDGET_BYTES = CACHE_BUDGET_BYTES - EXPERT_CACHE_BUDGET_BYTES
+EXPERT_BONUS = _env_float("QWEN36_EXPERT_BONUS", 4.0)
 CACHE_LOG_INTERVAL = _env_int("QWEN36_CACHE_LOG_INTERVAL", 0)
 
 
@@ -64,32 +67,29 @@ def _is_expert_tensor(name: str) -> bool:
     marker = ".mlp.experts."
     if marker not in name:
         return False
-    prefix, tail = name.split(marker, 1)
+
+    _, tail = name.split(marker, 1)
     parts = tail.split(".")
     if len(parts) < 2:
         return False
+
     try:
         int(parts[0])
     except ValueError:
         return False
+
     return parts[1] in {
         "gate_proj",
         "up_proj",
         "down_proj",
-    } or parts[1] in {
-        "gate_proj.weight_scale_inv",
-        "up_proj.weight_scale_inv",
-        "down_proj.weight_scale_inv",
     }
 
 
 class _PriorityTensorCache:
-    """Bounded cache that protects hot experts from ordinary tensor churn."""
+    """Single shared RAM cache with soft priority for repeatedly used experts."""
 
-    def __init__(self, max_bytes: int, expert_budget_bytes: int) -> None:
+    def __init__(self, max_bytes: int) -> None:
         self.max_bytes = max_bytes
-        self.expert_budget_bytes = expert_budget_bytes
-        self.general_budget_bytes = max_bytes - expert_budget_bytes
 
         self.items: dict[str, object] = {}
         self.item_bytes: dict[str, int] = {}
@@ -108,11 +108,13 @@ class _PriorityTensorCache:
         self.expert_misses = 0
         self.general_hits = 0
         self.general_misses = 0
+
         self.evictions = 0
         self.expert_evictions = 0
         self.general_evictions = 0
         self.skipped_oversize = 0
         self.loads = 0
+
         self.lock = Lock()
 
     @staticmethod
@@ -123,112 +125,91 @@ class _PriorityTensorCache:
         hits = self.item_hits.get(name, 0)
         last = self.item_last_access.get(name, 0)
         age = max(self.clock - last, 0)
+        expert = self.item_expert.get(name, False)
 
-        # Frequency has a strong influence; recency prevents ancient hot items
-        # from becoming permanently immortal. Experts receive a modest bonus.
-        frequency = math.log1p(hits)
-        recency = 1.0 / (1.0 + age)
-        bonus = 1.75 if self.item_expert.get(name, False) else 0.0
-        return (frequency * 2.0) + (recency * 10.0) + bonus
+        # Higher score means "more valuable to keep".
+        #
+        # Frequency:
+        #   repeated reuse matters strongly, but log1p prevents a very hot
+        #   tensor from becoming mathematically immortal.
+        frequency = 3.0 * math.log1p(hits)
+        # Recency:
+        #   recently used tensors get a temporary boost.
+        recency = 8.0 / math.sqrt(1.0 + age)
+        # Expert preservation:
+        #   experts are important to keep, but this is only a soft bonus.
+        #   They can still be evicted when cold enough.
+        expert_bonus = EXPERT_BONUS if expert else 0.0
+        return frequency + recency + expert_bonus
 
-    def _usage_for(self, expert: bool) -> int:
-        return self.expert_bytes if expert else self.general_bytes
-
-    def _budget_for(self, expert: bool) -> int:
-        return self.expert_budget_bytes if expert else self.general_budget_bytes
-
-    def _select_victim(self, expert: bool) -> str | None:
-        candidates = [
-            name
-            for name in self.items
-            if self.item_expert.get(name, False) == expert
-        ]
-        if not candidates:
+    def _select_victim(self) -> str | None:
+        if not self.items:
             return None
-        return min(candidates, key=self._score)
+        return min(self.items, key=self._score)
 
-    def _remove(self, name: str) -> None:
+    def _remove(self, name: str) -> tuple[int, bool]:
         size = self.item_bytes.pop(name, 0)
         expert = self.item_expert.pop(name, False)
+
         self.items.pop(name, None)
         self.item_hits.pop(name, None)
         self.item_last_access.pop(name, None)
+
         self.bytes_used -= size
         if expert:
             self.expert_bytes -= size
         else:
             self.general_bytes -= size
 
+        return size, expert
+
     def get(self, name: str):
         with self.lock:
             self.clock += 1
             tensor = self.items.get(name)
-            expert = self.item_expert.get(name, False)
+
             if tensor is None:
                 self.misses += 1
-                if expert or _is_expert_tensor(name):
+                if _is_expert_tensor(name):
                     self.expert_misses += 1
                 else:
                     self.general_misses += 1
                 return None
 
             self.hits += 1
-            self.item_hits[name] += 1
+            self.item_hits[name] = self.item_hits.get(name, 0) + 1
             self.item_last_access[name] = self.clock
-            if expert:
+
+            if self.item_expert.get(name, False):
                 self.expert_hits += 1
             else:
                 self.general_hits += 1
+
             return tensor
 
     def put(self, name: str, tensor) -> None:
         size = self._tensor_bytes(tensor)
         expert = _is_expert_tensor(name)
+
         with self.lock:
             self.clock += 1
             self.loads += 1
 
-            previous = self.items.get(name)
-            if previous is not None:
+            if name in self.items:
                 self._remove(name)
 
             if size > self.max_bytes:
                 self.skipped_oversize += 1
                 return
 
-            pool_budget = self._budget_for(expert)
-            while self._usage_for(expert) + size > pool_budget:
-                victim = self._select_victim(expert)
-                if victim is None:
-                    # A newly inserted general tensor may still use free expert
-                    # capacity, and vice versa. Borrow only unused capacity.
-                    other = not expert
-                    if self._usage_for(expert) + size > pool_budget:
-                        free_other = self._budget_for(other) - self._usage_for(other)
-                        free_total = self.max_bytes - self.bytes_used
-                        if free_other + free_total < size:
-                            victim = self._select_victim(other)
-                    if victim is None:
-                        break
-                victim_expert = self.item_expert.get(victim, False)
-                self._remove(victim)
-                self.evictions += 1
-                if victim_expert:
-                    self.expert_evictions += 1
-                else:
-                    self.general_evictions += 1
-
             while self.bytes_used + size > self.max_bytes:
-                victim = self._select_victim(expert)
-                if victim is None:
-                    victim = self._select_victim(False)
-                if victim is None:
-                    victim = self._select_victim(True)
+                victim = self._select_victim()
                 if victim is None:
                     break
-                victim_expert = self.item_expert.get(victim, False)
-                self._remove(victim)
+
+                _, victim_expert = self._remove(victim)
                 self.evictions += 1
+
                 if victim_expert:
                     self.expert_evictions += 1
                 else:
@@ -243,6 +224,7 @@ class _PriorityTensorCache:
             self.item_hits[name] = 0
             self.item_last_access[name] = self.clock
             self.item_expert[name] = expert
+
             self.bytes_used += size
             if expert:
                 self.expert_bytes += size
@@ -256,6 +238,7 @@ class _PriorityTensorCache:
             self.item_hits.clear()
             self.item_last_access.clear()
             self.item_expert.clear()
+
             self.bytes_used = 0
             self.expert_bytes = 0
             self.general_bytes = 0
@@ -263,24 +246,38 @@ class _PriorityTensorCache:
     def snapshot(self) -> dict[str, int | float]:
         with self.lock:
             total = self.hits + self.misses
-            hit_rate = (self.hits / total * 100.0) if total else 0.0
+            hit_rate = self.hits / total * 100.0 if total else 0.0
+
             expert_total = self.expert_hits + self.expert_misses
-            general_total = self.general_hits + self.general_misses
             expert_hit_rate = (
                 self.expert_hits / expert_total * 100.0 if expert_total else 0.0
             )
+
+            general_total = self.general_hits + self.general_misses
             general_hit_rate = (
                 self.general_hits / general_total * 100.0 if general_total else 0.0
             )
-            expert_items = sum(1 for value in self.item_expert.values() if value)
-            general_items = len(self.items) - expert_items
+
+            expert_items = sum(
+                1 for value in self.item_expert.values() if value
+            )
+
+            # Show how much of the current resident set is experts by bytes and
+            # by item count. This is especially useful for tuning the bonus.
+            expert_share = (
+                self.expert_bytes / self.bytes_used * 100.0
+                if self.bytes_used
+                else 0.0
+            )
+
             return {
                 "items": len(self.items),
                 "expert_items": expert_items,
-                "general_items": general_items,
+                "general_items": len(self.items) - expert_items,
                 "bytes": self.bytes_used,
                 "expert_bytes": self.expert_bytes,
                 "general_bytes": self.general_bytes,
+                "expert_share": expert_share,
                 "hits": self.hits,
                 "misses": self.misses,
                 "hit_rate": hit_rate,
@@ -304,9 +301,11 @@ class _ShardStore:
         self.stack = ExitStack()
         self.weight_map: dict[str, str] = {}
         self.handles: dict[Path, object] = {}
+
         self.handle_opens = 0
         self.handle_hits = 0
-        self.cache = _PriorityTensorCache(CACHE_BUDGET_BYTES, EXPERT_CACHE_BUDGET_BYTES)
+
+        self.cache = _PriorityTensorCache(CACHE_BUDGET_BYTES)
         self._last_log_loads = 0
 
         index_path = self.root / "model.safetensors.index.json"
@@ -336,23 +335,28 @@ class _ShardStore:
             return
 
         self._last_log_loads = int(stats["loads"])
+
         used_mib = stats["bytes"] / (1024 * 1024)
         budget_mib = self.cache.max_bytes / (1024 * 1024)
         expert_mib = stats["expert_bytes"] / (1024 * 1024)
-        expert_budget_mib = self.cache.expert_budget_bytes / (1024 * 1024) if hasattr(self.cache, 'expert_budget_bytes') else EXPERT_CACHE_BUDGET_BYTES / (1024 * 1024)
+
         print(
             "cache progress: "
-            f"loads={stats['loads']} | hits={stats['hits']} | misses={stats['misses']} | "
-            f"hit_rate={stats['hit_rate']:.1f}% | "
+            f"loads={stats['loads']} | hits={stats['hits']} | "
+            f"misses={stats['misses']} | hit_rate={stats['hit_rate']:.1f}% | "
             f"expert_hit={stats['expert_hit_rate']:.1f}% | "
-            f"evictions={stats['evictions']} (expert={stats['expert_evictions']}, general={stats['general_evictions']}) | "
+            f"general_hit={stats['general_hit_rate']:.1f}% | "
+            f"evictions={stats['evictions']} "
+            f"(expert={stats['expert_evictions']}, general={stats['general_evictions']}) | "
             f"ram={used_mib:.1f}/{budget_mib:.1f} MiB | "
-            f"experts_ram={expert_mib:.1f}/{expert_budget_mib:.1f} MiB | "
+            f"experts_ram={expert_mib:.1f} MiB "
+            f"({stats['expert_share']:.1f}%) | "
             f"last={name}"
         )
 
     def load(self, name: str, device: str):
         cached = self.cache.get(name)
+
         if cached is not None:
             self._maybe_log_progress(name)
             if device == "cpu":
@@ -368,14 +372,18 @@ class _ShardStore:
         for shard in shards:
             if not shard.is_file():
                 continue
+
             handle = self._handle(shard)
-            if name in handle.keys():
-                tensor = handle.get_tensor(name)
-                self.cache.put(name, tensor)
-                self._maybe_log_progress(name)
-                if device == "cpu":
-                    return tensor
-                return tensor.to(device=device)
+            if name not in handle.keys():
+                continue
+
+            tensor = handle.get_tensor(name)
+            self.cache.put(name, tensor)
+            self._maybe_log_progress(name)
+
+            if device == "cpu":
+                return tensor
+            return tensor.to(device=device)
 
         raise KeyError(f"Tensor not found: {name}")
 
@@ -391,9 +399,11 @@ _stores: dict[Path, _ShardStore] = {}
 def _store(root: Path) -> _ShardStore:
     key = root.resolve()
     store = _stores.get(key)
+
     if store is None:
         store = _ShardStore(key)
         _stores[key] = store
+
     return store
 
 
@@ -420,9 +430,8 @@ def main() -> None:
     print(
         "LRU config: "
         f"budget={CACHE_GB:.2f} GiB | "
-        f"expert_ratio={EXPERT_CACHE_RATIO:.0%} | "
-        f"expert_budget={_format_mib(EXPERT_CACHE_BUDGET_BYTES)} | "
-        f"general_budget={_format_mib(GENERAL_CACHE_BUDGET_BYTES)} | "
+        f"mode=global-soft-priority | "
+        f"expert_bonus={EXPERT_BONUS:.2f} | "
         f"log_interval={CACHE_LOG_INTERVAL or 'off'}"
     )
 
@@ -431,29 +440,29 @@ def main() -> None:
     for root, store in _stores.items():
         stats = store.cache.snapshot()
         total = stats["hits"] + stats["misses"]
+
         print(
             "cached reader: "
             f"root={root} | "
             f"shards opened={store.handle_opens} | "
             f"cached handle hits={store.handle_hits}"
         )
+
         print(
             "LRU summary: "
-            f"items={stats['items']} (expert={stats['expert_items']}, general={stats['general_items']}) | "
-            f"ram={_format_mib(int(stats['bytes']))}/{_format_mib(store.cache.max_bytes)} | "
-            f"expert_ram={_format_mib(int(stats['expert_bytes']))}/{_format_mib(EXPERT_CACHE_BUDGET_BYTES)} | "
-            f"general_ram={_format_mib(int(stats['general_bytes']))}/{_format_mib(GENERAL_CACHE_BUDGET_BYTES)}"
-        )
-        print(
-            "LRU hits: "
-            f"total={stats['hits']} | misses={stats['misses']} | hit_rate={stats['hit_rate']:.2f}% | "
-            f"expert={stats['expert_hits']}/{stats['expert_hits'] + stats['expert_misses']} ({stats['expert_hit_rate']:.2f}%) | "
-            f"general={stats['general_hits']}/{stats['general_hits'] + stats['general_misses']} ({stats['general_hit_rate']:.2f}%)"
-        )
-        print(
-            "LRU evictions: "
-            f"total={stats['evictions']} | expert={stats['expert_evictions']} | "
-            f"general={stats['general_evictions']} | oversize_skips={stats['skipped_oversize']} | "
+            f"items={stats['items']} "
+            f"(expert={stats['expert_items']}, general={stats['general_items']}) | "
+            f"ram={_format_mib(int(stats['bytes']))}/"
+            f"{_format_mib(store.cache.max_bytes)} | "
+            f"expert_ram={_format_mib(int(stats['expert_bytes']))} "
+            f"({stats['expert_share']:.1f}%) | "
+            f"hits={stats['hits']} | misses={stats['misses']} | "
+            f"hit_rate={stats['hit_rate']:.2f}% | "
+            f"expert_hit_rate={stats['expert_hit_rate']:.2f}% | "
+            f"general_hit_rate={stats['general_hit_rate']:.2f}% | "
+            f"evictions={stats['evictions']} "
+            f"(expert={stats['expert_evictions']}, general={stats['general_evictions']}) | "
+            f"oversize_skips={stats['skipped_oversize']} | "
             f"loads={stats['loads']} | lookups={total}"
         )
 
