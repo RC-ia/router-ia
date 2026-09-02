@@ -112,7 +112,7 @@ def linear_attention_step(root: Path, layer: int, x0: torch.Tensor, device: str)
     attn = torch.einsum("bhkd,bhk->bhd", state, qn)
 
     z_w = load_projection(root, prefix + "linear_attn.in_proj_z", device)
-    z = F.linear(h_compute, z_w).reshape(1, LINEAR_NUM_V_HEADS).reshape(1, LINEAR_NUM_V_HEADS, 128) if z_w.shape[-2] == LINEAR_NUM_V_HEADS else F.linear(h_compute, z_w).reshape(1, LINEAR_NUM_V_HEADS, 128)
+    z = F.linear(h_compute, z_w).reshape(1, LINEAR_NUM_V_HEADS, 128)
     norm_w = load_layer_weight(root, layer, "linear_attn.norm.weight", device)
     gated, _, _ = gated_rmsnorm(attn, z, norm_w)
 
