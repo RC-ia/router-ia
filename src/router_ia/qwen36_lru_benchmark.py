@@ -75,7 +75,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Repeated Qwen3.6 LRU weight-cache benchmark")
     parser.add_argument("root", type=Path)
     parser.add_argument("--tokens", type=str, default="0,1,2", help="Comma-separated token IDs")
-    parser.add_argument("--generations", type=int, default=2)
+    parser.add_argument("--generations", type=int, default=5)
     parser.add_argument("--start-layer", type=int, default=0)
     parser.add_argument("--end-layer", type=int, default=base.DEFAULT_LAYERS - 1)
     parser.add_argument("--top-k", type=int, default=8)
@@ -135,18 +135,32 @@ def main() -> None:
     print(f"  total wall time: {total_time:.3f} s")
     print(f"  tokens processed: {len(all_times)}")
     print(f"  avg token time: {sum(all_times) / len(all_times):.3f} s")
-    if len(all_times) >= 2:
+    if all_times:
         print(f"  first token time: {all_times[0]:.3f} s")
         print(f"  last token time: {all_times[-1]:.3f} s")
         print(f"  change first->last: {all_times[-1] - all_times[0]:+.3f} s")
-    if len(tokens) > 0 and len(all_times) >= len(tokens) * 2:
-        first_gen = all_times[:len(tokens)]
-        second_gen = all_times[len(tokens):len(tokens) * 2]
-        avg1 = sum(first_gen) / len(first_gen)
-        avg2 = sum(second_gen) / len(second_gen)
-        print(f"  generation 1 avg/token: {avg1:.3f} s")
-        print(f"  generation 2 avg/token: {avg2:.3f} s")
-        print(f"  generation avg change: {avg2 - avg1:+.3f} s/token")
+
+    generation_avgs: list[float] = []
+    for index in range(args.generations):
+        start = index * len(tokens)
+        end = start + len(tokens)
+        if end > len(all_times):
+            break
+        avg = sum(all_times[start:end]) / len(tokens)
+        generation_avgs.append(avg)
+        print(f"  generation {index + 1} avg/token: {avg:.3f} s")
+
+    if len(generation_avgs) >= 2:
+        print("  generation changes:")
+        for index in range(1, len(generation_avgs)):
+            delta = generation_avgs[index] - generation_avgs[index - 1]
+            print(f"    gen {index}->{index + 1}: {delta:+.3f} s/token")
+        best = min(generation_avgs)
+        worst = max(generation_avgs)
+        print(f"  generation best avg/token: {best:.3f} s")
+        print(f"  generation worst avg/token: {worst:.3f} s")
+        print(f"  best-vs-worst: {best - worst:+.3f} s/token")
+
     print_cache_stats("final", root)
 
 
