@@ -4,23 +4,24 @@ from __future__ import annotations
 
 CUDA cache layout:
 
-    resident VRAM pool + hot-expert VRAM pool -> RAM cache -> SSD shards
+    resident VRAM + hot-expert VRAM + 300 MiB streaming window -> RAM -> SSD
 
-The resident pool never evicts. It is used for non-expert tensors such as the
-LM head, attention/DeltaNet projections, norms and shared-expert projections.
-The hot-expert pool is independent and uses soft priority eviction only among
-routed experts. With the default 3 GiB VRAM cache this gives 1.8 GiB to
-resident tensors and 1.2 GiB to hot experts, leaving the process allocator
-headroom (for example 3.5 GiB in the T4 test).
+The resident pool never evicts. The hot-expert pool evicts only experts. On an
+expert cache miss the CUDA path can stream the raw FP8 weight and its scale from
+RAM, dequantize on the GPU, compute with it, and discard the streaming tensor at
+the end of the layer. This keeps the GPU doing the FP8->FP16 conversion instead
+of spending the CPU doing that work.
 
-FP8 weights stay raw in RAM. CUDA projection tensors are dequantized once and
-stored as FP16 to reduce VRAM use and memory bandwidth.
+The default 3 GiB VRAM budget is split into 1.8 GiB resident, 0.9 GiB hot
+experts, and 0.3 GiB for the rotating streaming window. The process-level CUDA
+limit can still be higher (for example 3.5 GiB) to leave allocator headroom.
 
 Environment variables:
     QWEN36_CACHE_GB: RAM cache budget, default 3.0 GiB.
     QWEN36_VRAM_GB: optional CUDA allocator limit, default 0 (disabled).
-    QWEN36_VRAM_CACHE_GB: total VRAM cache budget, default 3.0 GiB.
-    QWEN36_RESIDENT_VRAM_RATIO: resident share of VRAM cache, default 0.60.
+    QWEN36_VRAM_CACHE_GB: total persistent VRAM cache budget, default 3.0 GiB.
+    QWEN36_RESIDENT_VRAM_RATIO: persistent resident share, default 0.60.
+    QWEN36_VRAM_STREAM_GB: rotating RAM->GPU staging budget, default 0.30 GiB.
     QWEN36_EXPERT_BONUS: hot-expert priority bonus, default 4.0.
     QWEN36_CACHE_LOG_INTERVAL: progress interval, default 0.
 """
@@ -58,8 +59,13 @@ VRAM_GB = _env_float("QWEN36_VRAM_GB", 0.0)
 VRAM_CACHE_GB = _env_float("QWEN36_VRAM_CACHE_GB", 3.0)
 VRAM_CACHE_BUDGET_BYTES = int(VRAM_CACHE_GB * 1024**3)
 RESIDENT_VRAM_RATIO = min(_env_float("QWEN36_RESIDENT_VRAM_RATIO", 0.60), 0.95)
+STREAM_GB = min(_env_float("QWEN36_VRAM_STREAM_GB", 0.30), max(VRAM_CACHE_GB * 0.5, 0.01))
+STREAM_BUDGET_BYTES = int(STREAM_GB * 1024**3)
 RESIDENT_VRAM_BUDGET_BYTES = int(VRAM_CACHE_BUDGET_BYTES * RESIDENT_VRAM_RATIO)
-EXPERT_VRAM_BUDGET_BYTES = VRAM_CACHE_BUDGET_BYTES - RESIDENT_VRAM_BUDGET_BYTES
+EXPERT_VRAM_BUDGET_BYTES = max(
+    VRAM_CACHE_BUDGET_BYTES - RESIDENT_VRAM_BUDGET_BYTES - STREAM_BUDGET_BYTES,
+    0,
+)
 EXPERT_BONUS = _env_float("QWEN36_EXPERT_BONUS", 4.0)
 CACHE_LOG_INTERVAL = int(_env_float("QWEN36_CACHE_LOG_INTERVAL", 0.0))
 
@@ -186,7 +192,7 @@ class _PriorityTensorCache:
             if self.evict:
                 while self.bytes_used + size > self.max_bytes and self.items:
                     victim = min(self.items, key=self._score)
-                    _, _ = self._remove(victim)
+                    self._remove(victim)
                     self.evictions += 1
                     if _is_expert_tensor(victim):
                         self.expert_evictions += 1
@@ -245,7 +251,7 @@ class _PriorityTensorCache:
 
 
 class _DualVRAMCache:
-    """Independent resident and hot-expert VRAM pools with aggregate metrics."""
+    """Resident cache + hot-expert cache + rotating streaming window."""
 
     def __init__(self, total_bytes: int) -> None:
         self.resident = _PriorityTensorCache(
@@ -254,37 +260,52 @@ class _DualVRAMCache:
         self.experts = _PriorityTensorCache(
             EXPERT_VRAM_BUDGET_BYTES, "vram-experts", evict=True
         )
+        self.stream = _PriorityTensorCache(
+            STREAM_BUDGET_BYTES, "vram-stream", evict=True
+        )
         self.max_bytes = total_bytes
 
-    def _pool(self, name: str) -> _PriorityTensorCache:
+    def _persistent_pool(self, name: str) -> _PriorityTensorCache:
         return self.experts if _is_expert_tensor(name) else self.resident
 
     def get(self, name: str) -> torch.Tensor | None:
-        return self._pool(name).get(name)
+        return self._persistent_pool(name).get(name)
 
     def put(self, name: str, tensor: torch.Tensor) -> bool:
-        return self._pool(name).put(name, tensor)
+        return self._persistent_pool(name).put(name, tensor)
+
+    def get_stream(self, name: str) -> torch.Tensor | None:
+        return self.stream.get(name)
+
+    def put_stream(self, name: str, tensor: torch.Tensor) -> bool:
+        return self.stream.put(name, tensor)
+
+    def clear_stream(self) -> None:
+        self.stream.clear()
 
     def clear(self) -> None:
         self.resident.clear()
         self.experts.clear()
+        self.stream.clear()
 
     def snapshot(self) -> dict[str, int | float]:
         resident = self.resident.snapshot()
         experts = self.experts.snapshot()
-        hits = int(resident["hits"] + experts["hits"])
-        misses = int(resident["misses"] + experts["misses"])
-        expert_items = int(experts["expert_items"])
-        bytes_used = int(resident["bytes"] + experts["bytes"])
-        expert_bytes = int(experts["bytes"])
+        stream = self.stream.snapshot()
+        hits = int(resident["hits"] + experts["hits"] + stream["hits"])
+        misses = int(resident["misses"] + experts["misses"] + stream["misses"])
+        persistent_bytes = int(resident["bytes"] + experts["bytes"])
+        bytes_used = persistent_bytes + int(stream["bytes"])
         return {
-            "items": int(resident["items"] + experts["items"]),
-            "expert_items": expert_items,
+            "items": int(resident["items"] + experts["items"] + stream["items"]),
+            "expert_items": int(experts["expert_items"]),
             "general_items": int(resident["items"]),
+            "stream_items": int(stream["items"]),
             "bytes": bytes_used,
-            "expert_bytes": expert_bytes,
+            "expert_bytes": int(experts["bytes"]),
             "general_bytes": int(resident["bytes"]),
-            "expert_share": expert_bytes / bytes_used * 100.0 if bytes_used else 0.0,
+            "stream_bytes": int(stream["bytes"]),
+            "expert_share": int(experts["bytes"]) / bytes_used * 100.0 if bytes_used else 0.0,
             "hits": hits,
             "misses": misses,
             "hit_rate": hits / (hits + misses) * 100.0 if hits + misses else 0.0,
@@ -294,19 +315,23 @@ class _DualVRAMCache:
             "general_hits": int(resident["hits"]),
             "general_misses": int(resident["misses"]),
             "general_hit_rate": resident["hit_rate"],
+            "stream_hits": int(stream["hits"]),
+            "stream_misses": int(stream["misses"]),
+            "stream_hit_rate": stream["hit_rate"],
             "evictions": int(experts["evictions"]),
             "expert_evictions": int(experts["evictions"]),
             "general_evictions": 0,
-            "skipped_oversize": int(resident["skipped_oversize"] + experts["skipped_oversize"]),
-            "loads": int(resident["loads"] + experts["loads"]),
+            "stream_evictions": int(stream["evictions"]),
+            "skipped_oversize": int(resident["skipped_oversize"] + experts["skipped_oversize"] + stream["skipped_oversize"]),
+            "loads": int(resident["loads"] + experts["loads"] + stream["loads"]),
             "resident_items": int(resident["items"]),
             "resident_bytes": int(resident["bytes"]),
             "resident_budget_bytes": RESIDENT_VRAM_BUDGET_BYTES,
             "resident_skipped": int(resident["skipped_oversize"]),
             "expert_budget_bytes": EXPERT_VRAM_BUDGET_BYTES,
-            "expert_bytes": int(experts["bytes"]),
-            "expert_pool_items": expert_items,
+            "expert_pool_items": int(experts["expert_items"]),
             "expert_pool_hit_rate": experts["hit_rate"],
+            "stream_budget_bytes": STREAM_BUDGET_BYTES,
         }
 
 
@@ -352,10 +377,12 @@ class _ShardStore:
             f"ram={ram['bytes'] / 1024**2:.1f} MiB | "
             f"vram={vram['bytes'] / 1024**2:.1f} MiB "
             f"(resident={vram['resident_bytes'] / 1024**2:.1f}, "
-            f"experts={vram['expert_bytes'] / 1024**2:.1f}) | "
+            f"experts={vram['expert_bytes'] / 1024**2:.1f}, "
+            f"stream={vram['stream_bytes'] / 1024**2:.1f}) | "
             f"ram_hit={ram['hit_rate']:.1f}% | vram_hit={vram['hit_rate']:.1f}% | "
             f"expert_vram_hit={vram['expert_pool_hit_rate']:.1f}% | "
-            f"expert_evict={vram['expert_evictions']} | last={name}"
+            f"stream_hit={vram['stream_hit_rate']:.1f}% | "
+            f"expert_evict={vram['expert_evictions']} | stream_evict={vram['stream_evictions']} | last={name}"
         )
 
     def _load_ssd(self, name: str) -> torch.Tensor:
@@ -425,6 +452,35 @@ class _ShardStore:
         self._maybe_log_progress(cache_key)
         return out
 
+    def stream_projection(self, prefix: str) -> torch.Tensor:
+        """Move raw FP8+scale from RAM, dequantize on CUDA, and keep it briefly."""
+        cache_key = prefix + ".__stream__"
+        cached = self.vram_cache.get_stream(cache_key)
+        if cached is not None:
+            return cached
+
+        weight = self.load(prefix + ".weight", device="cpu")
+        if weight.dtype == torch.float8_e4m3fn:
+            scale = self.load(prefix + ".weight_scale_inv", device="cpu")
+            gpu_weight = weight.to(device="cuda")
+            gpu_scale = scale.to(device="cuda")
+            del weight, scale
+            gpu_out = dequantize_fp8_blockwise(gpu_weight, gpu_scale).to(dtype=torch.float16)
+            del gpu_weight, gpu_scale
+        else:
+            gpu_out = weight.to(device="cuda", dtype=torch.float16)
+            del weight
+
+        if not self.vram_cache.put_stream(cache_key, gpu_out):
+            # The current Qwen expert working set is much smaller than 300 MiB,
+            # but fall back gracefully if a future tensor does not fit.
+            return gpu_out
+        self._maybe_log_progress(cache_key)
+        return gpu_out
+
+    def clear_stream(self) -> None:
+        self.vram_cache.clear_stream()
+
     def runtime_tensor(self, name: str, device: str, dtype: torch.dtype | None = torch.float32) -> torch.Tensor:
         self.target_device = device
         cache_key = name + ".__runtime__"
@@ -467,27 +523,20 @@ def _cached_load_tensor(root: Path, name: str, device: str = "cpu"):
     return tensor
 
 
-def _dequantize_for_store(store: _ShardStore, weight: torch.Tensor, scale_inv: torch.Tensor, cache_key: str) -> torch.Tensor:
-    if store.target_device != "cuda":
-        return dequantize_fp8_blockwise(weight, scale_inv)
-    cached_tensor = store.vram_cache.get(cache_key)
-    if cached_tensor is not None:
-        return cached_tensor
-    cpu_out = dequantize_fp8_blockwise(weight, scale_inv)
-    gpu_out = cpu_out.to(device="cuda", dtype=torch.float16)
-    del cpu_out
-    store.vram_cache.put(cache_key, gpu_out)
-    store._maybe_log_progress(cache_key)
-    return gpu_out
-
-
 def _cached_dequantize(weight: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
     origin = _tensor_origins.get(id(weight))
     if origin is None:
         return dequantize_fp8_blockwise(weight, scale_inv)
     root, name = origin
     store = _store(root)
-    return _dequantize_for_store(store, weight, scale_inv, name + ".__dequant__")
+    cache_key = name + ".__dequant__"
+    if store.target_device == "cuda":
+        cpu_out = dequantize_fp8_blockwise(weight, scale_inv)
+        gpu_out = cpu_out.to(device="cuda", dtype=torch.float16)
+        del cpu_out
+        store.vram_cache.put(cache_key, gpu_out)
+        return gpu_out
+    return dequantize_fp8_blockwise(weight, scale_inv)
 
 
 def _cached_load_projection(root: Path, prefix: str, device: str) -> torch.Tensor:
@@ -496,6 +545,14 @@ def _cached_load_projection(root: Path, prefix: str, device: str) -> torch.Tenso
 
 def cached_runtime_tensor(root: Path, name: str, device: str, dtype: torch.dtype | None = torch.float32) -> torch.Tensor:
     return _store(root).runtime_tensor(name, device, dtype)
+
+
+def cached_stream_projection(root: Path, prefix: str) -> torch.Tensor:
+    return _store(root).stream_projection(prefix)
+
+
+def clear_cuda_stream(root: Path) -> None:
+    _store(root).clear_stream()
 
 
 base.load_tensor = _cached_load_tensor
@@ -522,7 +579,8 @@ def main() -> None:
         f"vram={VRAM_CACHE_GB:.2f} GiB | "
         f"resident={RESIDENT_VRAM_BUDGET_BYTES / 1024**3:.2f} GiB | "
         f"hot_experts={EXPERT_VRAM_BUDGET_BYTES / 1024**3:.2f} GiB | "
-        f"mode=resident-plus-hot-experts | fp16_vram=on | "
+        f"stream={STREAM_GB:.2f} GiB | "
+        f"mode=resident-plus-hot-experts-plus-stream | fp16_vram=on | "
         f"expert_bonus={EXPERT_BONUS:.2f}"
     )
     base.main()
@@ -544,8 +602,10 @@ def main() -> None:
             f"items={vram['items']} | total={_format_mib(int(vram['bytes']))}/{_format_mib(store.vram_cache.max_bytes)} | "
             f"resident={_format_mib(int(vram['resident_bytes']))}/{_format_mib(RESIDENT_VRAM_BUDGET_BYTES)} | "
             f"experts={_format_mib(int(vram['expert_bytes']))}/{_format_mib(EXPERT_VRAM_BUDGET_BYTES)} | "
+            f"stream={_format_mib(int(vram['stream_bytes']))}/{_format_mib(STREAM_BUDGET_BYTES)} | "
             f"hit_rate={vram['hit_rate']:.2f}% | expert_hit_rate={vram['expert_pool_hit_rate']:.2f}% | "
-            f"expert_evictions={vram['expert_evictions']} | resident_skipped={vram['resident_skipped']}"
+            f"stream_hit_rate={vram['stream_hit_rate']:.2f}% | expert_evictions={vram['expert_evictions']} | "
+            f"stream_evictions={vram['stream_evictions']}"
         )
 
 
