@@ -162,7 +162,7 @@ def _run_shared_expert(root: Path, layer: int, x: torch.Tensor, device: str) -> 
     up_w = _load_shared_projection(root, layer, "up_proj", device)
     down_w = _load_shared_projection(root, layer, "down_proj", device)
     shared_gate_w = base.load_tensor(
-        root, layer_prefix(layer) + "mlp.shared_expert_gate.weight", device=device
+        root, base.layer_prefix(layer) + "mlp.shared_expert_gate.weight", device=device
     ).float()
 
     gate = torch.sigmoid(F.linear(x, shared_gate_w))
