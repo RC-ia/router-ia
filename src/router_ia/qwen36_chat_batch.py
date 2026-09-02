@@ -1,15 +1,6 @@
 from __future__ import annotations
 
-"""Batch mini-chat smoke test for Qwen3.6 hierarchical RAM/VRAM caches.
-
-This is designed for notebook/Kaggle environments where interactive input()
-is inconvenient. Pass one or more --prompt values. The RAM/VRAM caches stay
-alive across all prompts and generated tokens so we can observe reuse across
-both tiers.
-
-Important: the underlying runtime is still stateless across generated tokens;
-this is not yet a faithful Qwen3.6 KV-cache/DeltaNet-sequence decoder.
-"""
+"""Batch mini-chat smoke test for Qwen3.6 hierarchical RAM/VRAM caches."""
 
 import argparse
 import gc
@@ -27,17 +18,14 @@ DEFAULT_MAX_NEW_TOKENS = 4
 
 
 def cache_stats(root: Path) -> dict[str, int | float]:
-    """Return aggregated RAM+VRAM stats plus per-tier metrics."""
     store = cached._stores.get(root.resolve())
     if store is None:
         return {}
-
     ram = store.ram_cache.snapshot()
     vram = store.vram_cache.snapshot()
     hits = int(ram["hits"] + vram["hits"])
     misses = int(ram["misses"] + vram["misses"])
     total = hits + misses
-
     return {
         "hits": hits,
         "misses": misses,
@@ -50,7 +38,6 @@ def cache_stats(root: Path) -> dict[str, int | float]:
         "vram_bytes": int(vram["bytes"]),
         "vram_hit_rate": float(vram["hit_rate"]),
         "vram_evictions": int(vram["evictions"]),
-        "vram_expert_hit_rate": float(vram["expert_hit_rate"]),
         "vram_expert_share": float(vram["expert_share"]),
     }
 
@@ -60,7 +47,6 @@ def print_cache(root: Path, label: str) -> None:
     if not stats:
         print(f"  cache {label}: unavailable")
         return
-
     print(
         f"  cache {label}: "
         f"ram={stats['ram_bytes'] / 1024**2:.1f}/{cached.CACHE_BUDGET_BYTES / 1024**2:.1f} MiB | "
@@ -78,6 +64,8 @@ def run_generated_token(
     token_id: int,
     final_norm: torch.Tensor,
     lm_head: torch.Tensor,
+    final_norm_name: str,
+    lm_head_name: str,
     device: str,
     sampling_top_k: int,
     temperature: float,
@@ -94,8 +82,15 @@ def run_generated_token(
         x, *_ = base.moe_step(root, layer, residual, top_k=8, device=device)
         del residual
 
-    x = base.rmsnorm(x, final_norm.to(device))
-    logits = F.linear(x, lm_head.to(device))
+    if device == "cuda":
+        final_norm_runtime = cached.cached_runtime_tensor(root, final_norm_name, device, dtype=torch.float32)
+        lm_head_runtime = cached.cached_runtime_tensor(root, lm_head_name, device, dtype=torch.float32)
+    else:
+        final_norm_runtime = final_norm
+        lm_head_runtime = lm_head
+
+    x = base.rmsnorm(x, final_norm_runtime)
+    logits = F.linear(x, lm_head_runtime)
     next_id = sample_next(logits, temperature, sampling_top_k)
 
     if device == "cuda":
@@ -104,9 +99,9 @@ def run_generated_token(
     peak_logit = float(torch.max(logits).item())
 
     del x, logits
-    gc.collect()
     if device == "cuda":
-        torch.cuda.empty_cache()
+        del final_norm_runtime, lm_head_runtime
+    gc.collect()
     return next_id, elapsed, peak_logit
 
 
@@ -116,6 +111,8 @@ def generate_response(
     tokenizer,
     final_norm: torch.Tensor,
     lm_head: torch.Tensor,
+    final_norm_name: str,
+    lm_head_name: str,
     device: str,
     max_new_tokens: int,
     sampling_top_k: int,
@@ -138,7 +135,15 @@ def generate_response(
     for step in range(1, max_new_tokens + 1):
         before = cache_stats(root)
         next_id, elapsed, peak = run_generated_token(
-            root, current_id, final_norm, lm_head, device, sampling_top_k, temperature
+            root,
+            current_id,
+            final_norm,
+            lm_head,
+            final_norm_name,
+            lm_head_name,
+            device,
+            sampling_top_k,
+            temperature,
         )
         after = cache_stats(root)
 
@@ -166,18 +171,14 @@ def generate_response(
             break
 
     print()
-    print(
-        f"  resposta: {len(generated)} tokens | "
-        f"wall={perf_counter() - turn_start:.3f}s"
-    )
+    print(f"  resposta: {len(generated)} tokens | wall={perf_counter() - turn_start:.3f}s")
     print_cache(root, "after turn")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Batch Qwen3.6 router mini-chat test")
     parser.add_argument("root", type=Path)
-    parser.add_argument("--prompt", action="append", required=True,
-                        help="Prompt to test; repeat --prompt for multiple turns")
+    parser.add_argument("--prompt", action="append", required=True, help="Prompt to test; repeat --prompt for multiple turns")
     parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-k", type=int, default=20, help="Sampling top-k")
@@ -203,6 +204,7 @@ def main() -> None:
     print("mode=experimental-stateless-autoregressive")
     print("warning=no DeltaNet recurrent state or full-attention KV cache yet")
     print("cache=hierarchical-vram-ram-ssd")
+    print("vram_dequantized_cache=on")
     print(f"prompts={len(args.prompt)}")
     print(f"device={args.device}")
     print(f"max_new_tokens={args.max_new_tokens}")
@@ -216,7 +218,14 @@ def main() -> None:
     for index, prompt in enumerate(args.prompt, start=1):
         print(f"\n===== TURN {index}/{len(args.prompt)} =====")
         generate_response(
-            root, prompt, tokenizer, final_norm, lm_head, args.device,
+            root,
+            prompt,
+            tokenizer,
+            final_norm,
+            lm_head,
+            norm_name,
+            lm_name,
+            args.device,
             max_new_tokens=args.max_new_tokens,
             sampling_top_k=args.top_k,
             temperature=args.temperature,
