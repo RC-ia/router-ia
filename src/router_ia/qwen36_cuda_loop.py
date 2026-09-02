@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""CUDA-first single-token Qwen3.6 reference runner with GPU expert cache."""
+"""CUDA-first single-token Qwen3.6 reference runner with compact CPU expert cache."""
 
 import argparse
 import gc
@@ -27,15 +27,18 @@ FULL_Q_DIM = FULL_NUM_HEADS * FULL_HEAD_DIM
 FULL_NUM_KV_GROUPS = FULL_NUM_HEADS // FULL_NUM_KV_HEADS
 EPS = 1e-6
 DEFAULT_LAYERS = 40
-DEFAULT_CACHE_MIB = 512.0
+DEFAULT_CACHE_MIB = 1536.0
 
-class GPUWeightCache:
+
+class CPUWeightCache:
+    """LRU cache in system RAM, keeping expert weights in their compact FP8 form."""
+
     def __init__(self, budget_mib: float) -> None:
         if budget_mib < 0:
             raise ValueError("cache budget must be non-negative")
         self.budget_bytes = int(budget_mib * 1024**2)
         self.used_bytes = 0
-        self.items: OrderedDict[str, tuple[torch.Tensor, int]] = OrderedDict()
+        self.items: OrderedDict[str, tuple[torch.Tensor, torch.Tensor | None, int]] = OrderedDict()
         self.hits = 0
         self.misses = 0
         self.evictions = 0
@@ -44,31 +47,41 @@ class GPUWeightCache:
     def nbytes(tensor: torch.Tensor) -> int:
         return int(tensor.numel() * tensor.element_size())
 
-    def get(self, key: str) -> torch.Tensor | None:
+    @classmethod
+    def item_nbytes(cls, weight: torch.Tensor, scale: torch.Tensor | None) -> int:
+        size = cls.nbytes(weight)
+        if scale is not None:
+            size += cls.nbytes(scale)
+        return size
+
+    def get(self, key: str) -> tuple[torch.Tensor, torch.Tensor | None] | None:
         item = self.items.get(key)
         if item is None:
             self.misses += 1
             return None
-        tensor, _ = item
+        weight, scale, _ = item
         self.items.move_to_end(key)
         self.hits += 1
-        return tensor
+        return weight, scale
 
-    def put(self, key: str, tensor: torch.Tensor) -> torch.Tensor:
-        size = self.nbytes(tensor)
+    def put(self, key: str, weight: torch.Tensor, scale: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor | None]:
+        size = self.item_nbytes(weight, scale)
         if self.budget_bytes == 0 or size > self.budget_bytes:
-            return tensor
+            return weight, scale
+
         old = self.items.pop(key, None)
         if old is not None:
-            self.used_bytes -= old[1]
+            self.used_bytes -= old[2]
+
         while self.items and self.used_bytes + size > self.budget_bytes:
-            _, (evicted, evicted_size) = self.items.popitem(last=False)
+            _, (evicted_weight, evicted_scale, evicted_size) = self.items.popitem(last=False)
             self.used_bytes -= evicted_size
             self.evictions += 1
-            del evicted
-        self.items[key] = (tensor, size)
+            del evicted_weight, evicted_scale
+
+        self.items[key] = (weight, scale, size)
         self.used_bytes += size
-        return tensor
+        return weight, scale
 
     def stats(self) -> tuple[int, int, int, int]:
         return self.used_bytes, len(self.items), self.hits, self.misses
@@ -77,26 +90,33 @@ class GPUWeightCache:
         self.items.clear()
         self.used_bytes = 0
 
-_GPU_CACHE: GPUWeightCache | None = None
 
-def set_gpu_cache(cache: GPUWeightCache | None) -> None:
-    global _GPU_CACHE
-    _GPU_CACHE = cache
+_CPU_CACHE: CPUWeightCache | None = None
+
+
+def set_cpu_cache(cache: CPUWeightCache | None) -> None:
+    global _CPU_CACHE
+    _CPU_CACHE = cache
+
 
 def should_cache_projection(prefix: str) -> bool:
     return ".mlp.experts." in prefix or ".mlp.shared_expert." in prefix
 
+
 def layer_prefix(layer: int) -> str:
     return f"model.language_model.layers.{layer}."
 
+
 def load_layer_weight(root: Path, layer: int, suffix: str, device: str) -> torch.Tensor:
     return load_tensor(root, layer_prefix(layer) + suffix, device=device)
+
 
 def load_optional_tensor(root: Path, name: str, device: str) -> torch.Tensor | None:
     try:
         return load_tensor(root, name, device=device)
     except KeyError:
         return None
+
 
 def attention_type(root: Path, layer: int) -> str:
     prefix = layer_prefix(layer)
@@ -110,6 +130,7 @@ def attention_type(root: Path, layer: int) -> str:
         return "full_attention"
     raise KeyError(f"Could not identify attention type for layer {layer}")
 
+
 def dequantize_fp8_target(weight: torch.Tensor, scale_inv: torch.Tensor, device: str) -> torch.Tensor:
     if device != "cuda":
         return dequantize_fp8_blockwise(weight, scale_inv)
@@ -120,29 +141,39 @@ def dequantize_fp8_target(weight: torch.Tensor, scale_inv: torch.Tensor, device:
     del w, s, expanded
     return out
 
+
 def load_fp8_projection_target(root: Path, prefix: str, device: str) -> torch.Tensor:
     cache_key = prefix if should_cache_projection(prefix) and device == "cuda" else None
-    if cache_key is not None and _GPU_CACHE is not None:
-        cached = _GPU_CACHE.get(cache_key)
+    if cache_key is not None and _CPU_CACHE is not None:
+        cached = _CPU_CACHE.get(cache_key)
         if cached is not None:
-            return cached
+            weight, scale = cached
+            if weight.dtype == torch.float8_e4m3fn:
+                return dequantize_fp8_target(weight, scale, device)
+            return weight.float().to(device)
+
     weight = load_tensor(root, prefix + ".weight", device="cpu")
+    scale: torch.Tensor | None = None
     if weight.dtype == torch.float8_e4m3fn:
         scale = load_tensor(root, prefix + ".weight_scale_inv", device="cpu")
         out = dequantize_fp8_target(weight, scale, device)
-        del scale
     else:
         out = weight.float().to(device)
-    del weight
-    if cache_key is not None and _GPU_CACHE is not None:
-        out = _GPU_CACHE.put(cache_key, out)
+
+    if cache_key is not None and _CPU_CACHE is not None:
+        _CPU_CACHE.put(cache_key, weight, scale)
+    else:
+        del weight, scale
     return out
+
 
 def load_moe_projection_target(root: Path, layer: int, expert: int, kind: str, device: str) -> torch.Tensor:
     return load_fp8_projection_target(root, f"{layer_prefix(layer)}mlp.experts.{expert}.{kind}", device)
 
+
 def load_shared_projection_target(root: Path, layer: int, kind: str, device: str) -> torch.Tensor:
     return load_fp8_projection_target(root, f"{layer_prefix(layer)}mlp.shared_expert.{kind}", device)
+
 
 def linear_attention_step(root: Path, layer: int, x0: torch.Tensor, device: str) -> torch.Tensor:
     prefix = layer_prefix(layer)
@@ -185,6 +216,7 @@ def linear_attention_step(root: Path, layer: int, x0: torch.Tensor, device: str)
     del input_norm, h, qkv_w, qkv_scale, mixed, conv_w, q, k, v, a_w, b_w, a_log, dt_bias, a_raw, b_raw, beta, g, decay, qn, kn, state, retrieved, delta, attn, z_w, z, norm_w, gated, out_w, attn_projected
     return residual
 
+
 def full_attention_step(root: Path, layer: int, x0: torch.Tensor, device: str) -> torch.Tensor:
     prefix = layer_prefix(layer)
     input_norm = load_layer_weight(root, layer, "input_layernorm.weight", device)
@@ -221,6 +253,7 @@ def full_attention_step(root: Path, layer: int, x0: torch.Tensor, device: str) -
     del input_norm, h, q_w, q_scale, k_w, k_scale, v_w, v_scale, q_gate, q, gate, k, v, q_norm_w, k_norm_w, scores, attn_weights, attn, attn_flat, out_w, out_scale, attn_projected
     return residual
 
+
 def run_routed_expert(root: Path, layer: int, expert: int, x: torch.Tensor, device: str) -> torch.Tensor:
     gate_w = load_moe_projection_target(root, layer, expert, "gate_proj", device)
     up_w = load_moe_projection_target(root, layer, expert, "up_proj", device)
@@ -231,6 +264,7 @@ def run_routed_expert(root: Path, layer: int, expert: int, x: torch.Tensor, devi
     out = F.linear(hidden, down_w.float())
     del gate, up, hidden
     return out
+
 
 def run_shared_expert(root: Path, layer: int, x: torch.Tensor, device: str) -> tuple[torch.Tensor, float]:
     gate_w = load_shared_projection_target(root, layer, "gate_proj", device)
@@ -246,6 +280,7 @@ def run_shared_expert(root: Path, layer: int, x: torch.Tensor, device: str) -> t
     gate_value = float(gate.item())
     del gate_w, up_w, down_w, shared_gate_w, gate, hidden_gate, up, hidden, raw
     return out, gate_value
+
 
 def moe_step(root: Path, layer: int, residual: torch.Tensor, top_k: int, device: str) -> tuple[torch.Tensor, list[int], list[float], float, float]:
     post_norm = load_layer_weight(root, layer, "post_attention_layernorm.weight", device)
@@ -267,6 +302,7 @@ def moe_step(root: Path, layer: int, residual: torch.Tensor, top_k: int, device:
     gc.collect()
     return layer_out, expert_ids, weights, shared_gate, moe_input_norm
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="CUDA-first Qwen3.6 single-token loop")
     parser.add_argument("root", type=Path)
@@ -274,7 +310,7 @@ def main() -> None:
     parser.add_argument("--start-layer", type=int, default=0)
     parser.add_argument("--end-layer", type=int, default=DEFAULT_LAYERS - 1)
     parser.add_argument("--top-k", type=int, default=8)
-    parser.add_argument("--cache-mib", type=float, default=DEFAULT_CACHE_MIB)
+    parser.add_argument("--cache-mib", type=float, default=DEFAULT_CACHE_MIB, help="system RAM cache budget for compact FP8 expert weights")
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA unavailable")
@@ -282,13 +318,16 @@ def main() -> None:
         raise SystemExit(f"layer range must be inside 0..{DEFAULT_LAYERS - 1}")
     if args.cache_mib < 0:
         raise SystemExit("cache-mib must be non-negative")
+
     root = args.root.resolve()
     device = "cuda"
-    cache = GPUWeightCache(args.cache_mib)
-    set_gpu_cache(cache)
+    cache = CPUWeightCache(args.cache_mib)
+    set_cpu_cache(cache)
+
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"PyTorch CUDA: {torch.version.cuda}")
-    print(f"GPU cache budget: {args.cache_mib:.1f} MiB")
+    print(f"RAM FP8 cache budget: {args.cache_mib:.1f} MiB")
+
     x = load_embedding_row(root, args.token_id).reshape(1, HIDDEN).to(device).float()
     torch.cuda.synchronize()
     start_total = perf_counter()
@@ -296,6 +335,7 @@ def main() -> None:
     print(f"token id: {args.token_id}")
     print(f"layers: {args.start_layer}..{args.end_layer}")
     print(f"input norm: {torch.linalg.vector_norm(x).item():.8f}")
+
     for layer in range(args.start_layer, args.end_layer + 1):
         start_layer = perf_counter()
         kind = attention_type(root, layer)
@@ -304,6 +344,7 @@ def main() -> None:
         torch.cuda.synchronize()
         layer_ms = (perf_counter() - start_layer) * 1000.0
         used_bytes, entries, hits, misses = cache.stats()
+
         print(f"layer {layer} ({kind}):")
         print(f"  router top-{args.top_k}: {expert_ids}")
         print(f"  router weights: {[round(v, 8) for v in weights]}")
@@ -314,13 +355,15 @@ def main() -> None:
         print(f"  output mean: {x.mean().item():.8f}")
         print(f"  VRAM allocated: {torch.cuda.memory_allocated() / 1024**2:.1f} MiB")
         print(f"  VRAM reserved: {torch.cuda.memory_reserved() / 1024**2:.1f} MiB")
-        print(f"  cache: {used_bytes / 1024**2:.1f} MiB / {args.cache_mib:.1f} MiB ({entries} tensors)")
+        print(f"  RAM cache: {used_bytes / 1024**2:.1f} MiB / {args.cache_mib:.1f} MiB ({entries} tensors)")
         print(f"  cache hits: {hits}")
         print(f"  cache misses: {misses}")
         print(f"  cache evictions: {cache.evictions}")
         print(f"  time: {layer_ms:.3f} ms")
+
         del residual
         gc.collect()
+
     torch.cuda.synchronize()
     total_ms = (perf_counter() - start_total) * 1000.0
     print(f"final output shape: {tuple(x.shape)}")
@@ -329,16 +372,18 @@ def main() -> None:
     print(f"final output min: {x.min().item():.8f}")
     print(f"final output max: {x.max().item():.8f}")
     print(f"total time: {total_ms:.3f} ms")
-    print(f"final cache size: {cache.used_bytes / 1024**2:.1f} MiB")
-    print(f"final cache entries: {len(cache.items)}")
+    print(f"final RAM cache size: {cache.used_bytes / 1024**2:.1f} MiB")
+    print(f"final RAM cache entries: {len(cache.items)}")
     print(f"final cache hits: {cache.hits}")
     print(f"final cache misses: {cache.misses}")
     print(f"final cache evictions: {cache.evictions}")
+
     del x
     cache.clear()
-    set_gpu_cache(None)
+    set_cpu_cache(None)
     gc.collect()
     torch.cuda.empty_cache()
+
 
 if __name__ == "__main__":
     main()
