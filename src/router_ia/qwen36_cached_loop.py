@@ -1,19 +1,15 @@
 from __future__ import annotations
 
-"""Qwen3.6 loop with persistent shards and a soft priority-aware RAM cache.
+"""Qwen3.6 loop with persistent shards and soft priority-aware RAM cache.
 
 The cache keeps raw CPU tensors and uses the full RAM budget as one shared pool.
 Eviction is global, but expert tensors receive a strong preservation bonus so
 frequently reused MoE weights are less likely to be evicted than ordinary
 attention/norm tensors.
 
-This intentionally avoids a hard expert/general partition: a hot expert may
-consume free capacity that would otherwise be unused, while a cold expert can
-still be evicted when a more valuable general tensor needs space.
-
 Environment variables:
     QWEN36_CACHE_GB:
-        Total RAM budget for raw tensor cache, default 2.5 GiB.
+        Total RAM budget for raw tensor cache, default 3.0 GiB.
     QWEN36_EXPERT_BONUS:
         Preservation bonus for expert tensors in the eviction score,
         default 4.0.
@@ -57,7 +53,7 @@ def _env_int(name: str, default: int) -> int:
     return value if value > 0 else 0
 
 
-CACHE_GB = _env_float("QWEN36_CACHE_GB", 2.5)
+CACHE_GB = _env_float("QWEN36_CACHE_GB", 3.0)
 CACHE_BUDGET_BYTES = int(CACHE_GB * 1024 * 1024 * 1024)
 EXPERT_BONUS = _env_float("QWEN36_EXPERT_BONUS", 4.0)
 CACHE_LOG_INTERVAL = _env_int("QWEN36_CACHE_LOG_INTERVAL", 0)
@@ -127,18 +123,8 @@ class _PriorityTensorCache:
         age = max(self.clock - last, 0)
         expert = self.item_expert.get(name, False)
 
-        # Higher score means "more valuable to keep".
-        #
-        # Frequency:
-        #   repeated reuse matters strongly, but log1p prevents a very hot
-        #   tensor from becoming mathematically immortal.
         frequency = 3.0 * math.log1p(hits)
-        # Recency:
-        #   recently used tensors get a temporary boost.
         recency = 8.0 / math.sqrt(1.0 + age)
-        # Expert preservation:
-        #   experts are important to keep, but this is only a soft bonus.
-        #   They can still be evicted when cold enough.
         expert_bonus = EXPERT_BONUS if expert else 0.0
         return frequency + recency + expert_bonus
 
@@ -261,9 +247,6 @@ class _PriorityTensorCache:
             expert_items = sum(
                 1 for value in self.item_expert.values() if value
             )
-
-            # Show how much of the current resident set is experts by bytes and
-            # by item count. This is especially useful for tuning the bonus.
             expert_share = (
                 self.expert_bytes / self.bytes_used * 100.0
                 if self.bytes_used
@@ -301,10 +284,8 @@ class _ShardStore:
         self.stack = ExitStack()
         self.weight_map: dict[str, str] = {}
         self.handles: dict[Path, object] = {}
-
         self.handle_opens = 0
         self.handle_hits = 0
-
         self.cache = _PriorityTensorCache(CACHE_BUDGET_BYTES)
         self._last_log_loads = 0
 
@@ -335,7 +316,6 @@ class _ShardStore:
             return
 
         self._last_log_loads = int(stats["loads"])
-
         used_mib = stats["bytes"] / (1024 * 1024)
         budget_mib = self.cache.max_bytes / (1024 * 1024)
         expert_mib = stats["expert_bytes"] / (1024 * 1024)
@@ -356,7 +336,6 @@ class _ShardStore:
 
     def load(self, name: str, device: str):
         cached = self.cache.get(name)
-
         if cached is not None:
             self._maybe_log_progress(name)
             if device == "cpu":
@@ -372,18 +351,14 @@ class _ShardStore:
         for shard in shards:
             if not shard.is_file():
                 continue
-
             handle = self._handle(shard)
-            if name not in handle.keys():
-                continue
-
-            tensor = handle.get_tensor(name)
-            self.cache.put(name, tensor)
-            self._maybe_log_progress(name)
-
-            if device == "cpu":
-                return tensor
-            return tensor.to(device=device)
+            if name in handle.keys():
+                tensor = handle.get_tensor(name)
+                self.cache.put(name, tensor)
+                self._maybe_log_progress(name)
+                if device == "cpu":
+                    return tensor
+                return tensor.to(device=device)
 
         raise KeyError(f"Tensor not found: {name}")
 
@@ -399,11 +374,9 @@ _stores: dict[Path, _ShardStore] = {}
 def _store(root: Path) -> _ShardStore:
     key = root.resolve()
     store = _stores.get(key)
-
     if store is None:
         store = _ShardStore(key)
         _stores[key] = store
-
     return store
 
 
@@ -411,7 +384,6 @@ def _cached_load_tensor(root: Path, name: str, device: str = "cpu"):
     return _store(root).load(name, device)
 
 
-# qwen36_40layer_loop resolves these names through its module globals.
 base.load_tensor = _cached_load_tensor
 base.dequantize_fp8_blockwise = dequantize_fp8_blockwise
 
@@ -440,14 +412,12 @@ def main() -> None:
     for root, store in _stores.items():
         stats = store.cache.snapshot()
         total = stats["hits"] + stats["misses"]
-
         print(
             "cached reader: "
             f"root={root} | "
             f"shards opened={store.handle_opens} | "
             f"cached handle hits={store.handle_hits}"
         )
-
         print(
             "LRU summary: "
             f"items={stats['items']} "
