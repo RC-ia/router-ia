@@ -79,11 +79,11 @@ def linear_attention_step(root: Path, layer: int, x0: torch.Tensor, device: str)
     prefix = layer_prefix(layer)
     input_norm = load_layer_weight(root, layer, "input_layernorm.weight", device)
     h = rmsnorm(x0, input_norm)
+    compute_dtype = torch.float16 if device == "cuda" else torch.float32
+    h_compute = h.to(dtype=compute_dtype)
 
-    qkv_w = load_layer_weight(root, layer, "linear_attn.in_proj_qkv.weight", "cpu")
-    qkv_scale = load_layer_weight(root, layer, "linear_attn.in_proj_qkv.weight_scale_inv", "cpu")
-    qkv_w = dequantize_fp8_blockwise(qkv_w, qkv_scale).to(device)
-    mixed = F.linear(h.float(), qkv_w.float()).reshape(1, LINEAR_KEY_DIM * 2 + LINEAR_VALUE_DIM)
+    qkv_w = load_projection(root, prefix + "linear_attn.in_proj_qkv", device)
+    mixed = F.linear(h_compute, qkv_w).reshape(1, LINEAR_KEY_DIM * 2 + LINEAR_VALUE_DIM)
 
     conv_w = load_layer_weight(root, layer, "linear_attn.conv1d.weight", device).float()
     mixed = F.silu(mixed * conv_w[:, 0, -1].reshape(1, -1))
@@ -96,8 +96,8 @@ def linear_attention_step(root: Path, layer: int, x0: torch.Tensor, device: str)
     b_w = load_projection(root, prefix + "linear_attn.in_proj_b", device)
     a_log = load_layer_weight(root, layer, "linear_attn.A_log", device).float().reshape(1, LINEAR_NUM_V_HEADS)
     dt_bias = load_layer_weight(root, layer, "linear_attn.dt_bias", device).float().reshape(1, LINEAR_NUM_V_HEADS)
-    a_raw = F.linear(h.float(), a_w.float()).reshape(1, LINEAR_NUM_V_HEADS)
-    b_raw = F.linear(h.float(), b_w.float()).reshape(1, LINEAR_NUM_V_HEADS)
+    a_raw = F.linear(h_compute, a_w).reshape(1, LINEAR_NUM_V_HEADS).float()
+    b_raw = F.linear(h_compute, b_w).reshape(1, LINEAR_NUM_V_HEADS).float()
     beta = torch.sigmoid(b_raw)
     g = -torch.exp(a_log) * F.softplus(a_raw + dt_bias)
     decay = torch.exp(g)
@@ -112,17 +112,18 @@ def linear_attention_step(root: Path, layer: int, x0: torch.Tensor, device: str)
     attn = torch.einsum("bhkd,bhk->bhd", state, qn)
 
     z_w = load_projection(root, prefix + "linear_attn.in_proj_z", device)
-    z = F.linear(h.float(), z_w.float()).reshape(1, LINEAR_NUM_V_HEADS, 128)
+    z = F.linear(h_compute, z_w).reshape(1, LINEAR_NUM_V_HEADS).reshape(1, LINEAR_NUM_V_HEADS, 128) if z_w.shape[-2] == LINEAR_NUM_V_HEADS else F.linear(h_compute, z_w).reshape(1, LINEAR_NUM_V_HEADS, 128)
     norm_w = load_layer_weight(root, layer, "linear_attn.norm.weight", device)
     gated, _, _ = gated_rmsnorm(attn, z, norm_w)
 
     out_w = load_projection(root, prefix + "linear_attn.out_proj", device)
-    attn_projected = F.linear(gated.reshape(1, LINEAR_VALUE_DIM), out_w.float())
-    residual = x0.reshape(1, HIDDEN) + attn_projected
+    gated_compute = gated.reshape(1, LINEAR_VALUE_DIM).to(dtype=compute_dtype)
+    attn_projected = F.linear(gated_compute, out_w).float()
+    residual = x0.reshape(1, HIDDEN).float() + attn_projected
 
-    del input_norm, h, qkv_w, qkv_scale, mixed, conv_w, q, k, v
+    del input_norm, h, h_compute, qkv_w, mixed, conv_w, q, k, v
     del a_w, b_w, a_log, dt_bias, a_raw, b_raw, beta, g, decay, qn, kn
-    del state, retrieved, delta, attn, z_w, z, norm_w, gated, out_w, attn_projected
+    del state, retrieved, delta, attn, z_w, z, norm_w, gated, out_w, gated_compute, attn_projected
     gc.collect()
     if device == "cuda":
         torch.cuda.empty_cache()
@@ -134,21 +135,17 @@ def full_attention_step(root: Path, layer: int, x0: torch.Tensor, device: str) -
     prefix = layer_prefix(layer)
     input_norm = load_layer_weight(root, layer, "input_layernorm.weight", device)
     h = rmsnorm(x0, input_norm)
+    compute_dtype = torch.float16 if device == "cuda" else torch.float32
+    h_compute = h.to(dtype=compute_dtype)
 
-    q_w = load_layer_weight(root, layer, "self_attn.q_proj.weight", "cpu")
-    q_scale = load_layer_weight(root, layer, "self_attn.q_proj.weight_scale_inv", "cpu")
-    q_w = dequantize_fp8_blockwise(q_w, q_scale).to(device)
-    k_w = load_layer_weight(root, layer, "self_attn.k_proj.weight", "cpu")
-    k_scale = load_layer_weight(root, layer, "self_attn.k_proj.weight_scale_inv", "cpu")
-    k_w = dequantize_fp8_blockwise(k_w, k_scale).to(device)
-    v_w = load_layer_weight(root, layer, "self_attn.v_proj.weight", "cpu")
-    v_scale = load_layer_weight(root, layer, "self_attn.v_proj.weight_scale_inv", "cpu")
-    v_w = dequantize_fp8_blockwise(v_w, v_scale).to(device)
+    q_w = load_projection(root, prefix + "self_attn.q_proj", device)
+    k_w = load_projection(root, prefix + "self_attn.k_proj", device)
+    v_w = load_projection(root, prefix + "self_attn.v_proj", device)
 
-    q_gate = F.linear(h.float(), q_w.float()).reshape(1, FULL_NUM_HEADS, FULL_HEAD_DIM * 2)
+    q_gate = F.linear(h_compute, q_w).reshape(1, FULL_NUM_HEADS, FULL_HEAD_DIM * 2)
     q, gate = torch.chunk(q_gate, 2, dim=-1)
-    k = F.linear(h.float(), k_w.float()).reshape(1, FULL_NUM_KV_HEADS, FULL_HEAD_DIM)
-    v = F.linear(h.float(), v_w.float()).reshape(1, FULL_NUM_KV_HEADS, FULL_HEAD_DIM)
+    k = F.linear(h_compute, k_w).reshape(1, FULL_NUM_KV_HEADS, FULL_HEAD_DIM)
+    v = F.linear(h_compute, v_w).reshape(1, FULL_NUM_KV_HEADS, FULL_HEAD_DIM)
 
     q_norm_w = load_layer_weight(root, layer, "self_attn.q_norm.weight", device)
     k_norm_w = load_layer_weight(root, layer, "self_attn.k_norm.weight", device)
@@ -156,25 +153,21 @@ def full_attention_step(root: Path, layer: int, x0: torch.Tensor, device: str) -
     k = rmsnorm(k, k_norm_w).float()
 
     k = k.repeat_interleave(FULL_NUM_KV_GROUPS, dim=1)
-    v = v.repeat_interleave(FULL_NUM_KV_GROUPS, dim=1)
+    v = v.repeat_interleave(FULL_NUM_KV_GROUPS, dim=1).float()
 
-    # Shapes: q=[B,H,1,D], k=[B,H,1,D], v=[B,H,1,D].
-    # For position 0 there is one causal key, so softmax has a single element.
     scores = torch.matmul(q.unsqueeze(2), k.transpose(-1, -2)).squeeze(-2) * (FULL_HEAD_DIM ** -0.5)
     attn_weights = torch.softmax(scores.float(), dim=-1)
     attn = torch.matmul(attn_weights.unsqueeze(-2), v).squeeze(-2)
-    attn = attn * torch.sigmoid(gate)
-    attn_flat = attn.reshape(1, FULL_Q_DIM)
+    attn = attn * torch.sigmoid(gate.float())
+    attn_flat = attn.reshape(1, FULL_Q_DIM).to(dtype=compute_dtype)
 
-    out_w = load_layer_weight(root, layer, "self_attn.o_proj.weight", "cpu")
-    out_scale = load_layer_weight(root, layer, "self_attn.o_proj.weight_scale_inv", "cpu")
-    out_w = dequantize_fp8_blockwise(out_w, out_scale).to(device)
-    attn_projected = F.linear(attn_flat, out_w.float())
-    residual = x0.reshape(1, HIDDEN) + attn_projected
+    out_w = load_projection(root, prefix + "self_attn.o_proj", device)
+    attn_projected = F.linear(attn_flat, out_w).float()
+    residual = x0.reshape(1, HIDDEN).float() + attn_projected
 
-    del input_norm, h, q_w, q_scale, k_w, k_scale, v_w, v_scale
+    del input_norm, h, h_compute, q_w, k_w, v_w
     del q_gate, q, gate, k, v, q_norm_w, k_norm_w, scores, attn_weights, attn
-    del attn_flat, out_w, out_scale, attn_projected
+    del attn_flat, out_w, attn_projected
     gc.collect()
     if device == "cuda":
         torch.cuda.empty_cache()
@@ -183,23 +176,15 @@ def full_attention_step(root: Path, layer: int, x0: torch.Tensor, device: str) -
 
 def load_moe_projection(root: Path, layer: int, expert: int, kind: str, device: str) -> torch.Tensor:
     prefix = f"{layer_prefix(layer)}mlp.experts.{expert}.{kind}"
-    weight = load_tensor(root, prefix + ".weight", device="cpu")
-    if weight.dtype == torch.float8_e4m3fn:
-        scale = load_tensor(root, prefix + ".weight_scale_inv", device="cpu")
-        out = dequantize_fp8_blockwise(weight, scale).to(device)
-        del scale
-    else:
-        out = weight.float().to(device)
-    del weight
-    return out
+    return load_projection(root, prefix, device)
 
 
 def run_routed_expert(root: Path, layer: int, expert: int, x: torch.Tensor, device: str) -> torch.Tensor:
     gate_w = load_moe_projection(root, layer, expert, "gate_proj", device)
     up_w = load_moe_projection(root, layer, expert, "up_proj", device)
     down_w = load_moe_projection(root, layer, expert, "down_proj", device)
-    gate = F.linear(x, gate_w)
-    up = F.linear(x, up_w)
+    gate = F.linear(x.to(gate_w.dtype) if device == "cuda" else x, gate_w)
+    up = F.linear(x.to(up_w.dtype) if device == "cuda" else x, up_w)
     hidden = F.silu(gate) * up
     out = F.linear(hidden, down_w)
     del gate_w, up_w, down_w, gate, up, hidden
@@ -208,15 +193,7 @@ def run_routed_expert(root: Path, layer: int, expert: int, x: torch.Tensor, devi
 
 def load_shared_projection(root: Path, layer: int, kind: str, device: str) -> torch.Tensor:
     prefix = f"{layer_prefix(layer)}mlp.shared_expert.{kind}"
-    weight = load_tensor(root, prefix + ".weight", device="cpu")
-    if weight.dtype == torch.float8_e4m3fn:
-        scale = load_tensor(root, prefix + ".weight_scale_inv", device="cpu")
-        out = dequantize_fp8_blockwise(weight, scale).to(device)
-        del scale
-    else:
-        out = weight.float().to(device)
-    del weight
-    return out
+    return load_projection(root, prefix, device)
 
 
 def run_shared_expert(root: Path, layer: int, x: torch.Tensor, device: str) -> tuple[torch.Tensor, float]:
@@ -225,15 +202,24 @@ def run_shared_expert(root: Path, layer: int, x: torch.Tensor, device: str) -> t
     down_w = load_shared_projection(root, layer, "down_proj", device)
     shared_gate_w = load_layer_weight(root, layer, "mlp.shared_expert_gate.weight", device).float()
 
-    gate = torch.sigmoid(F.linear(x, shared_gate_w))
-    hidden_gate = F.linear(x, gate_w)
-    up = F.linear(x, up_w)
-    hidden = F.silu(hidden_gate) * up
-    raw = F.linear(hidden, down_w)
-    out = raw * gate
-    gate_value = float(gate.item())
+    if device == "cuda":
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            shared_gate = torch.sigmoid(F.linear(x, shared_gate_w))
+            hidden_gate = F.linear(x.to(gate_w.dtype), gate_w)
+            up = F.linear(x.to(up_w.dtype), up_w)
+            hidden = F.silu(hidden_gate) * up
+            raw = F.linear(hidden, down_w)
+            out = raw * shared_gate
+    else:
+        shared_gate = torch.sigmoid(F.linear(x, shared_gate_w))
+        hidden_gate = F.linear(x, gate_w)
+        up = F.linear(x, up_w)
+        hidden = F.silu(hidden_gate) * up
+        raw = F.linear(hidden, down_w)
+        out = raw * shared_gate
 
-    del gate_w, up_w, down_w, shared_gate_w, gate, hidden_gate, up, hidden, raw
+    gate_value = float(shared_gate.float().item())
+    del gate_w, up_w, down_w, shared_gate_w, shared_gate, hidden_gate, up, hidden, raw
     return out, gate_value
 
 
@@ -248,11 +234,11 @@ def moe_step(root: Path, layer: int, residual: torch.Tensor, top_k: int, device:
     routed_sum = torch.zeros_like(moe_in)
     for expert_id, weight in zip(expert_ids, weights):
         out = run_routed_expert(root, layer, expert_id, moe_in, device)
-        routed_sum.add_(out, alpha=weight)
+        routed_sum.add_(out.float(), alpha=weight)
         del out
 
     shared_out, shared_gate = run_shared_expert(root, layer, moe_in, device)
-    moe_out = routed_sum + shared_out
+    moe_out = routed_sum + shared_out.float()
     layer_out = residual + moe_out
     moe_input_norm = float(torch.linalg.vector_norm(moe_in).item())
 
@@ -264,74 +250,37 @@ def moe_step(root: Path, layer: int, residual: torch.Tensor, top_k: int, device:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run Qwen3.6 through all layers sequentially")
+    parser = argparse.ArgumentParser(description="Qwen3.6 40-layer sequential router")
     parser.add_argument("root", type=Path)
-    parser.add_argument("--token-id", type=int, default=0)
-    parser.add_argument("--start-layer", type=int, default=0)
-    parser.add_argument("--end-layer", type=int, default=DEFAULT_LAYERS - 1)
-    parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument("--max-new-tokens", type=int, default=1)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
-    parser.add_argument("--quiet", action="store_true", help="Only print final result")
+    parser.add_argument("--top-k", type=int, default=8)
     args = parser.parse_args()
 
     if args.device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("CUDA unavailable")
-    if not 0 <= args.start_layer <= args.end_layer < DEFAULT_LAYERS:
-        raise SystemExit(f"layer range must be inside 0..{DEFAULT_LAYERS - 1}")
 
     root = args.root.resolve()
-    x = load_embedding_row(root, args.token_id).reshape(1, HIDDEN).to(args.device).float()
-    start_total = perf_counter()
+    print(f"device={args.device}")
+    print(f"layers={DEFAULT_LAYERS}")
+    print(f"top_k={args.top_k}")
 
-    if not args.quiet:
-        print("op=loop")
-        print(f"token id: {args.token_id}")
-        print(f"layers: {args.start_layer}..{args.end_layer}")
-        print(f"device: {args.device}")
-        print(f"input shape: {tuple(x.shape)}")
-        print(f"input norm: {torch.linalg.vector_norm(x).item():.8f}")
-
-    for layer in range(args.start_layer, args.end_layer + 1):
-        start_layer = perf_counter()
-        x_before = x
+    token_id = 1
+    x = load_embedding_row(root, token_id).reshape(1, HIDDEN).to(args.device).float()
+    start = perf_counter()
+    for layer in range(DEFAULT_LAYERS):
         kind = attention_type(root, layer)
         if kind == "linear_attention":
-            residual = linear_attention_step(root, layer, x_before, args.device)
+            residual = linear_attention_step(root, layer, x, args.device)
         else:
-            residual = full_attention_step(root, layer, x_before, args.device)
-        x, expert_ids, weights, shared_gate, moe_input_norm = moe_step(
-            root, layer, residual, args.top_k, args.device
-        )
-        if args.device == "cuda":
-            torch.cuda.synchronize()
-        layer_ms = (perf_counter() - start_layer) * 1000.0
-
-        if not args.quiet:
-            print(f"layer {layer} ({kind}):")
-            print(f"  router top-{args.top_k}: {expert_ids}")
-            print(f"  router weights: {[round(v, 8) for v in weights]}")
-            print(f"  shared gate: {shared_gate:.8f}")
-            print(f"  moe input norm: {moe_input_norm:.8f}")
-            print(f"  output shape: {tuple(x.shape)}")
-            print(f"  output norm: {torch.linalg.vector_norm(x).item():.8f}")
-            print(f"  output mean: {x.mean().item():.8f}")
-            print(f"  time: {layer_ms:.3f} ms")
-        del x_before, residual
+            residual = full_attention_step(root, layer, x, args.device)
+        x, expert_ids, weights, shared_gate, moe_norm = moe_step(root, layer, residual, args.top_k, args.device)
+        del residual
+        print(f"layer={layer} kind={kind} experts={expert_ids} weights={[round(v, 4) for v in weights]} shared_gate={shared_gate:.4f} moe_norm={moe_norm:.4f}")
 
     if args.device == "cuda":
         torch.cuda.synchronize()
-    total_ms = (perf_counter() - start_total) * 1000.0
-    print(f"final output shape: {tuple(x.shape)}")
-    print(f"final output norm: {torch.linalg.vector_norm(x).item():.8f}")
-    print(f"final output mean: {x.mean().item():.8f}")
-    print(f"final output min: {x.min().item():.8f}")
-    print(f"final output max: {x.max().item():.8f}")
-    print(f"total time: {total_ms:.3f} ms")
-
-    del x
-    gc.collect()
-    if args.device == "cuda":
-        torch.cuda.empty_cache()
+    print(f"elapsed={perf_counter() - start:.3f}s")
 
 
 if __name__ == "__main__":
