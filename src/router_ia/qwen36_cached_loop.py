@@ -15,6 +15,10 @@ Environment variables:
         default 4.0.
     QWEN36_CACHE_LOG_INTERVAL:
         Print cache progress every N cache inserts, default 0 (disabled).
+    QWEN36_VRAM_GB:
+        Optional per-process CUDA allocator limit in GiB. Disabled by default
+        (0). When enabled, the limit is applied as a fraction of the detected
+        GPU's total VRAM before model tensors are allocated.
 """
 
 import atexit
@@ -25,6 +29,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from threading import Lock
 
+import torch
 from safetensors import safe_open
 
 from . import qwen36_40layer_loop as base
@@ -57,6 +62,35 @@ CACHE_GB = _env_float("QWEN36_CACHE_GB", 3.0)
 CACHE_BUDGET_BYTES = int(CACHE_GB * 1024 * 1024 * 1024)
 EXPERT_BONUS = _env_float("QWEN36_EXPERT_BONUS", 4.0)
 CACHE_LOG_INTERVAL = _env_int("QWEN36_CACHE_LOG_INTERVAL", 0)
+VRAM_GB = _env_float("QWEN36_VRAM_GB", 0.0)
+
+
+def _configure_vram_limit(device: str) -> None:
+    """Optionally cap this process's CUDA allocator before any CUDA allocations."""
+    if device != "cuda" or VRAM_GB <= 0:
+        return
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA unavailable but QWEN36_VRAM_GB was requested")
+
+    props = torch.cuda.get_device_properties(0)
+    total_gib = props.total_memory / (1024 ** 3)
+    fraction = VRAM_GB / total_gib
+
+    if fraction >= 1.0:
+        print(
+            f"VRAM limit: requested {VRAM_GB:.2f} GiB >= detected "
+            f"{total_gib:.2f} GiB; leaving allocator uncapped"
+        )
+        return
+
+    if fraction <= 0.0:
+        return
+
+    torch.cuda.set_per_process_memory_fraction(fraction, 0)
+    print(
+        f"VRAM limit: {VRAM_GB:.2f} GiB / {total_gib:.2f} GiB "
+        f"({fraction * 100.0:.1f}% of allocator limit)"
+    )
 
 
 def _is_expert_tensor(name: str) -> bool:
@@ -399,11 +433,17 @@ def _format_mib(value: int) -> str:
 
 
 def main() -> None:
+    import sys
+
+    device = "cuda" if "--device" in sys.argv and "cuda" in sys.argv else "cpu"
+    _configure_vram_limit(device)
+
     print(
         "LRU config: "
         f"budget={CACHE_GB:.2f} GiB | "
         f"mode=global-soft-priority | "
         f"expert_bonus={EXPERT_BONUS:.2f} | "
+        f"vram_limit={VRAM_GB:.2f} GiB | "
         f"log_interval={CACHE_LOG_INTERVAL or 'off'}"
     )
 
