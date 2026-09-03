@@ -21,6 +21,7 @@ from . import qwen36_attention_cache as attention_state
 from . import qwen36_chat_batch as chat
 from . import qwen36_cached_loop as cached
 from . import qwen36_expert_cache as expert_cache
+from .qwen36_mini_chat import sample_next
 
 _T = TypeVar("_T")
 
@@ -187,7 +188,7 @@ def _generate_response_stateful(
         hidden = base.rmsnorm(hidden, final_norm_runtime)
         if device == "cuda":
             with torch.autocast(device_type="cuda", dtype=torch.float16):
-                logits = F.linear(hidden, lm_head_runtime)
+                logits = F.linear(hidden.to(lm_head_runtime.dtype), lm_head_runtime)
         else:
             logits = F.linear(hidden, lm_head_runtime)
         current_id = int(sample_next(logits, temperature, sampling_top_k))
@@ -255,9 +256,9 @@ def _generate_response_stateful(
 _configure_fused_cache_budget()
 
 base.attention_type = _cached_attention_type
-base.linear_attention_step = _without_allocator_flush(_stateful_attention_step)
-base.full_attention_step = _without_allocator_flush(_stateful_attention_step)
 
 _ORIGINAL_CHAT_RUN_GENERATED_TOKEN = chat.run_generated_token
+base.linear_attention_step = _without_allocator_flush(_stateful_attention_step)
+base.full_attention_step = _without_allocator_flush(_stateful_attention_step)
 chat.run_generated_token = _without_allocator_flush(_run_generated_token_stateful)
 chat.generate_response = _generate_response_stateful
