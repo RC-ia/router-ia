@@ -38,7 +38,7 @@ def compare(name: str, ref: torch.Tensor, got: torch.Tensor, tolerance: float = 
 
 
 def apply_rope(q: torch.Tensor, k: torch.Tensor, position: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply Qwen3.6 RoPE without depending on an optional cache helper."""
+    """Apply Qwen3.6/Transformers RoPE using the standard half-split rotate_half."""
     device = q.device
     dtype = q.dtype
     half_dim = ROPE_DIM // 2
@@ -47,16 +47,16 @@ def apply_rope(q: torch.Tensor, k: torch.Tensor, position: int) -> tuple[torch.T
     cos = angles.cos().to(dtype=dtype)
     sin = angles.sin().to(dtype=dtype)
 
-    def rotate(x: torch.Tensor) -> torch.Tensor:
+    def rotate_half(x: torch.Tensor) -> torch.Tensor:
         x_rot = x[..., :ROPE_DIM]
         x_pass = x[..., ROPE_DIM:]
-        x_even = x_rot[..., 0::2]
-        x_odd = x_rot[..., 1::2]
-        rotated = torch.stack((x_even * cos - x_odd * sin, x_even * sin + x_odd * cos), dim=-1).reshape_as(x_rot)
-        return torch.cat((rotated, x_pass), dim=-1)
+        x1 = x_rot[..., :half_dim]
+        x2 = x_rot[..., half_dim:]
+        rotated = torch.cat((-x2, x1), dim=-1)
+        return torch.cat((x_rot * cos.repeat(2) + rotated * sin.repeat(2), x_pass), dim=-1)
 
     assert half_dim == cos.numel()
-    return rotate(q), rotate(k)
+    return rotate_half(q), rotate_half(k)
 
 
 def discover_full_attention_layers(root: Path) -> list[int]:
