@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Persistent compressed GPU cache for Qwen3.6 routed experts."""
+"""Persistent FP8 GPU cache with Q4 RAM backing for Qwen3.6 routed experts."""
 
 from collections import OrderedDict
 from threading import Lock
@@ -19,7 +19,9 @@ FP8_MAX = 448.0
 FP16_EXPERT_BYTES_ESTIMATE = 3 * EXPERT_HIDDEN * HIDDEN * 2
 
 FP8_SLOTS_PER_LAYER = 8
-Q4_SLOTS_PER_LAYER = 4
+# Q4 is a RAM backing tier now. Keep it bounded so it does not consume the
+# model/runtime RAM budget indefinitely.
+Q4_SLOTS_PER_LAYER = 3
 TOTAL_SLOTS_PER_LAYER = FP8_SLOTS_PER_LAYER + Q4_SLOTS_PER_LAYER
 
 FP8Matrix = tuple[torch.Tensor, torch.Tensor]
@@ -69,8 +71,11 @@ def _q4_quantize_matrix(weight: torch.Tensor) -> Q4Matrix:
     return packed, scale.to(dtype=torch.float16), (rows, cols)
 
 
-def _q4_dequantize_matrix(matrix: Q4Matrix) -> torch.Tensor:
+def _q4_dequantize_matrix(matrix: Q4Matrix, device: str = "cuda") -> torch.Tensor:
     packed, scale, shape = matrix
+    if device == "cuda":
+        packed = packed.to(device="cuda", non_blocking=True)
+        scale = scale.to(device="cuda", non_blocking=True)
     low = (packed & 0x0F).to(torch.int16) - 8
     high = ((packed >> 4) & 0x0F).to(torch.int16) - 8
     q = torch.stack((low, high), dim=1).reshape(-1)[: shape[0] * shape[1]]
@@ -80,8 +85,8 @@ def _q4_dequantize_matrix(matrix: Q4Matrix) -> torch.Tensor:
 def _q4_dequantize_entry_batch(entries: list[ColdEntry], projection: int) -> list[torch.Tensor]:
     if not entries:
         return []
-    packed = torch.stack([entry[projection][0] for entry in entries], dim=0)
-    scales = torch.stack([entry[projection][1] for entry in entries], dim=0)
+    packed = torch.stack([entry[projection][0] for entry in entries], dim=0).to(device="cuda", non_blocking=True)
+    scales = torch.stack([entry[projection][1] for entry in entries], dim=0).to(device="cuda", non_blocking=True)
     shapes = [entry[projection][2] for entry in entries]
     rows, cols = shapes[0]
     if any(shape != (rows, cols) for shape in shapes):
@@ -93,11 +98,20 @@ def _q4_dequantize_entry_batch(entries: list[ColdEntry], projection: int) -> lis
 
 
 def _q4_quantize_entry_from_fp8(entry: WarmEntry) -> ColdEntry:
+    # The input is already on CUDA. Quantization therefore stays on the GPU;
+    # only the compressed Q4 result is copied to host RAM afterward.
     return tuple(_q4_quantize_matrix(_fp8_dequantize_matrix(m)) for m in entry)  # type: ignore[return-value]
 
 
+def _move_q4_to_cpu(entry: ColdEntry) -> ColdEntry:
+    return tuple(
+        (packed.detach().to(device="cpu"), scale.detach().to(device="cpu"), shape)
+        for packed, scale, shape in entry
+    )  # type: ignore[return-value]
+
+
 class RoutedExpertCache:
-    """Per-layer compressed expert cache: 8 FP8 + 4 Q4 slots."""
+    """Per-layer FP8 GPU cache with a colder Q4 backing tier in system RAM."""
 
     def __init__(self, budget_bytes: int, layers: int = MODEL_LAYERS) -> None:
         self.budget_bytes = max(int(budget_bytes), 0)
@@ -112,7 +126,9 @@ class RoutedExpertCache:
         self.fp8_entries: dict[int, OrderedDict[int, WarmEntry]] = {layer: OrderedDict() for layer in range(self.layers)}
         self.q4_entries: dict[int, OrderedDict[int, ColdEntry]] = {layer: OrderedDict() for layer in range(self.layers)}
         self.entry_bytes: dict[tuple[int, int, str], int] = {}
+        self.q4_ram_bytes: dict[tuple[int, int], int] = {}
         self.bytes_used = 0
+        self.q4_bytes_used = 0
         self.hits = 0
         self.misses = 0
         self.loads = 0
@@ -122,6 +138,7 @@ class RoutedExpertCache:
         self.fp16_to_fp8 = 0
         self.fp8_to_q4 = 0
         self.q4_drops = 0
+        self.q4_ram_evictions = 0
         self.stream_prefetch_hits = 0
         self.stream_prefetch_misses = 0
         self.lock = Lock()
@@ -129,11 +146,8 @@ class RoutedExpertCache:
     def _budget_slots(self) -> int:
         if not self.budget_bytes:
             return 0
-        target_per_layer = (
-            FP8_SLOTS_PER_LAYER * (FP16_EXPERT_BYTES_ESTIMATE // 2)
-            + Q4_SLOTS_PER_LAYER * (FP16_EXPERT_BYTES_ESTIMATE // 4)
-        )
-        return TOTAL_SLOTS_PER_LAYER if self.budget_bytes // max(target_per_layer, 1) >= self.layers else 0
+        target_per_layer = FP8_SLOTS_PER_LAYER * (FP16_EXPERT_BYTES_ESTIMATE // 2)
+        return FP8_SLOTS_PER_LAYER if self.budget_bytes // max(target_per_layer, 1) >= self.layers else 0
 
     @staticmethod
     def _fp8_size(entry: WarmEntry) -> int:
@@ -144,11 +158,18 @@ class RoutedExpertCache:
         return sum(int(p.numel()) * int(p.element_size()) + int(s.numel()) * int(s.element_size()) for p, s, _ in entry)
 
     def _record(self, layer: int, expert_id: int, tier: str, size: int) -> None:
-        self.entry_bytes[(layer, expert_id, tier)] = size
-        self.bytes_used += size
+        if tier == "q4":
+            self.q4_ram_bytes[(layer, expert_id)] = size
+            self.q4_bytes_used += size
+        else:
+            self.entry_bytes[(layer, expert_id, tier)] = size
+            self.bytes_used += size
 
     def _erase(self, layer: int, expert_id: int, tier: str) -> None:
-        self.bytes_used -= self.entry_bytes.pop((layer, expert_id, tier), 0)
+        if tier == "q4":
+            self.q4_bytes_used -= self.q4_ram_bytes.pop((layer, expert_id), 0)
+        else:
+            self.bytes_used -= self.entry_bytes.pop((layer, expert_id, tier), 0)
 
     @staticmethod
     def _stream_key(proj: str, kind: str) -> str:
@@ -226,14 +247,13 @@ class RoutedExpertCache:
                         result[position] = [None, None, None]
                     result[position][projection] = decoded[local]
 
-        return [tuple(item) for item in result if item is not None]  # type: ignore[arg-type]
+        return [tuple(item) for item in result]  # type: ignore[arg-type]
 
     def get(self, layer: int, expert_id: int):
         results = self.get_batch(layer, [expert_id])
         return results[0] if results else None
 
     def get_batch(self, layer: int, expert_ids: list[int]) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """Return cached experts, grouped by projection, with CUDA dequantization."""
         layer = int(layer)
         ids = [int(x) for x in expert_ids]
         with self.lock:
@@ -253,7 +273,10 @@ class RoutedExpertCache:
             victim_id, victim = bank.popitem(last=False)
             self._erase(layer, victim_id, "fp8")
             if self.q4_slots > 0:
-                cold = _q4_quantize_entry_from_fp8(victim)
+                # Quantize while the victim is still on CUDA, then place only
+                # the compressed Q4 representation in host RAM.
+                cold_gpu = _q4_quantize_entry_from_fp8(victim)
+                cold = _move_q4_to_cpu(cold_gpu)
                 q4 = self.q4_entries.setdefault(layer, OrderedDict())
                 old_q4 = q4.pop(victim_id, None)
                 if old_q4 is not None:
@@ -265,7 +288,7 @@ class RoutedExpertCache:
                     dropped_id, _ = q4.popitem(last=False)
                     self._erase(layer, dropped_id, "q4")
                     self.q4_drops += 1
-                    self.evictions += 1
+                    self.q4_ram_evictions += 1
             else:
                 self.evictions += 1
 
@@ -279,25 +302,10 @@ class RoutedExpertCache:
             self.fp16_to_fp8 += 1
 
     def get_or_load(self, store, layer: int, expert_id: int, layer_prefix: str):
-        hit = self.get(layer, expert_id)
-        if hit is not None:
-            return hit
-        expert_prefix = f"{layer_prefix}mlp.experts.{int(expert_id)}"
-        raw_weights, raw_scales = [], []
-        for name in ("gate_proj", "up_proj", "down_proj"):
-            w, s = self._raw_projection_for_gpu(store, expert_prefix + "." + name)
-            raw_weights.append(w); raw_scales.append(s)
-        if all(w.dtype == torch.float8_e4m3fn for w in raw_weights):
-            entry_fp8: WarmEntry = ((raw_weights[0], raw_scales[0]), (raw_weights[1], raw_scales[1]), (raw_weights[2], raw_scales[2]))
-            with self.lock:
-                self._insert_fp8_locked(int(layer), int(expert_id), entry_fp8); self.loads += 1
-            return tuple(_fp8_dequantize_matrix(m) for m in entry_fp8)
-        entry_fp16: FP16Entry = tuple(w.to(device="cuda", dtype=torch.float16) for w in raw_weights)  # type: ignore[assignment]
-        self.put_fp16(layer, expert_id, entry_fp16)
-        return entry_fp16
+        return self.get_or_load_batch(store, layer, [expert_id], layer_prefix)[0]
 
     def get_or_load_batch(self, store, layer: int, expert_ids: list[int], layer_prefix: str) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """Load routed misses into GPU-compressed storage, then decode the whole route as a batch."""
+        """Load misses to GPU-compressed storage, then dequantize the full route in a batch."""
         layer = int(layer)
         ids = [int(x) for x in expert_ids]
         misses: list[int] = []
@@ -308,25 +316,39 @@ class RoutedExpertCache:
                 if expert_id not in fp8 and expert_id not in q4:
                     misses.append(expert_id)
 
+        loaded: dict[int, WarmEntry | None] = {}
         for expert_id in misses:
             expert_prefix = f"{layer_prefix}mlp.experts.{expert_id}"
             raw_weights, raw_scales = [], []
             for name in ("gate_proj", "up_proj", "down_proj"):
                 w, s = self._raw_projection_for_gpu(store, expert_prefix + "." + name)
-                raw_weights.append(w); raw_scales.append(s)
+                raw_weights.append(w)
+                raw_scales.append(s)
             raw_is_fp8 = all(w.dtype == torch.float8_e4m3fn for w in raw_weights)
             if raw_is_fp8:
-                compact: WarmEntry = ((raw_weights[0], raw_scales[0]), (raw_weights[1], raw_scales[1]), (raw_weights[2], raw_scales[2]))
+                compact: WarmEntry = (
+                    (raw_weights[0], raw_scales[0]),
+                    (raw_weights[1], raw_scales[1]),
+                    (raw_weights[2], raw_scales[2]),
+                )
             else:
                 fp16 = tuple(w.to(device="cuda", dtype=torch.float16) for w in raw_weights)
                 compact = _fp8_quantize_entry(fp16)  # type: ignore[arg-type]
-            with self.lock:
-                self._insert_fp8_locked(layer, expert_id, compact)
-                self.loads += 1
-                if not raw_is_fp8:
-                    self.fp16_to_fp8 += 1
+                self.fp16_to_fp8 += 1
+            loaded[expert_id] = compact
 
-        return self.get_batch(layer, ids)
+        with self.lock:
+            for expert_id, compact in loaded.items():
+                if compact is not None:
+                    self._insert_fp8_locked(layer, expert_id, compact)
+                    self.loads += 1
+
+            found = self._lookup_batch_locked(layer, ids)
+
+        decoded = self._decode_found_batch(found)
+        if len(decoded) != len(ids):
+            raise RuntimeError(f"Expert batch integrity error: requested {len(ids)}, decoded {len(decoded)}")
+        return decoded
 
     def snapshot(self) -> dict[str, int | float]:
         with self.lock:
@@ -358,6 +380,8 @@ class RoutedExpertCache:
                 "fp16_to_fp8": self.fp16_to_fp8,
                 "fp8_to_q4": self.fp8_to_q4,
                 "q4_drops": self.q4_drops,
+                "q4_ram_evictions": self.q4_ram_evictions,
+                "q4_ram_bytes": self.q4_bytes_used,
                 "stream_prefetch_hits": self.stream_prefetch_hits,
                 "stream_prefetch_misses": self.stream_prefetch_misses,
                 "shared_items": q4_items,
@@ -369,5 +393,9 @@ class RoutedExpertCache:
     def clear(self) -> None:
         with self.lock:
             for layer in range(self.layers):
-                self.fp8_entries[layer].clear(); self.q4_entries[layer].clear()
-            self.entry_bytes.clear(); self.bytes_used = 0
+                self.fp8_entries[layer].clear()
+                self.q4_entries[layer].clear()
+            self.entry_bytes.clear()
+            self.q4_ram_bytes.clear()
+            self.bytes_used = 0
+            self.q4_bytes_used = 0
