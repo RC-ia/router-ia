@@ -2,7 +2,10 @@ from __future__ import annotations
 
 """Qwen3.6 chat runner with persistent compressed expert GPU cache."""
 
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Lock
 
 import torch
 import torch.nn.functional as F
@@ -17,6 +20,85 @@ _EXPERT_CACHES: dict[Path, RoutedExpertCache] = {}
 _ORIGINAL_EXPERT_TRIPLET = chat._expert_projection_triplet
 _ORIGINAL_CACHE_STATS = chat.cache_stats
 _ORIGINAL_PRINT_CACHE = chat.print_cache
+_ORIGINAL_BATCHED_MOE_STEP = chat.batched_moe_step
+_ORIGINAL_RUN_GENERATED_TOKEN = chat.run_generated_token
+
+
+class RoutingPredictor:
+    """Learn recurring expert routes and speculatively prefetch the next token."""
+
+    def __init__(self, top_n: int = 4, min_observations: int = 1) -> None:
+        self.top_n = max(int(top_n), 1)
+        self.min_observations = max(int(min_observations), 1)
+        self._unigram: dict[tuple[int, int], Counter[int]] = defaultdict(Counter)
+        self._bigram: dict[tuple[int, int, int], Counter[int]] = defaultdict(Counter)
+        self._observations: dict[tuple[int, int], int] = defaultdict(int)
+        self._pending: dict[tuple[int, int, int], set[int]] = {}
+        self._predictions = 0
+        self._predicted_experts = 0
+        self._matched_experts = 0
+        self._lock = Lock()
+
+    def observe(self, previous_token: int | None, token_id: int, layer: int, expert_ids: list[int]) -> None:
+        token_id = int(token_id)
+        layer = int(layer)
+        ids = [int(x) for x in expert_ids]
+        with self._lock:
+            key = (token_id, layer)
+            self._unigram[key].update(ids)
+            self._observations[key] += 1
+            if previous_token is not None:
+                sequence_key = (int(previous_token), token_id, layer)
+                self._bigram[sequence_key].update(ids)
+                pending = self._pending.pop(sequence_key, None)
+                if pending:
+                    self._matched_experts += len(pending.intersection(ids))
+
+    def predict(self, previous_token: int | None, token_id: int, layer: int) -> list[int]:
+        token_id = int(token_id)
+        layer = int(layer)
+        with self._lock:
+            candidates: Counter[int] | None = None
+            if previous_token is not None:
+                bigram = self._bigram.get((int(previous_token), token_id, layer))
+                if bigram and sum(bigram.values()) >= self.min_observations:
+                    candidates = bigram
+            if candidates is None:
+                unigram = self._unigram.get((token_id, layer))
+                if unigram and self._observations.get((token_id, layer), 0) >= self.min_observations:
+                    candidates = unigram
+            if not candidates:
+                return []
+            return [expert for expert, _ in candidates.most_common(self.top_n)]
+
+    def predict_route(self, previous_token: int | None, token_id: int, layer: int) -> list[int]:
+        predicted = self.predict(previous_token, token_id, layer)
+        if not predicted:
+            return []
+        with self._lock:
+            self._predictions += 1
+            self._predicted_experts += len(predicted)
+            if previous_token is not None:
+                self._pending[(int(previous_token), int(token_id), int(layer))] = set(predicted)
+        return predicted
+
+    def snapshot(self) -> dict[str, int | float]:
+        with self._lock:
+            precision = self._matched_experts / self._predicted_experts * 100.0 if self._predicted_experts else 0.0
+            return {
+                "predictions": self._predictions,
+                "predicted_experts": self._predicted_experts,
+                "matched_experts": self._matched_experts,
+                "expert_precision": precision,
+                "top_n": self.top_n,
+                "min_observations": self.min_observations,
+                "contexts": len(self._unigram),
+                "bigram_contexts": len(self._bigram),
+            }
+
+
+_ROUTING_PREDICTOR = RoutingPredictor(top_n=4, min_observations=1)
+_LAST_INPUT_TOKEN: int | None = None
 
 
 def _expert_cache(root: Path) -> RoutedExpertCache:
@@ -28,12 +110,7 @@ def _expert_cache(root: Path) -> RoutedExpertCache:
     return cache
 
 
-def _cached_expert_projection_triplet(
-    root: Path,
-    layer_prefix: str,
-    expert_id: int,
-    device: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _cached_expert_projection_triplet(root: Path, layer_prefix: str, expert_id: int, device: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if device != "cuda":
         return _ORIGINAL_EXPERT_TRIPLET(root, layer_prefix, expert_id, device)
     layer_marker = ".layers."
@@ -46,35 +123,16 @@ def _cached_expert_projection_triplet(
     return _expert_cache(root).get_or_load(cached._store(root), layer, expert_id, layer_prefix)
 
 
-def _load_route_batch_preserving_duplicates(
-    root: Path,
-    layer: int,
-    layer_prefix: str,
-    expert_ids: list[int],
-):
-    """Load each unique routed expert once, then restore original top-k order.
-
-    Routing can contain repeated expert IDs. The cache is keyed by (layer, expert),
-    so duplicate IDs must not be allowed to shrink the compute batch.
-    """
+def _load_route_batch_preserving_duplicates(root: Path, layer: int, layer_prefix: str, expert_ids: list[int]):
+    """Load each unique routed expert once, then restore original top-k order."""
     expert_cache = _expert_cache(root)
     store = cached._store(root)
-
     unique_ids = list(dict.fromkeys(int(x) for x in expert_ids))
-    loaded = {
-        expert_id: expert_cache.get_or_load(store, layer, expert_id, layer_prefix)
-        for expert_id in unique_ids
-    }
+    loaded = {expert_id: expert_cache.get_or_load(store, layer, expert_id, layer_prefix) for expert_id in unique_ids}
     return [loaded[int(expert_id)] for expert_id in expert_ids]
 
 
-def _batched_moe_step_gpu(
-    root: Path,
-    layer: int,
-    residual: torch.Tensor,
-    top_k: int,
-    device: str,
-):
+def _batched_moe_step_gpu(root: Path, layer: int, residual: torch.Tensor, top_k: int, device: str):
     """MoE step whose routed expert weights are prepared on CUDA."""
     if device != "cuda":
         return _ORIGINAL_BATCHED_MOE_STEP(root, layer, residual, top_k, device)
@@ -89,9 +147,10 @@ def _batched_moe_step_gpu(
 
     triplets = _load_route_batch_preserving_duplicates(root, layer, prefix, expert_ids)
     if len(triplets) != len(expert_ids):
-        raise RuntimeError(
-            f"Expert route batch mismatch: requested {len(expert_ids)}, loaded {len(triplets)}"
-        )
+        raise RuntimeError(f"Expert route batch mismatch: requested {len(expert_ids)}, loaded {len(triplets)}")
+
+    if _CURRENT_TOKEN_ID is not None:
+        _ROUTING_PREDICTOR.observe(_LAST_INPUT_TOKEN, _CURRENT_TOKEN_ID, layer, expert_ids)
 
     gate_w = torch.stack([triplet[0] for triplet in triplets], dim=0)
     up_w = torch.stack([triplet[1] for triplet in triplets], dim=0)
@@ -121,12 +180,48 @@ def _batched_moe_step_gpu(
     shared_gate_value = float(shared_gate.float().item())
     moe_input_norm = float(torch.linalg.vector_norm(moe_in).item())
 
-    del post_norm, moe_in, router_w, routed
-    del triplets, gate_w, up_w, down_w, batch_x
+    del post_norm, moe_in, router_w, routed, triplets, gate_w, up_w, down_w, batch_x
     del gate, up, hidden, expert_out, routing, routed_sum
     del shared_gate_w, shared_gate, shared_gate_proj, shared_up_proj, shared_down_proj
     del shared_hidden, shared_out, moe_out
     return layer_out, expert_ids, weights, shared_gate_value, moe_input_norm
+
+
+def _prefetch_predicted_routes(root: Path, previous_token: int | None, token_id: int) -> tuple[int, int]:
+    if not torch.cuda.is_available():
+        return 0, 0
+    store = cached._store(root)
+    expert_cache = _expert_cache(root)
+    jobs: list[tuple[str, int]] = []
+    for layer in range(base.DEFAULT_LAYERS):
+        predicted = _ROUTING_PREDICTOR.predict_route(previous_token, token_id, layer)
+        if not predicted:
+            continue
+        prefix = base.layer_prefix(layer)
+        for expert_id in predicted:
+            jobs.append((prefix, int(expert_id)))
+    if not jobs:
+        return 0, 0
+
+    with ThreadPoolExecutor(max_workers=min(8, len(jobs))) as pool:
+        futures = [pool.submit(expert_cache.prefetch_expert_raw, store, prefix, expert_id) for prefix, expert_id in jobs]
+        for future in futures:
+            future.result()
+    return len(jobs), sum(1 for _ in jobs)
+
+
+def _run_generated_token_with_predictor(root: Path, token_id: int, final_norm: torch.Tensor, lm_head: torch.Tensor, final_norm_name: str, lm_head_name: str, device: str, sampling_top_k: int, temperature: float):
+    global _LAST_INPUT_TOKEN, _CURRENT_TOKEN_ID
+    previous_token = _LAST_INPUT_TOKEN
+    _CURRENT_TOKEN_ID = int(token_id)
+    result = _ORIGINAL_RUN_GENERATED_TOKEN(root, token_id, final_norm, lm_head, final_norm_name, lm_head_name, device, sampling_top_k, temperature)
+    if device == "cuda":
+        _prefetch_predicted_routes(root, int(token_id), int(result[0]))
+    _LAST_INPUT_TOKEN = int(token_id)
+    _CURRENT_TOKEN_ID = None
+    return result
+
+_CURRENT_TOKEN_ID: int | None = None
 
 
 def _cache_stats_with_experts(root: Path) -> dict[str, int | float]:
@@ -135,6 +230,7 @@ def _cache_stats_with_experts(root: Path) -> dict[str, int | float]:
     if cache is None:
         return stats
     expert = cache.snapshot()
+    predictor = _ROUTING_PREDICTOR.snapshot()
     stats.update({
         "expert_cache_items": int(expert["items"]),
         "expert_cache_bytes": int(expert["bytes"]),
@@ -156,6 +252,12 @@ def _cache_stats_with_experts(root: Path) -> dict[str, int | float]:
         "expert_cache_q4_ram_evictions": int(expert["q4_ram_evictions"]),
         "expert_cache_stream_prefetch_hits": int(expert["stream_prefetch_hits"]),
         "expert_cache_stream_prefetch_misses": int(expert["stream_prefetch_misses"]),
+        "routing_predictor_predictions": int(predictor["predictions"]),
+        "routing_predictor_predicted_experts": int(predictor["predicted_experts"]),
+        "routing_predictor_matched_experts": int(predictor["matched_experts"]),
+        "routing_predictor_precision": float(predictor["expert_precision"]),
+        "routing_predictor_contexts": int(predictor["contexts"]),
+        "routing_predictor_bigram_contexts": int(predictor["bigram_contexts"]),
     })
     return stats
 
@@ -166,26 +268,30 @@ def _print_cache_with_experts(root: Path, label: str) -> None:
     if cache is None:
         return
     expert = cache.snapshot()
+    predictor = _ROUTING_PREDICTOR.snapshot()
     print(
         f"  expert_cache: fp8_vram_entries={expert['warm_items']} | "
         f"fp8_vram={expert['bytes'] / 1024**2:.1f}/{expert['budget_bytes'] / 1024**2:.1f} MiB | "
         f"q4_ram_entries={expert['cold_items']} | "
         f"q4_ram={expert['q4_ram_bytes'] / 1024**2:.1f} MiB | "
-        f"hit_rate={expert['hit_rate']:.2f}% | hits={expert['hits']} | "
-        f"misses={expert['misses']} | loads={expert['loads']}"
+        f"hit_rate={expert['hit_rate']:.2f}% | hits={expert['hits']} | misses={expert['misses']} | loads={expert['loads']}"
     )
     print(
         f"    tiers: FP8=VRAM:{expert['warm_items']} | Q4=RAM:{expert['cold_items']} | "
         f"hits FP8={expert['fp8_hits']} Q4={expert['q4_hits']} | "
-        f"GPU compressions FP8>Q4={expert['fp8_to_q4']} | "
-        f"Q4 RAM evictions={expert['q4_ram_evictions']} | "
-        f"prefetch hits={expert['stream_prefetch_hits']} misses={expert['stream_prefetch_misses']}"
+        f"GPU compressions FP8>Q4={expert['fp8_to_q4']} | Q4 RAM evictions={expert['q4_ram_evictions']}"
+    )
+    print(
+        f"  routing_predictor: predictions={predictor['predictions']} | "
+        f"predicted={predictor['predicted_experts']} | matched={predictor['matched_experts']} | "
+        f"precision={predictor['expert_precision']:.2f}% | contexts={predictor['contexts']} | "
+        f"bigrams={predictor['bigram_contexts']}"
     )
 
 
 chat._expert_projection_triplet = _cached_expert_projection_triplet
-_ORIGINAL_BATCHED_MOE_STEP = chat.batched_moe_step
 chat.batched_moe_step = _batched_moe_step_gpu
+chat.run_generated_token = _run_generated_token_with_predictor
 chat.cache_stats = _cache_stats_with_experts
 chat.print_cache = _print_cache_with_experts
 
@@ -203,6 +309,11 @@ def main() -> None:
     print("expert_cache_prefetch=parallel-raw-fp8-stream")
     print("expert_cache_compute=temporary-fp16")
     print("expert_cache_compute_batch=8-experts-preserve-duplicates")
+    print("expert_cache_kernel_fused_dequant=not-yet")
+    print("routing_predictor=enabled")
+    print("routing_predictor_policy=bigram-with-unigram-fallback")
+    print("routing_predictor_top_n=4")
+    print("routing_predictor_prefetch=next-token-all-layers")
     print(f"expert_cache_total_slots={cache.total_slots}")
     print(f"expert_cache_slots_per_layer={cache.slots_per_layer}")
     print(f"expert_cache_fp8_slots_per_layer={cache.fp8_slots}")
