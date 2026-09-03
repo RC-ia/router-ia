@@ -135,9 +135,9 @@ def _load_route_batch_preserving_duplicates(root: Path, layer: int, layer_prefix
 def _route_projection_batched(weight: torch.Tensor, x: torch.Tensor, batch_size: int) -> torch.Tensor:
     """Run routed expert projections on CUDA with the cheapest valid GEMM form.
 
-    For a single shared input vector, flattening the expert dimension turns the
-    N matvecs into one larger GEMM. For the down projection, every expert has a
-    different hidden vector, so the operation must remain a batched GEMM.
+    A shared input vector can be handled as one flattened GEMM across all
+    experts. The down projection receives one hidden vector per expert and
+    therefore uses a batched GEMM.
     """
     if weight.ndim != 3:
         raise ValueError(f"Expected [N,O,I] weight, got {tuple(weight.shape)}")
@@ -162,6 +162,21 @@ def _route_projection_batched(weight: torch.Tensor, x: torch.Tensor, batch_size:
     raise ValueError(f"Expected [I] or [N,I] input, got {tuple(x.shape)}")
 
 
+def _route_gate_up_single_gemm(gate_w: torch.Tensor, up_w: torch.Tensor, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute all routed gate/up projections with one flattened CUDA GEMM."""
+    if gate_w.shape != up_w.shape or gate_w.ndim != 3:
+        raise ValueError(
+            f"Gate/up shape mismatch: {tuple(gate_w.shape)} vs {tuple(up_w.shape)}"
+        )
+    if x.ndim != 1 or int(x.shape[0]) != int(gate_w.shape[-1]):
+        raise ValueError(f"Expected [I] input matching gate/up weights, got {tuple(x.shape)}")
+
+    experts, out_features, in_features = map(int, gate_w.shape)
+    combined = torch.cat((gate_w, up_w), dim=1).reshape(experts * 2 * out_features, in_features)
+    result = torch.mm(combined, x.reshape(in_features, 1)).reshape(experts, 2 * out_features)
+    return result[:, :out_features], result[:, out_features:]
+
+
 def _batched_moe_step_gpu(root: Path, layer: int, residual: torch.Tensor, top_k: int, device: str):
     """MoE step whose routed expert weights are prepared on CUDA."""
     if device != "cuda":
@@ -173,7 +188,7 @@ def _batched_moe_step_gpu(root: Path, layer: int, residual: torch.Tensor, top_k:
     router_w = base.load_layer_weight(root, layer, "mlp.gate.weight", device).float()
     routed = base.route(moe_in.reshape(-1), router_w, top_k=top_k)
     expert_ids = [int(v) for v in routed.expert_ids.detach().cpu().tolist()]
-    weights = [float(v) for v in routed.weights.detach().cpu().tolist()]
+    route_weights = routed.weights
 
     triplets = _load_route_batch_preserving_duplicates(root, layer, prefix, expert_ids)
     if len(triplets) != len(expert_ids):
@@ -188,11 +203,10 @@ def _batched_moe_step_gpu(root: Path, layer: int, residual: torch.Tensor, top_k:
     batch_x = moe_in.reshape(-1).to(dtype=torch.float16)
 
     with torch.autocast(device_type="cuda", dtype=torch.float16):
-        gate = _route_projection_batched(gate_w, batch_x, len(expert_ids))
-        up = _route_projection_batched(up_w, batch_x, len(expert_ids))
+        gate, up = _route_gate_up_single_gemm(gate_w, up_w, batch_x)
         hidden = F.silu(gate) * up
         expert_out = _route_projection_batched(down_w, hidden, len(expert_ids))
-        routing = torch.tensor(weights, device=device, dtype=expert_out.dtype).reshape(-1, 1)
+        routing = route_weights.to(dtype=expert_out.dtype).reshape(-1, 1)
         routed_sum = (expert_out * routing).sum(dim=0, keepdim=True)
 
     shared_gate_w = base.load_layer_weight(root, layer, "mlp.shared_expert_gate.weight", device).float()
@@ -209,9 +223,10 @@ def _batched_moe_step_gpu(root: Path, layer: int, residual: torch.Tensor, top_k:
     layer_out = residual + moe_out
     shared_gate_value = float(shared_gate.float().item())
     moe_input_norm = float(torch.linalg.vector_norm(moe_in).item())
+    weights = route_weights.detach().cpu().tolist()
 
     del post_norm, moe_in, router_w, routed, triplets, gate_w, up_w, down_w, batch_x
-    del gate, up, hidden, expert_out, routing, routed_sum
+    del gate, up, hidden, expert_out, route_weights, routing, routed_sum
     del shared_gate_w, shared_gate, shared_gate_proj, shared_up_proj, shared_down_proj
     del shared_hidden, shared_out, moe_out
     return layer_out, expert_ids, weights, shared_gate_value, moe_input_norm
@@ -338,7 +353,7 @@ def main() -> None:
     print("expert_cache_fp8_promotion=disabled")
     print("expert_cache_prefetch=parallel-raw-fp8-stream")
     print("expert_cache_compute=temporary-fp16")
-    print("expert_cache_compute_batch=single-gemm-per-projection-with-batched-down")
+    print("expert_cache_compute_batch=single-gemm-gate-up-plus-batched-down")
     print("expert_cache_kernel_fused_dequant=not-yet")
     print("routing_predictor=enabled")
     print("routing_predictor_policy=bigram-with-unigram-fallback")
