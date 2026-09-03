@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-"""Persistent three-tier GPU cache for complete Qwen3.6 routed experts.
+"""Persistent compressed GPU cache for Qwen3.6 routed experts.
 
-Hot experts stay in FP16. Less-used experts are compressed to block-scaled
-FP8, then to packed symmetric Q4 before finally being dropped. The three tiers
-are per-layer LRU banks so a sequential 40-layer decode does not cause
-cross-layer cache thrashing.
+The VRAM expert cache keeps raw FP8 experts as the main resident tier and a
+smaller Q4 tier as a colder backup. FP16 is never kept persistently: when an
+expert is requested, its compressed matrices are reconstructed to temporary
+FP16 tensors for the existing GEMM path.
 """
 
 from collections import OrderedDict
@@ -24,16 +24,22 @@ BLOCK = 128
 FP8_MAX = 448.0
 FP16_EXPERT_BYTES_ESTIMATE = 3 * EXPERT_HIDDEN * HIDDEN * 2
 
-HOT_SLOTS_PER_LAYER = 2
-FP8_SLOTS_PER_LAYER = 4
+# With ~1.2 GiB available for experts, this is approximately 8 FP8 + 4 Q4
+# experts per layer: 8*3 MiB + 4*1.5 MiB ~= 30 MiB/layer.
+FP8_SLOTS_PER_LAYER = 8
 Q4_SLOTS_PER_LAYER = 4
-TOTAL_SLOTS_PER_LAYER = HOT_SLOTS_PER_LAYER + FP8_SLOTS_PER_LAYER + Q4_SLOTS_PER_LAYER
+TOTAL_SLOTS_PER_LAYER = FP8_SLOTS_PER_LAYER + Q4_SLOTS_PER_LAYER
 
 FP8Matrix = tuple[torch.Tensor, torch.Tensor]
-HotEntry = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 WarmEntry = tuple[FP8Matrix, FP8Matrix, FP8Matrix]
 Q4Matrix = tuple[torch.Tensor, torch.Tensor, tuple[int, int]]
 ColdEntry = tuple[Q4Matrix, Q4Matrix, Q4Matrix]
+FP16Entry = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
+
+def _fp8_dequantize_matrix(matrix: FP8Matrix) -> torch.Tensor:
+    weight, scales = matrix
+    return dequant.dequantize_fp8_blockwise(weight, scales).to(dtype=torch.float16)
 
 
 def _fp8_quantize_blockwise(weight: torch.Tensor) -> FP8Matrix:
@@ -53,12 +59,7 @@ def _fp8_quantize_blockwise(weight: torch.Tensor) -> FP8Matrix:
     return quantized, scales
 
 
-def _fp8_dequantize_matrix(matrix: FP8Matrix) -> torch.Tensor:
-    weight, scales = matrix
-    return dequant.dequantize_fp8_blockwise(weight, scales).to(dtype=torch.float16)
-
-
-def _fp8_quantize_entry(entry: HotEntry) -> WarmEntry:
+def _fp8_quantize_entry(entry: FP16Entry) -> WarmEntry:
     return tuple(_fp8_quantize_blockwise(t) for t in entry)  # type: ignore[return-value]
 
 
@@ -85,15 +86,17 @@ def _q4_dequantize_matrix(matrix: Q4Matrix) -> torch.Tensor:
 
 
 def _q4_quantize_entry_from_fp8(entry: WarmEntry) -> ColdEntry:
-    return tuple(_q4_quantize_matrix(_fp8_dequantize_matrix(matrix)) for matrix in entry)  # type: ignore[return-value]
+    # Q4 is only reached on an actual cold transition, so this path is not on
+    # the normal warm hit path.
+    return tuple(_q4_quantize_matrix(_fp8_dequantize_matrix(m)) for m in entry)  # type: ignore[return-value]
 
 
-def _q4_quantize_entry(entry: HotEntry) -> ColdEntry:
+def _q4_quantize_entry(entry: FP16Entry) -> ColdEntry:
     return tuple(_q4_quantize_matrix(t) for t in entry)  # type: ignore[return-value]
 
 
 class RoutedExpertCache:
-    """Per-layer LRU cache: 2 FP16 hot, 4 FP8 warm, 4 Q4 cold."""
+    """Per-layer compressed expert cache: 8 FP8 + 4 Q4 slots."""
 
     def __init__(self, budget_bytes: int, layers: int = MODEL_LAYERS) -> None:
         self.budget_bytes = max(int(budget_bytes), 0)
@@ -102,15 +105,16 @@ class RoutedExpertCache:
         self.total_slots = self.slots_per_layer * self.layers
 
         remaining = self.slots_per_layer
-        self.hot_slots = min(HOT_SLOTS_PER_LAYER, remaining)
-        remaining -= self.hot_slots
         self.fp8_slots = min(FP8_SLOTS_PER_LAYER, remaining)
         remaining -= self.fp8_slots
         self.q4_slots = min(Q4_SLOTS_PER_LAYER, remaining)
 
-        self.entries: dict[int, OrderedDict[int, HotEntry]] = {layer: OrderedDict() for layer in range(self.layers)}
-        self.fp8_entries: dict[int, OrderedDict[int, WarmEntry]] = {layer: OrderedDict() for layer in range(self.layers)}
-        self.q4_entries: dict[int, OrderedDict[int, ColdEntry]] = {layer: OrderedDict() for layer in range(self.layers)}
+        self.fp8_entries: dict[int, OrderedDict[int, WarmEntry]] = {
+            layer: OrderedDict() for layer in range(self.layers)
+        }
+        self.q4_entries: dict[int, OrderedDict[int, ColdEntry]] = {
+            layer: OrderedDict() for layer in range(self.layers)
+        }
         self.entry_bytes: dict[tuple[int, int, str], int] = {}
         self.bytes_used = 0
 
@@ -118,7 +122,6 @@ class RoutedExpertCache:
         self.misses = 0
         self.loads = 0
         self.evictions = 0
-        self.hot_hits = 0
         self.fp8_hits = 0
         self.q4_hits = 0
         self.fp16_to_fp8 = 0
@@ -131,44 +134,31 @@ class RoutedExpertCache:
     def _budget_slots(self) -> int:
         if not self.budget_bytes:
             return 0
-        # Target footprint per layer is approximately:
-        # 2*6 MiB + 4*3 MiB + 4*1.5 MiB = 24 MiB.
         target_per_layer = (
-            HOT_SLOTS_PER_LAYER * FP16_EXPERT_BYTES_ESTIMATE
-            + FP8_SLOTS_PER_LAYER * (FP16_EXPERT_BYTES_ESTIMATE // 2)
+            FP8_SLOTS_PER_LAYER * (FP16_EXPERT_BYTES_ESTIMATE // 2)
             + Q4_SLOTS_PER_LAYER * (FP16_EXPERT_BYTES_ESTIMATE // 4)
         )
-        supported_layers = self.budget_bytes // max(target_per_layer, 1)
-        if supported_layers >= self.layers:
-            return TOTAL_SLOTS_PER_LAYER
-        fp16_capacity = self.budget_bytes // FP16_EXPERT_BYTES_ESTIMATE // max(self.layers, 1)
-        return min(HOT_SLOTS_PER_LAYER, fp16_capacity)
-
-    @staticmethod
-    def _hot_size(entry: HotEntry) -> int:
-        return sum(int(t.numel()) * int(t.element_size()) for t in entry)
+        return TOTAL_SLOTS_PER_LAYER if self.budget_bytes // max(target_per_layer, 1) >= self.layers else 0
 
     @staticmethod
     def _fp8_size(entry: WarmEntry) -> int:
         return sum(
-            int(weight.numel()) * int(weight.element_size())
-            + int(scales.numel()) * int(scales.element_size())
-            for weight, scales in entry
+            int(w.numel()) * int(w.element_size()) + int(s.numel()) * int(s.element_size())
+            for w, s in entry
         )
 
     @staticmethod
     def _q4_size(entry: ColdEntry) -> int:
         return sum(
-            int(packed.numel()) * int(packed.element_size())
-            + int(scale.numel()) * int(scale.element_size())
-            for packed, scale, _shape in entry
+            int(p.numel()) * int(p.element_size()) + int(s.numel()) * int(s.element_size())
+            for p, s, _ in entry
         )
 
     def _record(self, layer: int, expert_id: int, tier: str, size: int) -> None:
         self.entry_bytes[(layer, expert_id, tier)] = size
         self.bytes_used += size
 
-    def _erase_bytes(self, layer: int, expert_id: int, tier: str) -> None:
+    def _erase(self, layer: int, expert_id: int, tier: str) -> None:
         self.bytes_used -= self.entry_bytes.pop((layer, expert_id, tier), 0)
 
     @staticmethod
@@ -177,13 +167,13 @@ class RoutedExpertCache:
 
     def _raw_projection_for_gpu(self, store, proj: str):
         if hasattr(store, "vram_cache"):
-            weight_key = self._stream_key(proj, "weight")
-            scale_key = self._stream_key(proj, "scale")
-            streamed_weight = store.vram_cache.get_stream(weight_key)
-            streamed_scale = store.vram_cache.get_stream(scale_key)
-            if streamed_weight is not None and streamed_scale is not None:
+            wk = self._stream_key(proj, "weight")
+            sk = self._stream_key(proj, "scale")
+            w = store.vram_cache.get_stream(wk)
+            s = store.vram_cache.get_stream(sk)
+            if w is not None and s is not None:
                 self.stream_prefetch_hits += 1
-                return streamed_weight, streamed_scale
+                return w, s
             self.stream_prefetch_misses += 1
 
         weight = store.load(proj + ".weight", device="cpu")
@@ -196,142 +186,108 @@ class RoutedExpertCache:
             return gpu_weight, gpu_scale
         return weight, scale
 
+    def prefetch_expert_raw(self, store, layer_prefix: str, expert_id: int) -> None:
+        """Move one complete expert's raw FP8 tensors into the rotating stream."""
+        prefix = f"{layer_prefix}mlp.experts.{int(expert_id)}"
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            self._raw_projection_for_gpu(store, prefix + "." + name)
+
     def get(self, layer: int, expert_id: int):
         layer = int(layer)
         expert_id = int(expert_id)
         with self.lock:
-            hot = self.entries.setdefault(layer, OrderedDict())
-            entry = hot.get(expert_id)
+            fp8 = self.fp8_entries.setdefault(layer, OrderedDict())
+            entry = fp8.get(expert_id)
             if entry is not None:
                 self.hits += 1
-                self.hot_hits += 1
-                hot.move_to_end(expert_id)
-                return entry
-
-            fp8_bank = self.fp8_entries.setdefault(layer, OrderedDict())
-            compact = fp8_bank.get(expert_id)
-            if compact is not None:
-                self.hits += 1
                 self.fp8_hits += 1
-                fp8_bank.move_to_end(expert_id)
-                return tuple(_fp8_dequantize_matrix(m) for m in compact)
+                fp8.move_to_end(expert_id)
+                return tuple(_fp8_dequantize_matrix(m) for m in entry)
 
-            q4_bank = self.q4_entries.setdefault(layer, OrderedDict())
-            packed = q4_bank.get(expert_id)
-            if packed is not None:
+            q4 = self.q4_entries.setdefault(layer, OrderedDict())
+            entry_q4 = q4.get(expert_id)
+            if entry_q4 is not None:
                 self.hits += 1
                 self.q4_hits += 1
-                q4_bank.move_to_end(expert_id)
-                return tuple(_q4_dequantize_matrix(m) for m in packed)
+                q4.move_to_end(expert_id)
+                return tuple(_q4_dequantize_matrix(m) for m in entry_q4)
 
             self.misses += 1
             return None
 
-    def _insert_hot_locked(self, layer: int, expert_id: int, entry: HotEntry) -> None:
-        hot = self.entries.setdefault(layer, OrderedDict())
-        old = hot.pop(expert_id, None)
-        if old is not None:
-            self._erase_bytes(layer, expert_id, "fp16")
+    def _insert_fp8_locked(self, layer: int, expert_id: int, entry: WarmEntry) -> None:
+        bank = self.fp8_entries.setdefault(layer, OrderedDict())
+        if expert_id in bank:
+            self._erase(layer, expert_id, "fp8")
+            bank.pop(expert_id, None)
+        bank[expert_id] = entry
+        self._record(layer, expert_id, "fp8", self._fp8_size(entry))
+        bank.move_to_end(expert_id)
 
-        while hot and len(hot) >= self.hot_slots:
-            victim_id, victim = hot.popitem(last=False)
-            self._erase_bytes(layer, victim_id, "fp16")
-
-            if self.fp8_slots > 0:
-                compact = _fp8_quantize_entry(victim)
-                fp8_bank = self.fp8_entries[layer]
-                previous = fp8_bank.pop(victim_id, None)
-                if previous is not None:
-                    self._erase_bytes(layer, victim_id, "fp8")
-                fp8_bank[victim_id] = compact
-                self._record(layer, victim_id, "fp8", self._fp8_size(compact))
-                self.fp16_to_fp8 += 1
-
-                while len(fp8_bank) > self.fp8_slots:
-                    cold_id, cold_fp8 = fp8_bank.popitem(last=False)
-                    self._erase_bytes(layer, cold_id, "fp8")
-                    if self.q4_slots > 0:
-                        cold = _q4_quantize_entry_from_fp8(cold_fp8)
-                        q4_bank = self.q4_entries[layer]
-                        previous_q4 = q4_bank.pop(cold_id, None)
-                        if previous_q4 is not None:
-                            self._erase_bytes(layer, cold_id, "q4")
-                        q4_bank[cold_id] = cold
-                        self._record(layer, cold_id, "q4", self._q4_size(cold))
-                        self.fp8_to_q4 += 1
-                        while len(q4_bank) > self.q4_slots:
-                            dropped_id, _ = q4_bank.popitem(last=False)
-                            self._erase_bytes(layer, dropped_id, "q4")
-                            self.q4_drops += 1
-                            self.evictions += 1
-                    else:
-                        self.fp8_drops += 1
-                        self.evictions += 1
+        while len(bank) > self.fp8_slots:
+            victim_id, victim = bank.popitem(last=False)
+            self._erase(layer, victim_id, "fp8")
+            if self.q4_slots > 0:
+                cold = _q4_quantize_entry_from_fp8(victim)
+                q4 = self.q4_entries.setdefault(layer, OrderedDict())
+                old_q4 = q4.pop(victim_id, None)
+                if old_q4 is not None:
+                    self._erase(layer, victim_id, "q4")
+                q4[victim_id] = cold
+                self._record(layer, victim_id, "q4", self._q4_size(cold))
+                self.fp8_to_q4 += 1
+                while len(q4) > self.q4_slots:
+                    dropped_id, _ = q4.popitem(last=False)
+                    self._erase(layer, dropped_id, "q4")
+                    self.q4_drops += 1
+                    self.evictions += 1
             else:
                 self.evictions += 1
 
-        # A newly hot expert supersedes any compressed copy.
-        if expert_id in self.fp8_entries[layer]:
-            self.fp8_entries[layer].pop(expert_id, None)
-            self._erase_bytes(layer, expert_id, "fp8")
-        if expert_id in self.q4_entries[layer]:
-            self.q4_entries[layer].pop(expert_id, None)
-            self._erase_bytes(layer, expert_id, "q4")
-
-        hot[expert_id] = entry
-        self._record(layer, expert_id, "fp16", self._hot_size(entry))
-
-    def put(self, layer: int, expert_id: int, entry: HotEntry):
+    def put_fp16(self, layer: int, expert_id: int, entry: FP16Entry) -> None:
+        compact = _fp8_quantize_entry(entry)
         with self.lock:
-            if self.hot_slots <= 0:
-                return False
-            self._insert_hot_locked(int(layer), int(expert_id), entry)
+            self._insert_fp8_locked(int(layer), int(expert_id), compact)
             self.loads += 1
-            return True
+            self.fp16_to_fp8 += 1
 
     def get_or_load(self, store, layer: int, expert_id: int, layer_prefix: str):
         hit = self.get(layer, expert_id)
         if hit is not None:
             return hit
 
-        expert_prefix = f"{layer_prefix}mlp.experts.{expert_id}"
-        names = ("gate_proj", "up_proj", "down_proj")
+        expert_prefix = f"{layer_prefix}mlp.experts.{int(expert_id)}"
         raw_weights = []
         raw_scales = []
-        for name in names:
-            raw_weight, raw_scale = self._raw_projection_for_gpu(
-                store, expert_prefix + "." + name
-            )
-            raw_weights.append(raw_weight)
-            raw_scales.append(raw_scale)
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            w, s = self._raw_projection_for_gpu(store, expert_prefix + "." + name)
+            raw_weights.append(w)
+            raw_scales.append(s)
 
-        if all(weight.dtype == torch.float8_e4m3fn for weight in raw_weights):
-            gate_up_weights = torch.stack(raw_weights[:2], dim=0)
-            gate_up_scales = torch.stack(raw_scales[:2], dim=0)
-            gate_up_batch = dequant.dequantize_fp8_blockwise_batch(
-                gate_up_weights, gate_up_scales
-            ).to(dtype=torch.float16)
-            down_output = dequant.dequantize_fp8_blockwise(
-                raw_weights[2], raw_scales[2]
-            ).to(dtype=torch.float16)
-            entry = (gate_up_batch[0], gate_up_batch[1], down_output)
-        else:
-            entry = tuple(
-                weight.to(device="cuda", dtype=torch.float16)
-                for weight in raw_weights
+        if all(w.dtype == torch.float8_e4m3fn for w in raw_weights):
+            entry_fp8: WarmEntry = (
+                (raw_weights[0], raw_scales[0]),
+                (raw_weights[1], raw_scales[1]),
+                (raw_weights[2], raw_scales[2]),
             )
+            with self.lock:
+                self._insert_fp8_locked(int(layer), int(expert_id), entry_fp8)
+                self.loads += 1
+            return tuple(_fp8_dequantize_matrix(m) for m in entry_fp8)
 
-        self.put(layer, expert_id, entry)
-        return entry
+        entry_fp16: FP16Entry = tuple(
+            w.to(device="cuda", dtype=torch.float16) for w in raw_weights
+        )  # type: ignore[assignment]
+        self.put_fp16(layer, expert_id, entry_fp16)
+        return entry_fp16
 
     def snapshot(self) -> dict[str, int | float]:
         with self.lock:
             total = self.hits + self.misses
-            hot_items = sum(len(bank) for bank in self.entries.values())
-            fp8_items = sum(len(bank) for bank in self.fp8_entries.values())
-            q4_items = sum(len(bank) for bank in self.q4_entries.values())
+            fp8_items = sum(len(b) for b in self.fp8_entries.values())
+            q4_items = sum(len(b) for b in self.q4_entries.values())
             return {
-                "items": hot_items + fp8_items + q4_items,
+                "items": fp8_items + q4_items,
                 "bytes": self.bytes_used,
                 "budget_bytes": self.budget_bytes,
                 "hits": self.hits,
@@ -340,19 +296,16 @@ class RoutedExpertCache:
                 "loads": self.loads,
                 "evictions": self.evictions,
                 "layers": self.layers,
-                "layers_populated": sum(
-                    bool(self.entries[layer] or self.fp8_entries[layer] or self.q4_entries[layer])
-                    for layer in range(self.layers)
-                ),
+                "layers_populated": sum(bool(self.fp8_entries[l] or self.q4_entries[l]) for l in range(self.layers)),
                 "slots_per_layer": self.slots_per_layer,
                 "total_slots": self.total_slots,
-                "hot_slots_per_layer": self.hot_slots,
+                "hot_slots_per_layer": 0,
                 "warm_slots_per_layer": self.fp8_slots,
                 "cold_slots_per_layer": self.q4_slots,
-                "hot_items": hot_items,
+                "hot_items": 0,
                 "warm_items": fp8_items,
                 "cold_items": q4_items,
-                "hot_hits": self.hot_hits,
+                "hot_hits": 0,
                 "fp8_hits": self.fp8_hits,
                 "q4_hits": self.q4_hits,
                 "fp16_to_fp8": self.fp16_to_fp8,
@@ -360,16 +313,15 @@ class RoutedExpertCache:
                 "q4_drops": self.q4_drops,
                 "stream_prefetch_hits": self.stream_prefetch_hits,
                 "stream_prefetch_misses": self.stream_prefetch_misses,
-                "shared_items": fp8_items + q4_items,
-                "protected_items": hot_items,
-                "min_slots_per_layer": self.hot_slots,
-                "shared_slots": self.fp8_slots + self.q4_slots,
+                "shared_items": q4_items,
+                "protected_items": 0,
+                "min_slots_per_layer": 0,
+                "shared_slots": self.q4_slots,
             }
 
     def clear(self) -> None:
         with self.lock:
             for layer in range(self.layers):
-                self.entries[layer].clear()
                 self.fp8_entries[layer].clear()
                 self.q4_entries[layer].clear()
             self.entry_bytes.clear()
