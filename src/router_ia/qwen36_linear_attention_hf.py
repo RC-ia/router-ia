@@ -27,6 +27,7 @@ from .qwen36_op_probe import rmsnorm
 
 CONV_KERNEL = 4
 HEAD_DIM = 128
+LINEAR_CONV_DIM = base.LINEAR_KEY_DIM * 2 + base.LINEAR_VALUE_DIM
 
 
 def _raw_weight(root: Path, name: str) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -185,11 +186,11 @@ def linear_attention_step(
     a_w = load_linear_weight(root, prefix + "linear_attn.in_proj_a", device, dtype=compute_dtype)
     out_w = load_linear_weight(root, prefix + "linear_attn.out_proj", device, dtype=compute_dtype)
 
-    mixed = F.linear(h, qkv_w).reshape(1, base.LINEAR_CONV_DIM)
+    mixed = F.linear(h, qkv_w).reshape(1, LINEAR_CONV_DIM)
     conv_w = base.load_layer_weight(root, layer, "linear_attn.conv1d.weight", device).to(dtype=compute_dtype)
-    if conv_state is None or tuple(conv_state.shape) != (1, base.LINEAR_CONV_DIM, CONV_KERNEL):
+    if conv_state is None or tuple(conv_state.shape) != (1, LINEAR_CONV_DIM, CONV_KERNEL):
         conv_state = torch.zeros(
-            (1, base.LINEAR_CONV_DIM, CONV_KERNEL),
+            (1, LINEAR_CONV_DIM, CONV_KERNEL),
             device=x.device,
             dtype=compute_dtype,
         )
