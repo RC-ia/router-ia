@@ -25,10 +25,41 @@ def _load_config(root: Path):
     return AutoConfig.from_pretrained(str(root), local_files_only=True)
 
 
+def _pure_torch_causal_conv1d(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None, activation: str | None = None, *args, **kwargs) -> torch.Tensor:
+    """Depthwise causal conv without cuDNN/causal-conv1d kernels.
+
+    Matches the Qwen fallback semantics: left-pad by K-1, perform depthwise
+    cross-correlation, keep the original sequence length, then apply SiLU.
+    """
+    if x.ndim != 3 or weight.ndim != 2:
+        raise ValueError(f"Unexpected causal conv shapes: x={tuple(x.shape)} weight={tuple(weight.shape)}")
+    batch, channels, length = x.shape
+    if weight.shape[0] != channels:
+        raise ValueError(f"Causal conv channel mismatch: x={channels} weight={weight.shape[0]}")
+    kernel = weight.shape[1]
+    if kernel <= 0:
+        raise ValueError("Causal conv kernel must be non-empty")
+    padded = torch.nn.functional.pad(x, (kernel - 1, 0))
+    windows = padded.unfold(-1, kernel, 1)[..., :length, :]
+    out = (windows * weight.unsqueeze(0).unsqueeze(2)).sum(dim=-1)
+    if bias is not None:
+        out = out + bias.reshape(1, -1, 1)
+    if activation is None:
+        return out
+    if str(activation).lower() in {"silu", "swish"}:
+        return torch.nn.functional.silu(out)
+    raise ValueError(f"Unsupported causal conv activation: {activation!r}")
+
+
 def _disable_optional_qwen_kernels() -> None:
-    """Force Qwen3.5/3.6 reference modules onto pure-PyTorch fallbacks."""
+    """Force Qwen3.5/3.6 reference modules onto deterministic PyTorch paths."""
     import transformers.models.qwen3_5_moe.modeling_qwen3_5_moe as qwen
-    qwen.causal_conv1d_fn = None
+
+    # The HF forward reads causal_conv1d_fn as a module-global, so it cannot
+    # simply be set to None: forward would then call None(...). Use an explicit
+    # PyTorch implementation that avoids the cuDNN engine-selection failure
+    # seen with BF16 depthwise Conv1d on the Kaggle GPU.
+    qwen.causal_conv1d_fn = _pure_torch_causal_conv1d
     qwen.causal_conv1d_update = None
     qwen.chunk_gated_delta_rule = None
     qwen.fused_recurrent_gated_delta_rule = None
@@ -197,15 +228,7 @@ def _run_reference_layer(root: Path, layer: torch.nn.Module, meta_model: torch.n
     position_ids = torch.zeros((1, 1), device=hidden_input.device, dtype=torch.long)
     kwargs = {"hidden_states": hidden_input.unsqueeze(1), "position_embeddings": position_embeddings, "position_ids": position_ids, "attention_mask": None, "past_key_values": None}
     with torch.inference_mode():
-        try:
-            output = layer(**kwargs)
-        except TypeError:
-            kwargs.pop("past_key_values", None)
-            try:
-                output = layer(**kwargs)
-            except TypeError:
-                kwargs.pop("position_ids", None)
-                output = layer(**kwargs)
+        output = layer(**kwargs)
     if isinstance(output, tuple):
         output = output[0]
     if not isinstance(output, torch.Tensor):
