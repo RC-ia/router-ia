@@ -195,7 +195,7 @@ def _linear_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> t
     prefix = base.layer_prefix(layer)
     input_norm = base.load_layer_weight(root, layer, "input_layernorm.weight", device)
     h = rmsnorm(x0, input_norm)
-    compute_dtype = torch.float16 if device == "cuda" else torch.float32
+    compute_dtype = torch.bfloat16 if device == "cuda" else torch.float32
     h_compute = h.to(dtype=compute_dtype)
 
     qkv_w = _projection(root, prefix + "linear_attn.in_proj_qkv", device)
