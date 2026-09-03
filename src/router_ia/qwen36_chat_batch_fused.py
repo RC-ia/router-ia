@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Qwen3.6 chat runner with persistent tiered expert GPU cache."""
+"""Qwen3.6 chat runner with persistent compressed expert GPU cache."""
 
 from pathlib import Path
 
@@ -60,10 +60,8 @@ def _cache_stats_with_experts(root: Path) -> dict[str, int | float]:
         "expert_cache_hit_rate": float(expert["hit_rate"]),
         "expert_cache_loads": int(expert["loads"]),
         "expert_cache_evictions": int(expert["evictions"]),
-        "expert_cache_hot_items": int(expert["hot_items"]),
         "expert_cache_fp8_items": int(expert["warm_items"]),
         "expert_cache_q4_items": int(expert["cold_items"]),
-        "expert_cache_hot_hits": int(expert["hot_hits"]),
         "expert_cache_fp8_hits": int(expert["fp8_hits"]),
         "expert_cache_q4_hits": int(expert["q4_hits"]),
         "expert_cache_fp16_to_fp8": int(expert["fp16_to_fp8"]),
@@ -88,11 +86,10 @@ def _print_cache_with_experts(root: Path, label: str) -> None:
         f"misses={expert['misses']} | loads={expert['loads']} | evictions={expert['evictions']}"
     )
     print(
-        f"    tiers: FP16={expert['hot_items']} | FP8={expert['warm_items']} | "
-        f"Q4={expert['cold_items']} | hits FP8={expert['fp8_hits']} Q4={expert['q4_hits']} | "
-        f"compressions FP16>FP8={expert['fp16_to_fp8']} FP8>Q4={expert['fp8_to_q4']} | "
-        f"drops={expert['q4_drops']} | prefetch hits={expert['stream_prefetch_hits']} "
-        f"misses={expert['stream_prefetch_misses']}"
+        f"    tiers: FP8={expert['warm_items']} | Q4={expert['cold_items']} | "
+        f"hits FP8={expert['fp8_hits']} Q4={expert['q4_hits']} | "
+        f"compressions FP8>Q4={expert['fp8_to_q4']} | drops={expert['q4_drops']} | "
+        f"prefetch hits={expert['stream_prefetch_hits']} misses={expert['stream_prefetch_misses']}"
     )
 
 
@@ -105,16 +102,16 @@ def main() -> None:
     cache = _expert_cache(Path("."))
     print("expert_cache=complete-layer-expert")
     print("expert_cache_key=(layer,expert)")
-    print("expert_cache_policy=per-layer-tiered-2fp16-4fp8-4q4")
+    print("expert_cache_policy=per-layer-tiered-8fp8-4q4")
     print("expert_cache_budget=full-stream-vram-budget")
-    print("expert_cache_entry=FP16-hot|FP8-warm|Q4-cold")
-    print("expert_cache_eviction=compress-before-drop")
-    print("expert_cache_fp8_promotion=transient-only")
-    print("expert_cache_prefetch=raw-fp8-in-stream")
+    print("expert_cache_entry=FP8-resident|Q4-cold")
+    print("expert_cache_eviction=FP8-to-Q4-then-drop")
+    print("expert_cache_fp16_persistent=disabled")
+    print("expert_cache_fp8_promotion=disabled")
+    print("expert_cache_prefetch=parallel-raw-fp8-stream")
     print("expert_cache_compute=temporary-fp16")
     print(f"expert_cache_total_slots={cache.total_slots}")
     print(f"expert_cache_slots_per_layer={cache.slots_per_layer}")
-    print(f"expert_cache_hot_slots_per_layer={cache.hot_slots}")
     print(f"expert_cache_fp8_slots_per_layer={cache.fp8_slots}")
     print(f"expert_cache_q4_slots_per_layer={cache.q4_slots}")
     chat.main()
