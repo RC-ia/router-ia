@@ -28,6 +28,7 @@ from . import qwen36_chat_batch as chat
 from .qwen36_op_probe import dequantize_fp8_blockwise, load_embedding_row
 
 DEFAULT_TOLERANCE = 1e-3
+EXPERTS = 256
 
 
 def _load_config(root: Path):
@@ -129,6 +130,53 @@ def _load_checkpoint_tensor(root: Path, weight_map: dict[str, str], key: str) ->
         return tensor
 
 
+def _load_fused_expert_parameter(
+    root: Path,
+    weight_map: dict[str, str],
+    layer_idx: int,
+    local_name: str,
+    expected_shape: tuple[int, ...],
+) -> torch.Tensor:
+    """Build Transformers' fused MoE parameters from per-expert checkpoint tensors.
+
+    The Qwen3.6 safetensors checkpoint stores expert projections separately as
+    ``gate_proj`` and ``up_proj`` for each expert, while the Transformers module
+    exposes a fused ``experts.gate_up_proj`` parameter. The fused layout is
+    ``[expert, gate_rows + up_rows, hidden]``; therefore each expert is
+    concatenated along the projection-row dimension.
+    """
+    prefix = base.layer_prefix(layer_idx)
+    if local_name.endswith("mlp.experts.gate_up_proj"):
+        parts: list[torch.Tensor] = []
+        for expert in range(EXPERTS):
+            gate_key = f"{prefix}mlp.experts.{expert}.gate_proj.weight"
+            up_key = f"{prefix}mlp.experts.{expert}.up_proj.weight"
+            gate = _load_checkpoint_tensor(root, weight_map, gate_key)
+            up = _load_checkpoint_tensor(root, weight_map, up_key)
+            if gate.ndim != 2 or up.ndim != 2 or gate.shape[1] != up.shape[1]:
+                raise RuntimeError(
+                    f"Invalid expert projection shapes for layer={layer_idx} expert={expert}: "
+                    f"gate={tuple(gate.shape)} up={tuple(up.shape)}"
+                )
+            parts.append(torch.cat((gate, up), dim=0))
+        fused = torch.stack(parts, dim=0)
+    elif local_name.endswith("mlp.experts.down_proj"):
+        parts = []
+        for expert in range(EXPERTS):
+            down_key = f"{prefix}mlp.experts.{expert}.down_proj.weight"
+            parts.append(_load_checkpoint_tensor(root, weight_map, down_key))
+        fused = torch.stack(parts, dim=0)
+    else:
+        raise KeyError(local_name)
+
+    if tuple(fused.shape) != expected_shape:
+        raise RuntimeError(
+            f"Fused expert shape mismatch for layer {layer_idx} {local_name}: "
+            f"built={tuple(fused.shape)} model={expected_shape}"
+        )
+    return fused
+
+
 def _materialize_layer(root: Path, layer: torch.nn.Module, layer_idx: int, device: str) -> tuple[int, int]:
     """Materialize one meta decoder layer from checkpoint tensors."""
     weight_map = _checkpoint_index(root)
@@ -145,8 +193,21 @@ def _materialize_layer(root: Path, layer: torch.nn.Module, layer_idx: int, devic
             try:
                 tensor = _load_checkpoint_tensor(root, weight_map, checkpoint_key)
             except KeyError:
-                missing.append(checkpoint_key)
-                continue
+                if local_name.endswith("mlp.experts.gate_up_proj") or local_name.endswith("mlp.experts.down_proj"):
+                    try:
+                        tensor = _load_fused_expert_parameter(
+                            root,
+                            weight_map,
+                            layer_idx,
+                            local_name,
+                            tuple(destination.shape),
+                        )
+                    except KeyError:
+                        missing.append(checkpoint_key)
+                        continue
+                else:
+                    missing.append(checkpoint_key)
+                    continue
             if tuple(tensor.shape) != tuple(destination.shape):
                 raise RuntimeError(
                     f"Shape mismatch for {checkpoint_key}: checkpoint={tuple(tensor.shape)} "
@@ -298,8 +359,6 @@ def main() -> None:
                 f"cosine={cosine:.9f} | ref_norm={ref_norm:.6g} | router_norm={router_norm:.6g}"
             )
 
-        # Return this layer to meta so its real storage is released before the
-        # next layer is loaded. The parent model remains meta-only.
         official_layer.to_empty(device="meta")
         gc.collect()
         if args.device == "cuda":
