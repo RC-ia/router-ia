@@ -14,6 +14,8 @@ from . import qwen36_cached_loop as cached
 from .qwen36_op_probe import rmsnorm
 
 TOLERANCE = 1e-3
+ROPE_THETA = 10_000_000.0
+ROPE_DIM = int(base.FULL_HEAD_DIM * 0.25)
 
 
 def compare(name: str, ref: torch.Tensor, got: torch.Tensor, tolerance: float = TOLERANCE) -> bool:
@@ -35,6 +37,28 @@ def compare(name: str, ref: torch.Tensor, got: torch.Tensor, tolerance: float = 
     return ok
 
 
+def apply_rope(q: torch.Tensor, k: torch.Tensor, position: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply Qwen3.6 RoPE without depending on an optional cache helper."""
+    device = q.device
+    dtype = q.dtype
+    half_dim = ROPE_DIM // 2
+    inv_freq = 1.0 / (ROPE_THETA ** (torch.arange(0, ROPE_DIM, 2, device=device, dtype=torch.float32) / ROPE_DIM))
+    angles = position * inv_freq
+    cos = angles.cos().to(dtype=dtype)
+    sin = angles.sin().to(dtype=dtype)
+
+    def rotate(x: torch.Tensor) -> torch.Tensor:
+        x_rot = x[..., :ROPE_DIM]
+        x_pass = x[..., ROPE_DIM:]
+        x_even = x_rot[..., 0::2]
+        x_odd = x_rot[..., 1::2]
+        rotated = torch.stack((x_even * cos - x_odd * sin, x_even * sin + x_odd * cos), dim=-1).reshape_as(x_rot)
+        return torch.cat((rotated, x_pass), dim=-1)
+
+    assert half_dim == cos.numel()
+    return rotate(q), rotate(k)
+
+
 def discover_full_attention_layers(root: Path) -> list[int]:
     layers = []
     for layer in range(base.DEFAULT_LAYERS):
@@ -46,9 +70,6 @@ def discover_full_attention_layers(root: Path) -> list[int]:
 def reference_full_attention(root: Path, layer: int, hidden_states: list[torch.Tensor], device: str):
     prefix = base.layer_prefix(layer)
     input_norm = base.load_layer_weight(root, layer, "input_layernorm.weight", device)
-    # Use the public-in-module loader that is actually provided by the cached
-    # loop. Do not depend on the private convenience wrapper in attention_cache,
-    # because older checkouts of that module did not expose _projection.
     load_projection = cached._cached_load_projection
     q_w = load_projection(root, prefix + "self_attn.q_proj", device)
     k_w = load_projection(root, prefix + "self_attn.k_proj", device)
@@ -67,7 +88,7 @@ def reference_full_attention(root: Path, layer: int, hidden_states: list[torch.T
         q = rmsnorm(q, q_norm_w).float().unsqueeze(2)
         k = rmsnorm(k, k_norm_w).float().unsqueeze(2)
         v = v.float().unsqueeze(2)
-        q, k = cache._apply_rope(q, k, position)
+        q, k = apply_rope(q, k, position)
         q_tokens.append(q)
         k_tokens.append(k)
         v_tokens.append(v)
@@ -88,9 +109,6 @@ def reference_full_attention(root: Path, layer: int, hidden_states: list[torch.T
         attn = attn * torch.sigmoid(gates[position].float())
         attn_flat = attn.reshape(1, base.FULL_Q_DIM)
         projected = F.linear(attn_flat.to(dtype=out_w.dtype), out_w).float()
-        # _full_stateful() returns the complete attention residual, not the
-        # raw projected attention output. Keep the probe's reference aligned
-        # with the runtime contract: x0 + o_proj(attention).
         outputs.append(x.float().reshape(1, base.HIDDEN) + projected)
 
     return {"keys": full_k, "values": full_v, "outputs": outputs}
