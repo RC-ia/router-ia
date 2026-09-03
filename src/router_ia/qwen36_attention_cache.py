@@ -16,8 +16,9 @@ import torch
 import torch.nn.functional as F
 
 from . import qwen36_40layer_loop as base
+from . import qwen36_cached_loop as cached
 from .qwen36_gated_norm_probe import gated_rmsnorm
-from .qwen36_op_probe import load_projection, rmsnorm
+from .qwen36_op_probe import rmsnorm
 
 
 @dataclass
@@ -101,6 +102,11 @@ def active(root: Path, device: str) -> AttentionState:
     return state
 
 
+def _projection(root: Path, prefix: str, device: str) -> torch.Tensor:
+    """Use the same persistent tensor/projection cache as the fast MoE path."""
+    return cached._cached_load_projection(root, prefix, device)
+
+
 def _linear_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> torch.Tensor:
     state = active(root, device)
     prefix = base.layer_prefix(layer)
@@ -109,7 +115,7 @@ def _linear_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> t
     compute_dtype = torch.float16 if device == "cuda" else torch.float32
     h_compute = h.to(dtype=compute_dtype)
 
-    qkv_w = load_projection(root, prefix + "linear_attn.in_proj_qkv", device)
+    qkv_w = _projection(root, prefix + "linear_attn.in_proj_qkv", device)
     h_qkv = h_compute.to(dtype=qkv_w.dtype)
     mixed = F.linear(h_qkv, qkv_w).reshape(1, base.LINEAR_KEY_DIM * 2 + base.LINEAR_VALUE_DIM)
 
@@ -120,8 +126,8 @@ def _linear_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> t
     k = k.reshape(1, base.LINEAR_NUM_K_HEADS, 128).repeat_interleave(2, dim=1)
     v = v.reshape(1, base.LINEAR_NUM_V_HEADS, 128)
 
-    a_w = load_projection(root, prefix + "linear_attn.in_proj_a", device)
-    b_w = load_projection(root, prefix + "linear_attn.in_proj_b", device)
+    a_w = _projection(root, prefix + "linear_attn.in_proj_a", device)
+    b_w = _projection(root, prefix + "linear_attn.in_proj_b", device)
     a_log = base.load_layer_weight(root, layer, "linear_attn.A_log", device).float().reshape(1, base.LINEAR_NUM_V_HEADS)
     dt_bias = base.load_layer_weight(root, layer, "linear_attn.dt_bias", device).float().reshape(1, base.LINEAR_NUM_V_HEADS)
     h_a = h_compute.to(dtype=a_w.dtype)
@@ -153,12 +159,12 @@ def _linear_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> t
     state.linear_states[int(layer)] = linear_state.detach()
     attn = torch.einsum("bhkd,bhk->bhd", linear_state, qn)
 
-    z_w = load_projection(root, prefix + "linear_attn.in_proj_z", device)
+    z_w = _projection(root, prefix + "linear_attn.in_proj_z", device)
     z = F.linear(h_compute.to(dtype=z_w.dtype), z_w).reshape(1, base.LINEAR_NUM_V_HEADS, 128)
     norm_w = base.load_layer_weight(root, layer, "linear_attn.norm.weight", device)
     gated, _, _ = gated_rmsnorm(attn, z, norm_w)
 
-    out_w = load_projection(root, prefix + "linear_attn.out_proj", device)
+    out_w = _projection(root, prefix + "linear_attn.out_proj", device)
     gated_compute = gated.reshape(1, base.LINEAR_VALUE_DIM).to(dtype=out_w.dtype if device == "cuda" else compute_dtype)
     attn_projected = F.linear(gated_compute, out_w).float()
     residual = x0.reshape(1, base.HIDDEN).float() + attn_projected
@@ -166,7 +172,6 @@ def _linear_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> t
     del input_norm, h, h_compute, qkv_w, h_qkv, mixed, conv_w, q, k, v
     del a_w, b_w, h_a, h_b, a_log, dt_bias, a_raw, b_raw, beta, g, decay, qn, kn
     del retrieved, delta, attn, z_w, z, norm_w, gated, out_w, gated_compute, attn_projected
-    state.tokens_seen += 1
     return residual
 
 
@@ -178,9 +183,9 @@ def _full_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> tor
     compute_dtype = torch.float16 if device == "cuda" else torch.float32
     h_compute = h.to(dtype=compute_dtype)
 
-    q_w = load_projection(root, prefix + "self_attn.q_proj", device)
-    k_w = load_projection(root, prefix + "self_attn.k_proj", device)
-    v_w = load_projection(root, prefix + "self_attn.v_proj", device)
+    q_w = _projection(root, prefix + "self_attn.q_proj", device)
+    k_w = _projection(root, prefix + "self_attn.k_proj", device)
+    v_w = _projection(root, prefix + "self_attn.v_proj", device)
 
     q_gate = F.linear(h_compute.to(dtype=q_w.dtype), q_w).reshape(1, base.FULL_NUM_HEADS, base.FULL_HEAD_DIM * 2)
     q, gate = torch.chunk(q_gate, 2, dim=-1)
@@ -214,12 +219,12 @@ def _full_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> tor
     attn = attn * torch.sigmoid(gate.float())
     attn_flat = attn.reshape(1, base.FULL_Q_DIM).to(dtype=compute_dtype)
 
-    out_w = load_projection(root, prefix + "self_attn.o_proj", device)
+    out_w = _projection(root, prefix + "self_attn.o_proj", device)
     attn_projected = F.linear(attn_flat.to(dtype=out_w.dtype), out_w).float()
     residual = x0.reshape(1, base.HIDDEN).float() + attn_projected
 
     del input_norm, h, h_compute, q_w, k_w, v_w, q_gate, q, gate, k, v
-    del k_token, v_token, k_expanded, v_expanded, scores, attn_weights, attn
+    del q_norm_w, k_norm_w, k_token, v_token, k_expanded, v_expanded, scores, attn_weights, attn
     del attn_flat, out_w, attn_projected
     return residual
 
