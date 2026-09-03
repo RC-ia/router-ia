@@ -11,15 +11,7 @@ import torch.nn.functional as F
 
 from . import qwen36_attention_cache as attention
 from . import qwen36_40layer_loop as base
-from .qwen36_layer_fidelity_probe import (
-    _build_meta_model,
-    _find_layers,
-    _load_config,
-    _materialize_layer,
-    _module_input_dtype,
-    _pure_torch_causal_conv1d,
-    _stage_stats,
-)
+from .qwen36_layer_fidelity_probe import (_build_meta_model, _find_layers, _load_config, _materialize_layer, _module_input_dtype, _pure_torch_causal_conv1d, _stage_stats)
 from .qwen36_op_probe import load_embedding_row, rmsnorm
 
 DEFAULT_TOLERANCE = 1e-3
@@ -71,8 +63,7 @@ def split_qkv(conv):
     q = q.reshape(1, base.LINEAR_NUM_K_HEADS, 128).repeat_interleave(2, dim=1)
     k = k.reshape(1, base.LINEAR_NUM_K_HEADS, 128).repeat_interleave(2, dim=1)
     v = v.reshape(1, base.LINEAR_NUM_V_HEADS, 128)
-    q = q.float()
-    k = k.float()
+    q = q.float(); k = k.float()
     q_norm = q * torch.rsqrt((q * q).sum(dim=-1, keepdim=True) + 1e-6)
     k_norm = k * torch.rsqrt((k * k).sum(dim=-1, keepdim=True) + 1e-6)
     q_scaled = q_norm * (128 ** -0.5)
@@ -108,8 +99,7 @@ def run(root, layer, layer_idx, hidden, device, tolerance):
 
     def official():
         y = layer.linear_attn(hidden_states=normed.unsqueeze(1), cache_params=None, attention_mask=None)
-        if isinstance(y, tuple):
-            y = y[0]
+        if isinstance(y, tuple): y = y[0]
         return y.reshape(1, base.HIDDEN)
 
     ref_result, ref_linear = capture_linears(lambda: capture_conv(official)[0])
@@ -125,35 +115,25 @@ def run(root, layer, layer_idx, hidden, device, tolerance):
 
     ref_qkv = by_last_dim(ref_linear, LINEAR_CONV_DIM)
     ref_z = by_last_dim(ref_linear, base.LINEAR_VALUE_DIM)
-    ref_b = by_last_dim(ref_linear, base.LINEAR_NUM_V_HEADS)
-    ref_a = by_last_dim(ref_linear, base.LINEAR_NUM_V_HEADS, 1)
+    ref_a = by_last_dim(ref_linear, base.LINEAR_NUM_V_HEADS)
+    ref_b = by_last_dim(ref_linear, base.LINEAR_NUM_V_HEADS, 1)
     ref_out = by_last_dim(ref_linear, base.HIDDEN)
 
-    state = attention.active(root, device)
-    state.reset()
+    state = attention.active(root, device); state.reset()
     router_result, router_linear = capture_linears(lambda: attention.step_attention(root, layer_idx, hidden, device))
     router_qkv = by_last_dim(router_linear, LINEAR_CONV_DIM)
     router_z = by_last_dim(router_linear, base.LINEAR_VALUE_DIM)
-    # Runtime order is in_proj_a, then in_proj_b. The previous probe
-    # incorrectly assigned occurrence 0 to b and occurrence 1 to a.
     router_a = by_last_dim(router_linear, base.LINEAR_NUM_V_HEADS)
     router_b = by_last_dim(router_linear, base.LINEAR_NUM_V_HEADS, 1)
     router_out = by_last_dim(router_linear, base.HIDDEN)
 
     print("\n=== PROJECTION ===")
-    ok = [
-        report("in_proj_qkv", ref_qkv, router_qkv, tolerance),
-        report("in_proj_z", ref_z, router_z, tolerance),
-        report("in_proj_b", ref_b, router_b, tolerance),
-        report("in_proj_a", ref_a, router_a, tolerance),
-    ]
+    ok = [report("in_proj_qkv", ref_qkv, router_qkv, tolerance), report("in_proj_z", ref_z, router_z, tolerance), report("in_proj_b", ref_b, router_b, tolerance), report("in_proj_a", ref_a, router_a, tolerance)]
 
-    tmp = attention.AttentionState()
-    tmp.bind(device)
+    tmp = attention.AttentionState(); tmp.bind(device)
     conv_w = base.load_layer_weight(root, layer_idx, "linear_attn.conv1d.weight", device)
     router_conv = attention._causal_conv1d_step(tmp, layer_idx, router_qkv.reshape(1, -1), conv_w)
     ref_conv_out = ref_conv["output"].reshape_as(router_conv)
-
     print("\n=== CAUSAL CONV / QKV ===")
     ok.append(report("causal_conv", ref_conv_out, router_conv, tolerance))
     ref_q, ref_k, ref_v, ref_qn, ref_kn, ref_qs = split_qkv(ref_conv_out)
@@ -174,15 +154,11 @@ def run(root, layer, layer_idx, hidden, device, tolerance):
     def post(module, args, output):
         if isinstance(output, tuple): output = output[0]
         ref_norm["y"] = output.detach().clone()
-    h1 = layer.linear_attn.norm.register_forward_pre_hook(pre)
-    h2 = layer.linear_attn.norm.register_forward_hook(post)
+    h1 = layer.linear_attn.norm.register_forward_pre_hook(pre); h2 = layer.linear_attn.norm.register_forward_hook(post)
     try: official()
-    finally:
-        h1.remove(); h2.remove()
+    finally: h1.remove(); h2.remove()
 
-    state.reset()
-    router_norm = {}
-    original_gated = attention.gated_rmsnorm
+    state.reset(); router_norm = {}; original_gated = attention.gated_rmsnorm
     def gated(x, z, weight, *args, **kwargs):
         y = original_gated(x, z, weight, *args, **kwargs)
         router_norm["x"] = x.detach().clone(); router_norm["z"] = z.detach().clone(); router_norm["y"] = y[0].detach().clone()
@@ -191,42 +167,27 @@ def run(root, layer, layer_idx, hidden, device, tolerance):
     try: router_norm_result = attention.step_attention(root, layer_idx, hidden, device)
     finally: attention.gated_rmsnorm = original_gated
 
-    ok += [report("recurrent_core", ref_norm["x"], router_norm["x"], tolerance), report("gate_z", ref_norm["z"], router_norm["z"], tolerance), report("gated_rmsnorm", ref_norm["y"], router_norm["y"], tolerance), report("out_proj", ref_out, router_out, tolerance), report("linear_attention_total", ref_result, router_norm_result, tolerance)]
+    router_attention_only = router_norm_result - hidden.reshape(1, base.HIDDEN).float()
+    ok += [report("recurrent_core", ref_norm["x"], router_norm["x"], tolerance), report("gate_z", ref_norm["z"], router_norm["z"], tolerance), report("gated_rmsnorm", ref_norm["y"], router_norm["y"], tolerance), report("out_proj", ref_out, router_out, tolerance), report("linear_attention_total", ref_result, router_attention_only, tolerance)]
 
-    print("\n=== RESULT ===")
-    print(f"status={'PASS' if all(ok) else 'FAIL'}")
-    return all(ok)
+    print("\n=== RESULT ==="); print(f"status={'PASS' if all(ok) else 'FAIL'}"); return all(ok)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Qwen3.6 Linear Attention detailed fidelity probe")
-    parser.add_argument("root", type=Path)
-    parser.add_argument("--token-id", type=int, default=0)
-    parser.add_argument("--layer", type=int, default=0)
-    parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
-    parser.add_argument("--tolerance", type=float, default=DEFAULT_TOLERANCE)
+    parser.add_argument("root", type=Path); parser.add_argument("--token-id", type=int, default=0); parser.add_argument("--layer", type=int, default=0); parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda"); parser.add_argument("--tolerance", type=float, default=DEFAULT_TOLERANCE)
     args = parser.parse_args()
     if args.device == "cuda" and not torch.cuda.is_available(): raise SystemExit("CUDA unavailable")
     if not 0 <= args.layer < base.DEFAULT_LAYERS: raise SystemExit(f"--layer must be in [0, {base.DEFAULT_LAYERS - 1}]")
-    root = args.root.resolve()
+    root = args.root.resolve();
     if base.attention_type(root, args.layer) != "linear_attention": raise SystemExit(f"Layer {args.layer} is not linear_attention")
-    config = _load_config(root)
-    model = _build_meta_model(config)
-    layers = _find_layers(model)
-    layer = layers[args.layer]
+    config = _load_config(root); model = _build_meta_model(config); layers = _find_layers(model); layer = layers[args.layer]
     loaded, total = _materialize_layer(root, layer, args.layer, args.device)
-    print("op=linear-attention-fidelity-detailed")
-    print(f"layer={args.layer}")
-    print(f"token_id={args.token_id}")
-    print(f"device={args.device}")
-    print(f"loaded={loaded}/{total}")
-    print(f"tolerance={args.tolerance}")
+    print("op=linear-attention-fidelity-detailed"); print(f"layer={args.layer}"); print(f"token_id={args.token_id}"); print(f"device={args.device}"); print(f"loaded={loaded}/{total}"); print(f"tolerance={args.tolerance}")
     hidden = load_embedding_row(root, args.token_id).reshape(1, base.HIDDEN).to(args.device).float()
-    state = attention.state_for(root, args.device)
-    state.reset(); attention.activate(root, state)
+    state = attention.state_for(root, args.device); state.reset(); attention.activate(root, state)
     try: run(root, layer, args.layer, hidden, args.device, args.tolerance)
-    finally:
-        attention.deactivate(root); layer.to_empty(device="meta"); gc.collect()
+    finally: attention.deactivate(root); layer.to_empty(device="meta"); gc.collect()
 
 
 if __name__ == "__main__": main()
