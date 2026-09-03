@@ -136,6 +136,13 @@ def _projection(root: Path, prefix: str, device: str) -> torch.Tensor:
     return cached._cached_load_projection(root, prefix, device)
 
 
+def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Match the Transformers Qwen3.5/3.6 PyTorch fallback exactly."""
+    x = x.float()
+    inv_norm = torch.rsqrt((x * x).sum(dim=-1, keepdim=True) + eps)
+    return x * inv_norm
+
+
 def _causal_conv1d_step(
     state: AttentionState,
     layer: int,
@@ -152,7 +159,11 @@ def _causal_conv1d_step(
         raise ValueError(f"Unexpected mixed_qkv shape: {tuple(mixed_qkv.shape)}")
     if conv_weight.ndim != 3:
         raise ValueError(f"Unexpected conv weight shape: {tuple(conv_weight.shape)}")
-    if conv_weight.shape[0] != LINEAR_CONV_DIM or conv_weight.shape[1] != 1 or conv_weight.shape[2] != LINEAR_CONV_KERNEL:
+    if (
+        conv_weight.shape[0] != LINEAR_CONV_DIM
+        or conv_weight.shape[1] != 1
+        or conv_weight.shape[2] != LINEAR_CONV_KERNEL
+    ):
         raise ValueError(f"Unexpected conv weight shape: {tuple(conv_weight.shape)}")
 
     conv_dtype = conv_weight.dtype
@@ -207,8 +218,10 @@ def _linear_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> t
     g = -torch.exp(a_log) * F.softplus(a_raw + dt_bias)
     decay = torch.exp(g)
 
-    q = F.normalize(q.float(), dim=-1, eps=1e-6) * (128 ** -0.5)
-    k = F.normalize(k.float(), dim=-1, eps=1e-6)
+    q = _l2norm(q)
+    q = q * (128 ** -0.5)
+    k = _l2norm(k)
+
     linear_state = state.linear_states.get(int(layer))
     expected_state_shape = (1, base.LINEAR_NUM_VALUE_HEADS, 128, 128)
     if linear_state is None or linear_state.device != x0.device or tuple(linear_state.shape) != expected_state_shape:
