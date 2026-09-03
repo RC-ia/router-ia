@@ -116,7 +116,10 @@ def capture_runtime(fn):
         return out
 
     def norm(input, weight, eps=1e-6):
-        out = orig_norm(input, weight, eps)
+        # Runtime rmsnorm currently accepts exactly (x, weight). Keep the
+        # optional eps in the wrapper only so it is compatible with callers
+        # that use the conventional three-argument signature.
+        out = orig_norm(input, weight)
         captured["norm"].append(out.detach().clone())
         return out
 
