@@ -132,21 +132,34 @@ def _load_route_batch_preserving_duplicates(root: Path, layer: int, layer_prefix
     return [loaded[int(expert_id)] for expert_id in expert_ids]
 
 
-def _route_matvec_batched(weight: torch.Tensor, x: torch.Tensor, batch_size: int) -> torch.Tensor:
-    """Run N expert matvecs as one CUDA GEMM instead of N tiny batched GEMMs.
+def _route_projection_batched(weight: torch.Tensor, x: torch.Tensor, batch_size: int) -> torch.Tensor:
+    """Run routed expert projections on CUDA with the cheapest valid GEMM form.
 
-    ``weight`` is [N, out_features, in_features] and ``x`` is [in_features].
-    Flattening the expert dimension lets cuBLAS process one larger GEMM while
-    preserving the per-expert output layout expected by the router.
+    For a single shared input vector, flattening the expert dimension turns the
+    N matvecs into one larger GEMM. For the down projection, every expert has a
+    different hidden vector, so the operation must remain a batched GEMM.
     """
-    if weight.ndim != 3 or x.ndim != 1:
-        raise ValueError(f"Expected [N,O,I] weight and [I] input, got {tuple(weight.shape)} and {tuple(x.shape)}")
+    if weight.ndim != 3:
+        raise ValueError(f"Expected [N,O,I] weight, got {tuple(weight.shape)}")
     if int(weight.shape[0]) != int(batch_size):
         raise ValueError(f"Route batch size mismatch: {weight.shape[0]} != {batch_size}")
+
     out_features, in_features = map(int, weight.shape[1:])
-    flattened = weight.reshape(batch_size * out_features, in_features)
-    result = torch.mm(flattened, x.reshape(in_features, 1))
-    return result.reshape(batch_size, out_features)
+    if x.ndim == 1:
+        if int(x.shape[0]) != in_features:
+            raise ValueError(f"Expected [I] input with I={in_features}, got {tuple(x.shape)}")
+        flattened = weight.reshape(batch_size * out_features, in_features)
+        result = torch.mm(flattened, x.reshape(in_features, 1))
+        return result.reshape(batch_size, out_features)
+
+    if x.ndim == 2:
+        if tuple(x.shape) != (batch_size, in_features):
+            raise ValueError(
+                f"Expected [{batch_size},{in_features}] input for batched projection, got {tuple(x.shape)}"
+            )
+        return torch.bmm(weight, x.unsqueeze(-1)).squeeze(-1)
+
+    raise ValueError(f"Expected [I] or [N,I] input, got {tuple(x.shape)}")
 
 
 def _batched_moe_step_gpu(root: Path, layer: int, residual: torch.Tensor, top_k: int, device: str):
@@ -175,10 +188,10 @@ def _batched_moe_step_gpu(root: Path, layer: int, residual: torch.Tensor, top_k:
     batch_x = moe_in.reshape(-1).to(dtype=torch.float16)
 
     with torch.autocast(device_type="cuda", dtype=torch.float16):
-        gate = _route_matvec_batched(gate_w, batch_x, len(expert_ids))
-        up = _route_matvec_batched(up_w, batch_x, len(expert_ids))
+        gate = _route_projection_batched(gate_w, batch_x, len(expert_ids))
+        up = _route_projection_batched(up_w, batch_x, len(expert_ids))
         hidden = F.silu(gate) * up
-        expert_out = _route_matvec_batched(down_w, hidden, len(expert_ids))
+        expert_out = _route_projection_batched(down_w, hidden, len(expert_ids))
         routing = torch.tensor(weights, device=device, dtype=expert_out.dtype).reshape(-1, 1)
         routed_sum = (expert_out * routing).sum(dim=0, keepdim=True)
 
@@ -325,7 +338,7 @@ def main() -> None:
     print("expert_cache_fp8_promotion=disabled")
     print("expert_cache_prefetch=parallel-raw-fp8-stream")
     print("expert_cache_compute=temporary-fp16")
-    print("expert_cache_compute_batch=single-gemm-per-projection")
+    print("expert_cache_compute_batch=single-gemm-per-projection-with-batched-down")
     print("expert_cache_kernel_fused_dequant=not-yet")
     print("routing_predictor=enabled")
     print("routing_predictor_policy=bigram-with-unigram-fallback")
