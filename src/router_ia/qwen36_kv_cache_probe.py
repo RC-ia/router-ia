@@ -83,7 +83,10 @@ def reference_full_attention(root: Path, layer: int, hidden_states: list[torch.T
         attn = attn * torch.sigmoid(gates[position].float())
         attn_flat = attn.reshape(1, base.FULL_Q_DIM)
         projected = F.linear(attn_flat.to(dtype=out_w.dtype), out_w).float()
-        outputs.append(projected)
+        # _full_stateful() returns the complete attention residual, not the
+        # raw projected attention output. Keep the probe's reference aligned
+        # with the runtime contract: x0 + o_proj(attention).
+        outputs.append(x.float().reshape(1, base.HIDDEN) + projected)
 
     return {"keys": full_k, "values": full_v, "outputs": outputs}
 
@@ -129,7 +132,7 @@ def run_probe(root: Path, layer: int, num_tokens: int, device: str, seed: int, t
             ref_v = reference["values"][:, :, :position + 1]
             all_pass &= compare("cached K", ref_k, got_k, tolerance)
             all_pass &= compare("cached V", ref_v, got_v, tolerance)
-            all_pass &= compare("attention output", reference["outputs"][position], got, tolerance)
+            all_pass &= compare("attention residual", reference["outputs"][position], got, tolerance)
             expected_tokens = position + 1
             actual_tokens = int(got_k.shape[-2])
             ok_tokens = actual_tokens == expected_tokens
@@ -195,7 +198,7 @@ def main() -> int:
     print()
     all_pass = True
     for layer in layers:
-        all_pass &= run_probe(root, layer, args.tokens, args.device, args.seed, args.tolerance)
+        all_pass &= run_probe(root, layer, args.tokens, device=args.device, seed=args.seed, tolerance=args.tolerance)
         print()
     return 0 if all_pass else 1
 
