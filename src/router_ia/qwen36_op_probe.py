@@ -53,9 +53,18 @@ def load_embedding_row(root: Path, token_id: int) -> torch.Tensor:
 
 
 def rmsnorm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    x = x.float()
-    w = weight.float()
-    return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS) * (1.0 + w)
+    """Match Qwen3.5/3.6 RMSNorm semantics exactly.
+
+    Qwen computes the normalization and affine weight in FP32, then casts
+    the result back to the input dtype. This final cast is important for
+    fidelity when the layer input is BF16.
+    """
+    input_dtype = x.dtype
+    x_fp32 = x.float()
+    w_fp32 = weight.float()
+    output = x_fp32 * torch.rsqrt(x_fp32.pow(2).mean(dim=-1, keepdim=True) + EPS)
+    output = output * (1.0 + w_fp32)
+    return output.to(dtype=input_dtype)
 
 
 def dequantize_fp8_blockwise(weight: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
