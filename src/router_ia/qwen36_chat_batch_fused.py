@@ -46,6 +46,28 @@ def _cached_expert_projection_triplet(
     return _expert_cache(root).get_or_load(cached._store(root), layer, expert_id, layer_prefix)
 
 
+def _load_route_batch_preserving_duplicates(
+    root: Path,
+    layer: int,
+    layer_prefix: str,
+    expert_ids: list[int],
+):
+    """Load each unique routed expert once, then restore original top-k order.
+
+    Routing can contain repeated expert IDs. The cache is keyed by (layer, expert),
+    so duplicate IDs must not be allowed to shrink the compute batch.
+    """
+    expert_cache = _expert_cache(root)
+    store = cached._store(root)
+
+    unique_ids = list(dict.fromkeys(int(x) for x in expert_ids))
+    loaded = {
+        expert_id: expert_cache.get_or_load(store, layer, expert_id, layer_prefix)
+        for expert_id in unique_ids
+    }
+    return [loaded[int(expert_id)] for expert_id in expert_ids]
+
+
 def _batched_moe_step_gpu(
     root: Path,
     layer: int,
@@ -53,7 +75,7 @@ def _batched_moe_step_gpu(
     top_k: int,
     device: str,
 ):
-    """MoE step whose routed expert weights are dequantized as GPU batches."""
+    """MoE step whose routed expert weights are prepared on CUDA."""
     if device != "cuda":
         return _ORIGINAL_BATCHED_MOE_STEP(root, layer, residual, top_k, device)
 
@@ -65,14 +87,16 @@ def _batched_moe_step_gpu(
     expert_ids = [int(v) for v in routed.expert_ids.detach().cpu().tolist()]
     weights = [float(v) for v in routed.weights.detach().cpu().tolist()]
 
-    expert_cache = _expert_cache(root)
-    triplets = expert_cache.get_or_load_batch(
-        cached._store(root), layer, expert_ids, prefix
-    )
+    triplets = _load_route_batch_preserving_duplicates(root, layer, prefix, expert_ids)
     gate_w = torch.stack([triplet[0] for triplet in triplets], dim=0)
     up_w = torch.stack([triplet[1] for triplet in triplets], dim=0)
     down_w = torch.stack([triplet[2] for triplet in triplets], dim=0)
     batch_x = moe_in.expand(len(expert_ids), -1).to(dtype=torch.float16)
+
+    if len(triplets) != len(expert_ids):
+        raise RuntimeError(
+            f"Expert route batch mismatch: requested {len(expert_ids)}, loaded {len(triplets)}"
+        )
 
     with torch.autocast(device_type="cuda", dtype=torch.float16):
         gate = torch.bmm(gate_w, batch_x.unsqueeze(-1)).squeeze(-1)
@@ -173,7 +197,7 @@ def main() -> None:
     print("expert_cache_fp8_promotion=disabled")
     print("expert_cache_prefetch=parallel-raw-fp8-stream")
     print("expert_cache_compute=temporary-fp16")
-    print("expert_cache_compute_batch=8-experts")
+    print("expert_cache_compute_batch=8-experts-preserve-duplicates")
     print(f"expert_cache_total_slots={cache.total_slots}")
     print(f"expert_cache_slots_per_layer={cache.slots_per_layer}")
     print(f"expert_cache_fp8_slots_per_layer={cache.fp8_slots}")
