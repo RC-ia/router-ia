@@ -98,6 +98,7 @@ def gated_delta_recurrent(query: torch.Tensor, key: torch.Tensor, value: torch.T
 
 
 def linear_attention_step(root: Path, layer: int, x0: torch.Tensor, conv_state: torch.Tensor | None, recurrent_state: torch.Tensor | None, device: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run a complete reference-style one-token Qwen3.6 linear-attention step."""
     compute_dtype = torch.bfloat16 if device == "cuda" else torch.float32
     x = x0.to(device=device, dtype=compute_dtype)
     prefix = base.layer_prefix(layer)
@@ -127,13 +128,18 @@ def linear_attention_step(root: Path, layer: int, x0: torch.Tensor, conv_state: 
     dt_bias = load_vector(root, layer, "linear_attn.dt_bias", device).reshape(1, base.LINEAR_NUM_V_HEADS)
     g = -torch.exp(a_log) * F.softplus(a + dt_bias)
 
-    core, recurrent_state_new = gated_delta_recurrent(q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), g.unsqueeze(1), beta.unsqueeze(1), recurrent_state)
+    core, recurrent_state_new = gated_delta_recurrent(
+        q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), g.unsqueeze(1), beta.unsqueeze(1), recurrent_state
+    )
     attn = core[:, 0]
 
     z = F.linear(h, z_w).reshape(1, base.LINEAR_NUM_V_HEADS, HEAD_DIM)
     norm_w = base.load_layer_weight(root, layer, "linear_attn.norm.weight", device)
     gated, _, _ = gated_rmsnorm(attn, z, norm_w)
-    projected = F.linear(gated.reshape(1, base.LINEAR_VALUE_DIM), out_w).float()
+    # gated_rmsnorm performs its accumulation in FP32, while the module's
+    # out_proj weight is BF16 on CUDA. Match the module input dtype here.
+    gated_for_proj = gated.reshape(1, base.LINEAR_VALUE_DIM).to(dtype=out_w.dtype)
+    projected = F.linear(gated_for_proj, out_w).float()
     return projected, conv_state_new, recurrent_state_new
 
 
