@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Qwen3.6 chat runner with persistent two-tier expert GPU cache."""
+"""Qwen3.6 chat runner with persistent tiered expert GPU cache."""
 
 from pathlib import Path
 
@@ -34,19 +34,14 @@ def _cached_expert_projection_triplet(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if device != "cuda":
         return _ORIGINAL_EXPERT_TRIPLET(root, layer_prefix, expert_id, device)
-
     layer_marker = ".layers."
     if layer_marker not in layer_prefix:
         return _ORIGINAL_EXPERT_TRIPLET(root, layer_prefix, expert_id, device)
-
     try:
         layer = int(layer_prefix.split(layer_marker, 1)[1].split(".", 1)[0])
     except (ValueError, IndexError):
         return _ORIGINAL_EXPERT_TRIPLET(root, layer_prefix, expert_id, device)
-
-    return _expert_cache(root).get_or_load(
-        cached._store(root), layer, expert_id, layer_prefix
-    )
+    return _expert_cache(root).get_or_load(cached._store(root), layer, expert_id, layer_prefix)
 
 
 def _cache_stats_with_experts(root: Path) -> dict[str, int | float]:
@@ -55,27 +50,28 @@ def _cache_stats_with_experts(root: Path) -> dict[str, int | float]:
     if cache is None:
         return stats
     expert = cache.snapshot()
-    stats.update(
-        {
-            "expert_cache_items": int(expert["items"]),
-            "expert_cache_bytes": int(expert["bytes"]),
-            "expert_cache_budget": int(expert["budget_bytes"]),
-            "expert_cache_total_slots": int(expert["total_slots"]),
-            "expert_cache_hits": int(expert["hits"]),
-            "expert_cache_misses": int(expert["misses"]),
-            "expert_cache_hit_rate": float(expert["hit_rate"]),
-            "expert_cache_loads": int(expert["loads"]),
-            "expert_cache_evictions": int(expert["evictions"]),
-            "expert_cache_hot_items": int(expert["hot_items"]),
-            "expert_cache_fp8_items": int(expert["warm_items"]),
-            "expert_cache_hot_hits": int(expert["hot_hits"]),
-            "expert_cache_fp8_hits": int(expert["fp8_hits"]),
-            "expert_cache_fp16_to_fp8": int(expert["fp16_to_fp8"]),
-            "expert_cache_fp8_drops": int(expert["q4_drops"]),
-            "expert_cache_stream_prefetch_hits": int(expert["stream_prefetch_hits"]),
-            "expert_cache_stream_prefetch_misses": int(expert["stream_prefetch_misses"]),
-        }
-    )
+    stats.update({
+        "expert_cache_items": int(expert["items"]),
+        "expert_cache_bytes": int(expert["bytes"]),
+        "expert_cache_budget": int(expert["budget_bytes"]),
+        "expert_cache_total_slots": int(expert["total_slots"]),
+        "expert_cache_hits": int(expert["hits"]),
+        "expert_cache_misses": int(expert["misses"]),
+        "expert_cache_hit_rate": float(expert["hit_rate"]),
+        "expert_cache_loads": int(expert["loads"]),
+        "expert_cache_evictions": int(expert["evictions"]),
+        "expert_cache_hot_items": int(expert["hot_items"]),
+        "expert_cache_fp8_items": int(expert["warm_items"]),
+        "expert_cache_q4_items": int(expert["cold_items"]),
+        "expert_cache_hot_hits": int(expert["hot_hits"]),
+        "expert_cache_fp8_hits": int(expert["fp8_hits"]),
+        "expert_cache_q4_hits": int(expert["q4_hits"]),
+        "expert_cache_fp16_to_fp8": int(expert["fp16_to_fp8"]),
+        "expert_cache_fp8_to_q4": int(expert["fp8_to_q4"]),
+        "expert_cache_q4_drops": int(expert["q4_drops"]),
+        "expert_cache_stream_prefetch_hits": int(expert["stream_prefetch_hits"]),
+        "expert_cache_stream_prefetch_misses": int(expert["stream_prefetch_misses"]),
+    })
     return stats
 
 
@@ -88,16 +84,14 @@ def _print_cache_with_experts(root: Path, label: str) -> None:
     print(
         f"  expert_cache: entries={expert['items']} | "
         f"vram={expert['bytes'] / 1024**2:.1f}/{expert['budget_bytes'] / 1024**2:.1f} MiB | "
-        f"hit_rate={expert['hit_rate']:.2f}% | "
-        f"hits={expert['hits']} | misses={expert['misses']} | "
-        f"loads={expert['loads']} | evictions={expert['evictions']}"
+        f"hit_rate={expert['hit_rate']:.2f}% | hits={expert['hits']} | "
+        f"misses={expert['misses']} | loads={expert['loads']} | evictions={expert['evictions']}"
     )
     print(
         f"    tiers: FP16={expert['hot_items']} | FP8={expert['warm_items']} | "
-        f"FP8_hits={expert['fp8_hits']} | "
-        f"compressions FP16>FP8={expert['fp16_to_fp8']} | "
-        f"FP8_drops={expert['q4_drops']} | "
-        f"stream_prefetch hits={expert['stream_prefetch_hits']} "
+        f"Q4={expert['cold_items']} | hits FP8={expert['fp8_hits']} Q4={expert['q4_hits']} | "
+        f"compressions FP16>FP8={expert['fp16_to_fp8']} FP8>Q4={expert['fp8_to_q4']} | "
+        f"drops={expert['q4_drops']} | prefetch hits={expert['stream_prefetch_hits']} "
         f"misses={expert['stream_prefetch_misses']}"
     )
 
@@ -111,10 +105,10 @@ def main() -> None:
     cache = _expert_cache(Path("."))
     print("expert_cache=complete-layer-expert")
     print("expert_cache_key=(layer,expert)")
-    print("expert_cache_policy=per-layer-tiered-2fp16-4fp8")
+    print("expert_cache_policy=per-layer-tiered-2fp16-4fp8-4q4")
     print("expert_cache_budget=full-stream-vram-budget")
-    print("expert_cache_entry=FP16-hot|FP8-warm")
-    print("expert_cache_eviction=compress-to-fp8-then-drop")
+    print("expert_cache_entry=FP16-hot|FP8-warm|Q4-cold")
+    print("expert_cache_eviction=compress-before-drop")
     print("expert_cache_fp8_promotion=transient-only")
     print("expert_cache_prefetch=raw-fp8-in-stream")
     print("expert_cache_compute=temporary-fp16")
@@ -122,7 +116,7 @@ def main() -> None:
     print(f"expert_cache_slots_per_layer={cache.slots_per_layer}")
     print(f"expert_cache_hot_slots_per_layer={cache.hot_slots}")
     print(f"expert_cache_fp8_slots_per_layer={cache.fp8_slots}")
-    print(f"expert_cache_q4_slots_per_layer=0")
+    print(f"expert_cache_q4_slots_per_layer={cache.q4_slots}")
     chat.main()
 
 
