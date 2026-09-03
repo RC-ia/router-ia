@@ -18,7 +18,6 @@ from .qwen36_mini_chat import load_final_norm, load_lm_head, load_tokenizer, sam
 
 DEFAULT_MAX_NEW_TOKENS = 4
 EXPERT_LOAD_WORKERS = max(1, int(os.getenv("QWEN36_EXPERT_LOAD_WORKERS", "8")))
-EXPERT_EAGER_COUNT = max(1, int(os.getenv("QWEN36_EXPERT_EAGER_COUNT", "2")))
 
 
 def cache_stats(root: Path) -> dict[str, int | float]:
@@ -77,6 +76,7 @@ def print_cache(root: Path, label: str) -> None:
 
 
 def _projection(root: Path, prefix: str, device: str) -> torch.Tensor:
+    """Load a dequantized projection through the hierarchical cache."""
     return cached._cached_load_projection(root, prefix, device)
 
 
@@ -95,24 +95,50 @@ def _expert_projection_triplet(
 
 
 def _warm_expert_raw_cache(root: Path, layer_prefix: str, expert_ids: list[int]) -> None:
+    """Ensure routed FP8 weights/scales are resident in RAM before GPU staging."""
     store = cached._store(root)
     for expert_id in expert_ids:
         expert_prefix = f"{layer_prefix}mlp.experts.{expert_id}"
-        for name in ("gate_proj", "up_proj", "down_proj"):
-            store.load(expert_prefix + f".{name}.weight", device="cpu")
-            store.load(expert_prefix + f".{name}.weight_scale_inv", device="cpu")
+        for name in (
+            "gate_proj.weight",
+            "gate_proj.weight_scale_inv",
+            "up_proj.weight",
+            "up_proj.weight_scale_inv",
+            "down_proj.weight",
+            "down_proj.weight_scale_inv",
+        ):
+            store.load(expert_prefix + "." + name, device="cpu")
 
 
-def _run_expert_group(
-    triplets: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-    moe_in: torch.Tensor,
-    weights: list[float],
+def batched_moe_step(
+    root: Path,
+    layer: int,
+    residual: torch.Tensor,
+    top_k: int,
     device: str,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, list[int], list[float], float, float]:
+    prefix = base.layer_prefix(layer)
+    post_norm = base.load_layer_weight(root, layer, "post_attention_layernorm.weight", device)
+    moe_in = base.rmsnorm(residual, post_norm).reshape(1, base.HIDDEN).float()
+    router_w = base.load_layer_weight(root, layer, "mlp.gate.weight", device).float()
+    routed = base.route(moe_in.reshape(-1), router_w, top_k=top_k)
+    expert_ids = [int(v) for v in routed.expert_ids.detach().cpu().tolist()]
+    weights = [float(v) for v in routed.weights.detach().cpu().tolist()]
+
+    if device == "cuda":
+        _warm_expert_raw_cache(root, prefix, expert_ids)
+
+    with ThreadPoolExecutor(max_workers=min(EXPERT_LOAD_WORKERS, len(expert_ids))) as pool:
+        futures = [
+            pool.submit(_expert_projection_triplet, root, prefix, expert_id, device)
+            for expert_id in expert_ids
+        ]
+        triplets = [future.result() for future in futures]
+
     gate_w = torch.stack([triplet[0] for triplet in triplets], dim=0)
     up_w = torch.stack([triplet[1] for triplet in triplets], dim=0)
     down_w = torch.stack([triplet[2] for triplet in triplets], dim=0)
-    batch_x = moe_in.expand(len(triplets), -1)
+    batch_x = moe_in.expand(len(expert_ids), -1)
 
     if device == "cuda":
         with torch.autocast(device_type="cuda", dtype=torch.float16):
@@ -130,58 +156,7 @@ def _run_expert_group(
         expert_out = torch.bmm(down_w, hidden.unsqueeze(-1)).squeeze(-1)
         routing = torch.tensor(weights, device=device, dtype=expert_out.dtype).reshape(-1, 1)
         routed_sum = (expert_out * routing).sum(dim=0, keepdim=True)
-
-    del gate_w, up_w, down_w, batch_x, gate, up, hidden, expert_out, routing
-    return routed_sum
-
-
-def batched_moe_step(
-    root: Path,
-    layer: int,
-    residual: torch.Tensor,
-    top_k: int,
-    device: str,
-) -> tuple[torch.Tensor, list[int], list[float], float, float]:
-    prefix = base.layer_prefix(layer)
-    post_norm = base.load_layer_weight(root, layer, "post_attention_layernorm.weight", device)
-    moe_in = base.rmsnorm(residual, post_norm).reshape(1, base.HIDDEN).float()
-    router_w = base.load_layer_weight(root, layer, "mlp.gate.weight", device).float()
-
-    routed = base.route(moe_in.reshape(-1), router_w, top_k=top_k)
-    expert_ids = [int(v) for v in routed.expert_ids.detach().cpu().tolist()]
-    weights = [float(v) for v in routed.weights.detach().cpu().tolist()]
-
-    if device == "cuda":
-        _warm_expert_raw_cache(root, prefix, expert_ids)
-
-    eager_count = min(EXPERT_EAGER_COUNT, len(expert_ids))
-    eager_ids = expert_ids[:eager_count]
-    eager_weights = weights[:eager_count]
-    rest_ids = expert_ids[eager_count:]
-    rest_weights = weights[eager_count:]
-
-    # Load a small eager group first. Remaining experts are staged in worker
-    # threads while the GPU executes this group, hiding H2D/dequant latency.
-    eager_triplets = [
-        _expert_projection_triplet(root, prefix, expert_id, device)
-        for expert_id in eager_ids
-    ]
-    rest_triplets: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-    executor = ThreadPoolExecutor(max_workers=min(EXPERT_LOAD_WORKERS, max(len(rest_ids), 1)))
-    futures = [
-        executor.submit(_expert_projection_triplet, root, prefix, expert_id, device)
-        for expert_id in rest_ids
-    ]
-
-    try:
-        routed_sum = _run_expert_group(eager_triplets, moe_in, eager_weights, device)
-        if futures:
-            rest_triplets = [future.result() for future in futures]
-            rest_out = _run_expert_group(rest_triplets, moe_in, rest_weights, device)
-            routed_sum = routed_sum + rest_out
-            del rest_out
-    finally:
-        executor.shutdown(wait=True)
+        batch_x_compute = batch_x
 
     shared_gate_w = base.load_layer_weight(root, layer, "mlp.shared_expert_gate.weight", device).float()
     shared_gate_proj = _projection(root, f"{prefix}mlp.shared_expert.gate_proj", device)
@@ -204,9 +179,10 @@ def batched_moe_step(
     moe_input_norm = float(torch.linalg.vector_norm(moe_in).item())
 
     del post_norm, moe_in, router_w, routed
-    del eager_triplets, rest_triplets, futures
+    del triplets, gate_w, up_w, down_w, batch_x, batch_x_compute
+    del gate, up, hidden, expert_out, routing, routed_sum
     del shared_gate_w, shared_gate, shared_gate_proj, shared_up_proj, shared_down_proj
-    del shared_hidden, shared_out, moe_out, routed_sum
+    del shared_hidden, shared_out, moe_out
     return layer_out, expert_ids, weights, shared_gate_value, moe_input_norm
 
 
@@ -223,7 +199,6 @@ def run_generated_token(
 ) -> tuple[int, float, float]:
     start = perf_counter()
     x = base.load_embedding_row(root, token_id).reshape(1, base.HIDDEN).to(device).float()
-
     for layer in range(base.DEFAULT_LAYERS):
         kind = base.attention_type(root, layer)
         if kind == "linear_attention":
@@ -252,7 +227,6 @@ def run_generated_token(
         torch.cuda.synchronize()
     elapsed = perf_counter() - start
     peak_logit = float(torch.max(logits.float()).item())
-
     del x, logits
     if device == "cuda":
         del final_norm_runtime, lm_head_runtime
@@ -260,67 +234,39 @@ def run_generated_token(
     return next_id, elapsed, peak_logit
 
 
-def generate_response(
-    root: Path,
-    prompt: str,
-    tokenizer,
-    final_norm: torch.Tensor,
-    lm_head: torch.Tensor,
-    final_norm_name: str,
-    lm_head_name: str,
-    device: str,
-    max_new_tokens: int,
-    sampling_top_k: int,
-    temperature: float,
-) -> None:
+def generate_response(root: Path, prompt: str, tokenizer, final_norm: torch.Tensor, lm_head: torch.Tensor, final_norm_name: str, lm_head_name: str, device: str, max_new_tokens: int, sampling_top_k: int, temperature: float) -> None:
     prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
     if not prompt_ids:
         print("IA> [nenhum token produzido pelo tokenizer]")
         return
-
     current_id = int(prompt_ids[-1])
     eos_id = getattr(tokenizer, "eos_token_id", None)
     generated: list[int] = []
-
     print(f"\nVocê> {prompt}")
     print(f"  prompt tokens={len(prompt_ids)} | seed_token={current_id}")
     print("IA> ", end="", flush=True)
-
     turn_start = perf_counter()
     for step in range(1, max_new_tokens + 1):
         before = cache_stats(root)
-        next_id, elapsed, peak = run_generated_token(
-            root, current_id, final_norm, lm_head,
-            final_norm_name, lm_head_name, device,
-            sampling_top_k, temperature,
-        )
+        next_id, elapsed, peak = run_generated_token(root, current_id, final_norm, lm_head, final_norm_name, lm_head_name, device, sampling_top_k, temperature)
         after = cache_stats(root)
-
         delta_hits = int(after.get("hits", 0)) - int(before.get("hits", 0))
         delta_misses = int(after.get("misses", 0)) - int(before.get("misses", 0))
         step_hit_rate = delta_hits / max(delta_hits + delta_misses, 1) * 100.0
-
         generated.append(next_id)
         current_id = next_id
         text = tokenizer.decode([next_id], skip_special_tokens=True)
         print(text, end="", flush=True)
         print(
-            f"\n  [step {step:02d}] token={next_id} | "
-            f"time={elapsed:.3f}s | "
-            f"step_hit_rate={step_hit_rate:.1f}% | "
-            f"global_hit_rate={after.get('hit_rate', 0.0):.2f}% | "
-            f"ram_hit={after.get('ram_hit_rate', 0.0):.2f}% | "
-            f"vram_hit={after.get('vram_hit_rate', 0.0):.2f}% | "
-            f"expert_vram_hit={after.get('vram_expert_hit_rate', 0.0):.2f}% | "
-            f"stream_hit={after.get('vram_stream_hit_rate', 0.0):.2f}% | "
-            f"hits+{delta_hits} misses+{delta_misses} | "
-            f"peak_logit={peak:.4f}",
+            f"\n  [step {step:02d}] token={next_id} | time={elapsed:.3f}s | "
+            f"step_hit_rate={step_hit_rate:.1f}% | global_hit_rate={after.get('hit_rate', 0.0):.2f}% | "
+            f"ram_hit={after.get('ram_hit_rate', 0.0):.2f}% | vram_hit={after.get('vram_hit_rate', 0.0):.2f}% | "
+            f"expert_vram_hit={after.get('vram_expert_hit_rate', 0.0):.2f}% | stream_hit={after.get('vram_stream_hit_rate', 0.0):.2f}% | "
+            f"hits+{delta_hits} misses+{delta_misses} | peak_logit={peak:.4f}",
             flush=True,
         )
-
         if eos_id is not None and next_id == int(eos_id):
             break
-
     print()
     print(f"  resposta: {len(generated)} tokens | wall={perf_counter() - turn_start:.3f}s")
     print_cache(root, "after turn")
@@ -334,17 +280,14 @@ def main() -> None:
     parser.add_argument("--sampling-top-k", type=int, default=20)
     parser.add_argument("--temperature", type=float, default=0.0)
     args = parser.parse_args()
-
     root = args.model_dir.resolve()
     device = args.device.lower()
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but not available")
-
     cached._configure_vram_limit(device)
     tokenizer = load_tokenizer(root)
-    final_norm, final_norm_name = load_final_norm(root, device)
-    lm_head, lm_head_name = load_lm_head(root, device)
-
+    final_norm_name, final_norm = load_final_norm(root)
+    lm_head_name, lm_head, _lm_head_mode = load_lm_head(root)
     print("op=batch-mini-chat")
     print("mode=experimental-stateless-autoregressive")
     print("warning=no DeltaNet recurrent state or full-attention KV cache yet")
@@ -353,7 +296,6 @@ def main() -> None:
     print("vram_dequantized_cache=fp16")
     print("cuda_compute=fp16-autocast")
     print(f"expert_load_workers={EXPERT_LOAD_WORKERS}")
-    print(f"expert_eager_count={EXPERT_EAGER_COUNT}")
     print("expert_prefetch=stream-overlap")
     print("expert_compressed_tiers=FP16-hot|FP8-resident")
     print("expert_eviction=FP16-drop|FP8-drop")
@@ -367,25 +309,12 @@ def main() -> None:
     print(f"temperature={args.temperature}")
     print(f"lm_head={lm_head_name} shape={tuple(lm_head.shape)}")
     print(f"final_norm={final_norm_name} shape={tuple(final_norm.shape)}")
-
     print_cache(root, "initial")
-    prompts = [
-        "Olá",
-        "Como você está?",
-        "Explique o que é uma CPU",
-        "Quanto é 2 + 2?",
-    ]
-    total_start = perf_counter()
+    prompts = ["Olá", "Como você está?", "Explique o que é uma CPU", "Quanto é 2 + 2?"]
     for prompt in prompts:
-        generate_response(
-            root, prompt, tokenizer, final_norm, lm_head,
-            final_norm_name, lm_head_name, device,
-            args.max_new_tokens, args.sampling_top_k, args.temperature,
-        )
-
+        generate_response(root, prompt, tokenizer, final_norm, lm_head, final_norm_name, lm_head_name, device, args.max_new_tokens, args.sampling_top_k, args.temperature)
     print("\n===== SUMMARY =====")
-    print(f"turns={len(prompts)}")
-    print(f"total_wall={perf_counter() - total_start:.3f}s")
+    print("turns=4")
     print_cache(root, "final")
 
 
