@@ -165,7 +165,9 @@ def _linear_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> t
     gated, _, _ = gated_rmsnorm(attn, z, norm_w)
 
     out_w = _projection(root, prefix + "linear_attn.out_proj", device)
-    gated_compute = gated.reshape(1, base.LINEAR_VALUE_DIM).to(dtype=out_w.dtype if device == "cuda" else compute_dtype)
+    gated_compute = gated.reshape(1, base.LINEAR_VALUE_DIM).to(
+        dtype=out_w.dtype if device == "cuda" else compute_dtype
+    )
     attn_projected = F.linear(gated_compute, out_w).float()
     residual = x0.reshape(1, base.HIDDEN).float() + attn_projected
 
@@ -212,9 +214,10 @@ def _full_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> tor
     state.full_values[int(layer)] = full_v.detach()
 
     k_expanded = full_k.repeat_interleave(base.FULL_NUM_KV_GROUPS, dim=1)
-    v_expanded = full_v.repeat_interleave(base.FULL_NUM_KV_GROUPS, dim=1)
-    scores = torch.matmul(q.unsqueeze(2), k_expanded.transpose(-1, -2)).squeeze(-2) * (base.FULL_HEAD_DIM ** -0.5)
-    attn_weights = torch.softmax(scores.float(), dim=-1)
+    v_expanded = full_v.repeat_interleave(base.FULL_NUM_KV_GROUPS, dim=1).float()
+    q_float = q.float()
+    scores = torch.matmul(q_float.unsqueeze(2), k_expanded.transpose(-1, -2)) * (base.FULL_HEAD_DIM ** -0.5)
+    attn_weights = torch.softmax(scores, dim=-1)
     attn = torch.matmul(attn_weights.unsqueeze(-2), v_expanded).squeeze(-2)
     attn = attn * torch.sigmoid(gate.float())
     attn_flat = attn.reshape(1, base.FULL_Q_DIM).to(dtype=compute_dtype)
@@ -224,8 +227,8 @@ def _full_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> tor
     residual = x0.reshape(1, base.HIDDEN).float() + attn_projected
 
     del input_norm, h, h_compute, q_w, k_w, v_w, q_gate, q, gate, k, v
-    del q_norm_w, k_norm_w, k_token, v_token, k_expanded, v_expanded, scores, attn_weights, attn
-    del attn_flat, out_w, attn_projected
+    del q_norm_w, k_norm_w, k_token, v_token, k_expanded, v_expanded, q_float
+    del scores, attn_weights, attn, attn_flat, out_w, attn_projected
     return residual
 
 
