@@ -81,6 +81,7 @@ def gated_delta_recurrent(query: torch.Tensor, key: torch.Tensor, value: torch.T
     """HF-style recurrent gated-delta update using FP32 internal state/math."""
     batch, seq_len, num_heads, k_dim = query.shape
     v_heads, v_dim = value.shape[2], value.shape[3]
+    initial_dtype = query.dtype
     q = query.transpose(1, 2).contiguous().float()
     k = key.transpose(1, 2).contiguous().float()
     v = value.transpose(1, 2).contiguous().float()
@@ -108,7 +109,7 @@ def gated_delta_recurrent(query: torch.Tensor, key: torch.Tensor, value: torch.T
         delta = (v_t - kv_mem) * beta_t
         recurrent = recurrent + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
         outputs[:, :, i] = (recurrent * q_t.unsqueeze(-1)).sum(dim=-2)
-    return outputs.transpose(1, 2).contiguous(), recurrent.detach()
+    return outputs.transpose(1, 2).contiguous().to(dtype=initial_dtype), recurrent.detach()
 
 
 def linear_attention_step(root: Path, layer: int, x0: torch.Tensor, conv_state: torch.Tensor | None, recurrent_state: torch.Tensor | None, device: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -135,7 +136,7 @@ def linear_attention_step(root: Path, layer: int, x0: torch.Tensor, conv_state: 
     v = v_flat.reshape(1, base.LINEAR_NUM_V_HEADS, HEAD_DIM)
 
     a = F.linear(h, a_w).reshape(1, base.LINEAR_NUM_V_HEADS).float()
-    b = F.linear(h, b_w).reshape(1, base.LINEAR_NUM_V_HEADS).float()
+    b = F.linear(h, b_w).reshape(1, base.LINEAR_NUM_V_HEADS)
     beta = torch.sigmoid(b)
     a_log = load_vector(root, layer, "linear_attn.A_log", device).reshape(1, base.LINEAR_NUM_V_HEADS)
     dt_bias = load_vector(root, layer, "linear_attn.dt_bias", device).reshape(1, base.LINEAR_NUM_V_HEADS)
