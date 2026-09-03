@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import gc
+import json
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from safetensors import safe_open
 
 from . import qwen36_attention_cache as attention
 from . import qwen36_40layer_loop as base
@@ -22,16 +24,25 @@ from .qwen36_layer_fidelity_probe import (
     _stage_stats,
 )
 from .qwen36_op_probe import load_embedding_row, rmsnorm
-from safetensors import safe_open
-import json
 
 
-def report(name: str, ref: torch.Tensor, got: torch.Tensor, tol: float) -> None:
+def report(name: str, ref: torch.Tensor, got: torch.Tensor, tol: float) -> bool:
     s = _stage_stats(ref, got)
+    ok = s[0] <= tol
     print(
-        f"  {name:<36} {'PASS' if s[0] <= tol else 'FAIL'} "
+        f"  {name:<36} {'PASS' if ok else 'FAIL'} "
         f"max_abs={s[0]:.6g} mean_abs={s[1]:.6g} rel={s[2]:.6g} cosine={s[3]:.9f}"
     )
+    return ok
+
+
+def _token_channel_view(x: torch.Tensor) -> torch.Tensor:
+    """Normalize one-token [B,C] / [B,C,1] tensors to [B,C]."""
+    if x.ndim == 2:
+        return x
+    if x.ndim == 3 and x.shape[-1] == 1:
+        return x[..., 0]
+    raise ValueError(f"Expected one-token conv tensor [B,C] or [B,C,1], got {tuple(x.shape)}")
 
 
 def raw_weight(root: Path, name: str) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -45,7 +56,8 @@ def raw_weight(root: Path, name: str) -> tuple[torch.Tensor, torch.Tensor | None
     for shard in shards:
         with safe_open(str(shard), framework="pt", device="cpu") as handle:
             if name in handle.keys():
-                return handle.get_tensor(name), handle.get_tensor(scale_name) if scale_name in handle.keys() else None
+                scale = handle.get_tensor(scale_name) if scale_name in handle.keys() else None
+                return handle.get_tensor(name), scale
     raise KeyError(name)
 
 
@@ -87,7 +99,6 @@ def main() -> int:
     print(f"op=linear-attention-conv-precision layer={args.layer} tokens={args.tokens} device={args.device} tolerance={args.tolerance} materialized={loaded}/{total}")
     print(f"qkv_test_dtype={qkv_weight.dtype} reference_conv_weight_dtype={conv_ref_w.dtype} runtime_conv_weight_dtype={conv_run_w.dtype} reference_conv_weight_shape={tuple(conv_ref_w.shape)}")
 
-    ref_cache = _make_reference_cache(config)
     qwen, originals = _patch_official_conv()
     state = attention.state_for(root, args.device)
     original_projection = attention._projection
@@ -112,7 +123,7 @@ def main() -> int:
         state_len = conv_state.shape[-1]
         out = F.conv1d(mixed, weight.unsqueeze(1), bias, padding=0, groups=hidden_states.shape[1])[:, :, -hidden_states.shape[-1]:]
         if activation is not None:
-            out = F.silu(out)
+            out = torch.nn.functional.silu(out)
         conv_state.copy_(mixed[:, :, -state_len:])
         ref_outputs.append(out.detach().clone())
         ref_states.append(conv_state.detach().clone())
@@ -122,7 +133,7 @@ def main() -> int:
         ref_inputs.append(hidden_states.detach().clone())
         out = F.conv1d(hidden_states.to(weight.dtype), weight.unsqueeze(1), bias, padding=weight.shape[-1] - 1, groups=hidden_states.shape[1])[:, :, :hidden_states.shape[-1]]
         if activation is not None:
-            out = F.silu(out)
+            out = torch.nn.functional.silu(out)
         ref_outputs.append(out.detach().clone())
         return out.to(hidden_states.dtype)
 
@@ -138,12 +149,14 @@ def main() -> int:
     attention._projection = projection
     attention._causal_conv1d_step = run_conv
 
-    ok = True
+    all_ok = True
     try:
-        for pos, token0 in enumerate(tokens):
+        for pos in range(args.tokens):
             state.reset()
             ref_cache = _make_reference_cache(config)
-            # Replay prefix for recurrent tokens.
+            ref_inputs.clear(); ref_outputs.clear(); ref_states.clear()
+            run_inputs.clear(); run_outputs.clear(); run_states.clear()
+
             for i in range(pos + 1):
                 token = tokens[i].to(dtype=input_dtype)
                 normed = rmsnorm(token, input_norm)
@@ -152,40 +165,24 @@ def main() -> int:
                     ref = ref[0]
                 attention.step_attention(root, args.layer, token, args.device)
 
-            ri = ref_inputs[-1]
-            rr = ref_outputs[-1]
-            gi = run_inputs[-1]
-            gr = run_outputs[-1]
-            rs = ref_states[-1] if pos > 0 else None
-            gs = run_states[-1]
-
-            if ri.ndim == 3 and gi.ndim == 2:
-                gi_cmp = gi.unsqueeze(-1)
-            else:
-                gi_cmp = gi
-            if rr.ndim == 3 and gr.ndim == 2:
-                gr_cmp = gr.unsqueeze(-1)
-            else:
-                gr_cmp = gr
+            ri = _token_channel_view(ref_inputs[-1])
+            rr = _token_channel_view(ref_outputs[-1])
+            gi = _token_channel_view(run_inputs[-1])
+            gr = _token_channel_view(run_outputs[-1])
+            rs = ref_states[-1] if pos > 0 and ref_states else None
+            gs = run_states[-1] if run_states else None
 
             print(f"\nTOKEN {pos}")
-            report("conv_input", ri, gi_cmp, args.tolerance)
-            report("conv_output", rr, gr_cmp, args.tolerance)
-            if rs is not None:
-                report("conv_state_after", rs, gs, args.tolerance)
-            print(f"  ref_conv_input_dtype={ri.dtype} runtime_conv_input_dtype={gi.dtype} ref_conv_output_dtype={rr.dtype} runtime_conv_output_dtype={gr.dtype}")
+            all_ok &= report("conv_input", ri, gi, args.tolerance)
+            all_ok &= report("conv_output", rr, gr, args.tolerance)
+            if rs is not None and gs is not None:
+                all_ok &= report("conv_state_after", rs, gs, args.tolerance)
 
-            # Compare the same QKV using reference conv weight vs runtime conv weight, isolated from all later stages.
-            qkv = qkv_weight
-            q = F.linear(rmsnorm(token0.to(dtype=input_dtype), input_norm).to(qkv.dtype), qkv).reshape(1, base.LINEAR_KEY_DIM * 2 + base.LINEAR_VALUE_DIM)
-            q3 = q.reshape(1, q.shape[-1], 1)
-            rw = conv_ref_w.to(args.device)
-            tw = conv_run_w.to(args.device)
-            ref_direct = F.silu(F.conv1d(q3.to(rw.dtype), rw, padding=0 if pos else 3, groups=q.shape[-1]))
-            if pos == 0:
-                ref_direct = ref_direct[:, :, :1]
-            report("conv_direct_reference_weight", rr, ref_direct, args.tolerance)
-            report("conv_weight_vs_reference", conv_ref_w, conv_run_w, args.tolerance)
+            print(f"  ref_conv_input_dtype={ref_inputs[-1].dtype} runtime_conv_input_dtype={run_inputs[-1].dtype} ref_conv_output_dtype={ref_outputs[-1].dtype} runtime_conv_output_dtype={run_outputs[-1].dtype}")
+
+            print(f"  conv_ref_weight_dtype={conv_ref_w.dtype} conv_runtime_weight_dtype={conv_run_w.dtype}")
+            all_ok &= report("conv_weight_vs_reference", conv_ref_w, conv_run_w, args.tolerance)
+
     finally:
         attention._projection = original_projection
         attention._causal_conv1d_step = original_runtime_conv
@@ -197,7 +194,8 @@ def main() -> int:
         if args.device == "cuda":
             torch.cuda.empty_cache()
 
-    return 0 if ok else 1
+    print(f"\nRESULT status={'PASS' if all_ok else 'FAIL'}")
+    return 0 if all_ok else 1
 
 
 if __name__ == "__main__":
