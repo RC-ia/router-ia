@@ -1,12 +1,6 @@
 from __future__ import annotations
 
-"""Qwen3.6 chat runner with persistent adaptive per-layer expert GPU cache.
-
-Routed experts are cached as complete (layer, expert) triplets. Each entry
-contains gate/up/down FP16 matrices and is evicted atomically. Every layer
-keeps a small protected minimum while a shared overflow LRU lets hot layers
-consume spare expert slots.
-"""
+"""Qwen3.6 chat runner with persistent per-layer expert GPU cache."""
 
 from pathlib import Path
 
@@ -66,6 +60,7 @@ def _cache_stats_with_experts(root: Path) -> dict[str, int | float]:
             "expert_cache_items": int(expert["items"]),
             "expert_cache_bytes": int(expert["bytes"]),
             "expert_cache_budget": int(expert["budget_bytes"]),
+            "expert_cache_total_slots": int(expert["total_slots"]),
             "expert_cache_hits": int(expert["hits"]),
             "expert_cache_misses": int(expert["misses"]),
             "expert_cache_hit_rate": float(expert["hit_rate"]),
@@ -102,16 +97,15 @@ chat.print_cache = _print_cache_with_experts
 
 
 def main() -> None:
-    cache = RoutedExpertCache(cached.STREAM_BUDGET_BYTES)
+    cache = _expert_cache(Path("."))
     print("expert_cache=complete-layer-expert")
     print("expert_cache_key=(layer,expert)")
-    print("expert_cache_policy=per-layer-minimum+shared-lru")
+    print("expert_cache_policy=per-layer-5-lru")
     print("expert_cache_budget=full-stream-vram-budget")
     print("expert_cache_entry=gate+up+down-fp16")
     print("expert_cache_eviction=whole-expert")
     print(f"expert_cache_total_slots={cache.total_slots}")
-    print(f"expert_cache_min_slots_per_layer={cache.min_slots_per_layer}")
-    print(f"expert_cache_shared_slots={cache.shared_slots}")
+    print(f"expert_cache_slots_per_layer={cache.slots_per_layer}")
     chat.main()
 
 
