@@ -180,42 +180,33 @@ class RoutedExpertCache:
         for name in ("gate_proj", "up_proj", "down_proj"):
             self._raw_projection_for_gpu(store, prefix + "." + name)
 
-    def get(self, layer: int, expert_id: int):
-        results = self.get_batch(layer, [expert_id])
-        if not results:
-            return None
-        return results[0]
-
-    def _find_compressed_locked(self, layer: int, expert_id: int):
-        fp8 = self.fp8_entries.setdefault(layer, OrderedDict())
-        entry = fp8.get(expert_id)
-        if entry is not None:
-            self.hits += 1
-            self.fp8_hits += 1
-            fp8.move_to_end(expert_id)
-            return "fp8", entry
-        q4 = self.q4_entries.setdefault(layer, OrderedDict())
-        entry_q4 = q4.get(expert_id)
-        if entry_q4 is not None:
-            self.hits += 1
-            self.q4_hits += 1
-            q4.move_to_end(expert_id)
-            return "q4", entry_q4
-        self.misses += 1
-        return None, None
-
-    def get_batch(self, layer: int, expert_ids: list[int]) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """Return a routed expert batch, dequantized on CUDA in grouped kernels."""
-        layer = int(layer)
-        ids = [int(x) for x in expert_ids]
+    def _lookup_batch_locked(self, layer: int, expert_ids: list[int]):
         found: list[tuple[str | None, WarmEntry | ColdEntry | None]] = []
-        with self.lock:
-            for expert_id in ids:
-                found.append(self._find_compressed_locked(layer, expert_id))
+        for expert_id in expert_ids:
+            fp8 = self.fp8_entries.setdefault(layer, OrderedDict())
+            entry = fp8.get(expert_id)
+            if entry is not None:
+                self.hits += 1
+                self.fp8_hits += 1
+                fp8.move_to_end(expert_id)
+                found.append(("fp8", entry))
+                continue
+            q4 = self.q4_entries.setdefault(layer, OrderedDict())
+            entry_q4 = q4.get(expert_id)
+            if entry_q4 is not None:
+                self.hits += 1
+                self.q4_hits += 1
+                q4.move_to_end(expert_id)
+                found.append(("q4", entry_q4))
+                continue
+            self.misses += 1
+            found.append((None, None))
+        return found
 
+    def _decode_found_batch(self, found):
         fp8_positions = [i for i, (tier, _) in enumerate(found) if tier == "fp8"]
         q4_positions = [i for i, (tier, _) in enumerate(found) if tier == "q4"]
-        result: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None] = [None] * len(ids)
+        result: list[list[torch.Tensor | None] | None] = [None] * len(found)
 
         if fp8_positions:
             for projection in range(3):
@@ -224,18 +215,30 @@ class RoutedExpertCache:
                 decoded = dequant.dequantize_fp8_blockwise_batch(weights, scales).to(dtype=torch.float16)
                 for local, position in enumerate(fp8_positions):
                     if result[position] is None:
-                        result[position] = [None, None, None]  # type: ignore[list-item]
-                    result[position][projection] = decoded[local]  # type: ignore[index]
+                        result[position] = [None, None, None]
+                    result[position][projection] = decoded[local]
 
         if q4_positions:
             for projection in range(3):
                 decoded = _q4_dequantize_entry_batch([found[i][1] for i in q4_positions], projection)  # type: ignore[list-item]
                 for local, position in enumerate(q4_positions):
                     if result[position] is None:
-                        result[position] = [None, None, None]  # type: ignore[list-item]
-                    result[position][projection] = decoded[local]  # type: ignore[index]
+                        result[position] = [None, None, None]
+                    result[position][projection] = decoded[local]
 
         return [tuple(item) for item in result if item is not None]  # type: ignore[arg-type]
+
+    def get(self, layer: int, expert_id: int):
+        results = self.get_batch(layer, [expert_id])
+        return results[0] if results else None
+
+    def get_batch(self, layer: int, expert_ids: list[int]) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Return cached experts, grouped by projection, with CUDA dequantization."""
+        layer = int(layer)
+        ids = [int(x) for x in expert_ids]
+        with self.lock:
+            found = self._lookup_batch_locked(layer, ids)
+        return self._decode_found_batch(found)
 
     def _insert_fp8_locked(self, layer: int, expert_id: int, entry: WarmEntry) -> None:
         bank = self.fp8_entries.setdefault(layer, OrderedDict())
@@ -279,70 +282,51 @@ class RoutedExpertCache:
         hit = self.get(layer, expert_id)
         if hit is not None:
             return hit
-
         expert_prefix = f"{layer_prefix}mlp.experts.{int(expert_id)}"
-        raw_weights = []
-        raw_scales = []
+        raw_weights, raw_scales = [], []
         for name in ("gate_proj", "up_proj", "down_proj"):
             w, s = self._raw_projection_for_gpu(store, expert_prefix + "." + name)
-            raw_weights.append(w)
-            raw_scales.append(s)
-
+            raw_weights.append(w); raw_scales.append(s)
         if all(w.dtype == torch.float8_e4m3fn for w in raw_weights):
-            entry_fp8: WarmEntry = (
-                (raw_weights[0], raw_scales[0]),
-                (raw_weights[1], raw_scales[1]),
-                (raw_weights[2], raw_scales[2]),
-            )
+            entry_fp8: WarmEntry = ((raw_weights[0], raw_scales[0]), (raw_weights[1], raw_scales[1]), (raw_weights[2], raw_scales[2]))
             with self.lock:
-                self._insert_fp8_locked(int(layer), int(expert_id), entry_fp8)
-                self.loads += 1
+                self._insert_fp8_locked(int(layer), int(expert_id), entry_fp8); self.loads += 1
             return tuple(_fp8_dequantize_matrix(m) for m in entry_fp8)
-
         entry_fp16: FP16Entry = tuple(w.to(device="cuda", dtype=torch.float16) for w in raw_weights)  # type: ignore[assignment]
         self.put_fp16(layer, expert_id, entry_fp16)
         return entry_fp16
 
     def get_or_load_batch(self, store, layer: int, expert_ids: list[int], layer_prefix: str) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """Load misses into compressed GPU storage, then batch-dequantize all routed experts."""
+        """Load routed misses into GPU-compressed storage, then decode the whole route as a batch."""
+        layer = int(layer)
+        ids = [int(x) for x in expert_ids]
         misses: list[int] = []
-        for expert_id in expert_ids:
-            tier, _ = self._peek(layer, int(expert_id))
-            if tier is None:
-                misses.append(int(expert_id))
+        with self.lock:
+            for expert_id in ids:
+                fp8 = self.fp8_entries.setdefault(layer, OrderedDict())
+                q4 = self.q4_entries.setdefault(layer, OrderedDict())
+                if expert_id not in fp8 and expert_id not in q4:
+                    misses.append(expert_id)
 
         for expert_id in misses:
             expert_prefix = f"{layer_prefix}mlp.experts.{expert_id}"
-            raw_weights = []
-            raw_scales = []
+            raw_weights, raw_scales = [], []
             for name in ("gate_proj", "up_proj", "down_proj"):
                 w, s = self._raw_projection_for_gpu(store, expert_prefix + "." + name)
-                raw_weights.append(w)
-                raw_scales.append(s)
-            if not all(w.dtype == torch.float8_e4m3fn for w in raw_weights):
-                raw_weights = [w.to(device="cuda", dtype=torch.float16) for w in raw_weights]
-                compact = _fp8_quantize_entry(tuple(raw_weights))  # type: ignore[arg-type]
+                raw_weights.append(w); raw_scales.append(s)
+            raw_is_fp8 = all(w.dtype == torch.float8_e4m3fn for w in raw_weights)
+            if raw_is_fp8:
+                compact: WarmEntry = ((raw_weights[0], raw_scales[0]), (raw_weights[1], raw_scales[1]), (raw_weights[2], raw_scales[2]))
             else:
-                compact = (
-                    (raw_weights[0], raw_scales[0]),
-                    (raw_weights[1], raw_scales[1]),
-                    (raw_weights[2], raw_scales[2]),
-                )
+                fp16 = tuple(w.to(device="cuda", dtype=torch.float16) for w in raw_weights)
+                compact = _fp8_quantize_entry(fp16)  # type: ignore[arg-type]
             with self.lock:
-                self._insert_fp8_locked(int(layer), expert_id, compact)  # type: ignore[arg-type]
+                self._insert_fp8_locked(layer, expert_id, compact)
                 self.loads += 1
-                if all(w.dtype != torch.float8_e4m3fn for w in raw_weights):
+                if not raw_is_fp8:
                     self.fp16_to_fp8 += 1
 
-        return self.get_batch(layer, [int(x) for x in expert_ids])
-
-    def _peek(self, layer: int, expert_id: int):
-        with self.lock:
-            if expert_id in self.fp8_entries.setdefault(int(layer), OrderedDict()):
-                return "fp8", self.fp8_entries[int(layer)][expert_id]
-            if expert_id in self.q4_entries.setdefault(int(layer), OrderedDict()):
-                return "q4", self.q4_entries[int(layer)][expert_id]
-            return None, None
+        return self.get_batch(layer, ids)
 
     def snapshot(self) -> dict[str, int | float]:
         with self.lock:
@@ -385,7 +369,5 @@ class RoutedExpertCache:
     def clear(self) -> None:
         with self.lock:
             for layer in range(self.layers):
-                self.fp8_entries[layer].clear()
-                self.q4_entries[layer].clear()
-            self.entry_bytes.clear()
-            self.bytes_used = 0
+                self.fp8_entries[layer].clear(); self.q4_entries[layer].clear()
+            self.entry_bytes.clear(); self.bytes_used = 0
