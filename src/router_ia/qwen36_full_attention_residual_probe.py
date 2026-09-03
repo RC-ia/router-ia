@@ -133,8 +133,12 @@ def capture_runtime(fn):
         captured["einsum"].append((equation, out.detach().clone()))
         return out
 
-    def softmax(input, dim=None, _stacklevel=3, dtype=None):
-        out = orig_softmax(input, dim=dim, _stacklevel=_stacklevel, dtype=dtype)
+    def softmax(input, dim=-1, _stacklevel=3, dtype=None):
+        kwargs = {"dim": dim}
+        if dtype is not None:
+            kwargs["dtype"] = dtype
+
+        out = orig_softmax(input, **kwargs)
         captured["softmax"].append(out.detach().clone())
         return out
 
