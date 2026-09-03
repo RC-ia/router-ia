@@ -21,10 +21,10 @@ def load_reference_model(root: Path, *, device: str):
 
     config = AutoConfig.from_pretrained(str(root), local_files_only=True)
 
-    # Some recent Transformers releases inspect quantization_config during
-    # model construction and assume it is populated when an FP8 checkpoint is
-    # detected. On pre-FP8 GPUs we explicitly disable that path; the safetensor
-    # loader can then materialize the weights in the requested dtype.
+    # Recent Transformers releases inspect quantization_config during model
+    # construction. On GPUs that cannot execute the advertised FP8 format,
+    # disable the quantized construction path and let the checkpoint be
+    # materialized as ordinary PyTorch tensors.
     if hasattr(config, "quantization_config"):
         config.quantization_config = None
 
@@ -33,11 +33,19 @@ def load_reference_model(root: Path, *, device: str):
         "local_files_only": True,
         "low_cpu_mem_usage": True,
     }
+
     if device == "cuda":
         import torch
 
         kwargs["dtype"] = torch.bfloat16
+        # The reference model can exceed a single T4's VRAM. Accelerate may
+        # spill complete modules to disk; from_pretrained requires an explicit
+        # folder for that case, especially with MoE/internal weight formats.
+        offload_folder = root / ".reference_offload"
+        offload_folder.mkdir(parents=True, exist_ok=True)
         kwargs["device_map"] = "auto"
+        kwargs["offload_folder"] = str(offload_folder)
+        kwargs["offload_state_dict"] = True
     else:
         import torch
 
@@ -46,10 +54,11 @@ def load_reference_model(root: Path, *, device: str):
     try:
         model = AutoModelForCausalLM.from_pretrained(str(root), **kwargs)
     except TypeError:
-        # Compatibility with Transformers versions that still expose
+        # Compatibility with older Transformers releases that still expose
         # torch_dtype rather than dtype in from_pretrained.
         kwargs.pop("dtype", None)
         import torch
+
         kwargs["torch_dtype"] = torch.bfloat16 if device == "cuda" else torch.float32
         model = AutoModelForCausalLM.from_pretrained(str(root), **kwargs)
 
