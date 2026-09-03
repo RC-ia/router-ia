@@ -16,7 +16,10 @@ from .qwen36_op_probe import rmsnorm
 ROPE_THETA = 10_000_000.0
 ROPE_DIM = int(base.FULL_HEAD_DIM * 0.25)
 LINEAR_CONV_KERNEL = 4
-LINEAR_CONV_STATE = LINEAR_CONV_KERNEL - 1
+# Transformers keeps a full kernel-sized rolling conv buffer. The last three
+# entries are the previous tokens; the fourth slot is the current token after
+# each update. Keeping all four positions matches DynamicCache exactly.
+LINEAR_CONV_STATE = LINEAR_CONV_KERNEL
 LINEAR_CONV_DIM = base.LINEAR_KEY_DIM * 2 + base.LINEAR_VALUE_DIM
 
 
@@ -153,9 +156,10 @@ def _causal_conv1d_step(
 ) -> torch.Tensor:
     """Apply the exact one-token causal depthwise conv used by Qwen3.6.
 
-    The model uses kernel size 4 and therefore carries the previous three
-    pre-convolution QKV vectors between tokens. The cache stores those raw
-    vectors, then the current output is computed over ``[t-3, t-2, t-1, t]``.
+    The model uses kernel size 4 and keeps a rolling four-position state,
+    matching Transformers' ``LinearAttentionLayer`` cache. The current token
+    is appended before the convolution and remains in the final state, while
+    the convolution itself reads the final four positions.
     """
     if mixed_qkv.ndim != 2 or mixed_qkv.shape != (1, LINEAR_CONV_DIM):
         raise ValueError(f"Unexpected mixed_qkv shape: {tuple(mixed_qkv.shape)}")
