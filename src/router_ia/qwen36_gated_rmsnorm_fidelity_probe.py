@@ -35,35 +35,6 @@ def report(name: str, reference: torch.Tensor, candidate: torch.Tensor, toleranc
     return status == "PASS"
 
 
-def official_gated_norm(layer, x: torch.Tensor, z: torch.Tensor):
-    """Run only the official Transformers Gated RMSNorm module."""
-    captured: dict[str, torch.Tensor] = {}
-
-    def pre(module, args):
-        captured["x"] = args[0].detach().clone()
-        captured["z"] = args[1].detach().clone()
-
-    def post(module, args, output):
-        if isinstance(output, tuple):
-            output = output[0]
-        captured["y"] = output.detach().clone()
-
-    h1 = layer.linear_attn.norm.register_forward_pre_hook(pre)
-    h2 = layer.linear_attn.norm.register_forward_hook(post)
-    try:
-        # Calling the module directly avoids any recurrence/projection drift.
-        output = layer.linear_attn.norm(x, z)
-        if isinstance(output, tuple):
-            output = output[0]
-    finally:
-        h1.remove()
-        h2.remove()
-    captured.setdefault("x", x.detach().clone())
-    captured.setdefault("z", z.detach().clone())
-    captured.setdefault("y", output.detach().clone())
-    return captured
-
-
 def isolated_reference(x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor):
     """Literal implementation of the expected Qwen Gated RMSNorm semantics."""
     input_dtype = x.dtype
@@ -94,8 +65,6 @@ def run(root: Path, layer, layer_idx: int, hidden: torch.Tensor, device: str, to
     input_weight = base.load_layer_weight(root, layer_idx, "input_layernorm.weight", device)
     normed = rmsnorm(hidden, input_weight)
 
-    # Build deterministic, independent inputs for the norm itself by running
-    # the official linear-attention block once and capturing its norm inputs.
     def official_attention():
         y = layer.linear_attn(hidden_states=normed.unsqueeze(1), cache_params=None, attention_mask=None)
         if isinstance(y, tuple):
@@ -118,15 +87,21 @@ def run(root: Path, layer, layer_idx: int, hidden: torch.Tensor, device: str, to
     finally:
         layer.linear_attn.norm.forward = original_forward
 
+    # Transformers can expose per-head tensors as (heads, head_dim), while
+    # the router contract is (batch, heads, head_dim). Canonicalize the
+    # representation; RMSNorm itself always operates over the final axis.
     x = official_capture["x"]
     z = official_capture["z"]
     official_y = official_capture["y"]
+    if x.ndim == 2:
+        x = x.unsqueeze(0)
+    if z.ndim == 2:
+        z = z.unsqueeze(0)
+    if official_y.ndim == 2:
+        official_y = official_y.unsqueeze(0)
+
     weight = base.load_layer_weight(root, layer_idx, "linear_attn.norm.weight", device)
-
-    # 1) Validate the literal formula against the official module.
     ref_formula = isolated_reference(x, z, weight)
-
-    # 2) Validate the router function using exactly the same x/z/weight.
     router_result = router_gated_norm(x, z, weight)
     router_y = router_result[0]
 
@@ -136,13 +111,9 @@ def run(root: Path, layer, layer_idx: int, hidden: torch.Tensor, device: str, to
     print(f"  weight dtype={weight.dtype} shape={tuple(weight.shape)}")
 
     print("\n=== OFFICIAL vs LITERAL FORMULA ===")
-    ok = [
-        report("official_output", official_y, ref_formula["output"], tolerance),
-    ]
+    ok = [report("official_output", official_y, ref_formula["output"], tolerance)]
 
     print("\n=== GATED RMSNORM INTERNALS ===")
-    # Recompute the same stages independently from the exact official inputs.
-    # There is no hidden upstream difference in this section.
     official_variance = x.float().pow(2).mean(dim=-1, keepdim=True)
     official_normalized = (x.float() * torch.rsqrt(official_variance + 1e-6)).to(x.dtype)
     official_weighted = weight.reshape(1, 1, -1) * official_normalized
@@ -161,8 +132,6 @@ def run(root: Path, layer, layer_idx: int, hidden: torch.Tensor, device: str, to
         report("official_vs_router", official_y, router_y, tolerance),
     ]
 
-    # Extra dtype/order variants make it obvious if a future implementation
-    # accidentally moves the weight multiply or SiLU across a dtype cast.
     print("\n=== ORDER / DTYPE SENSITIVITY ===")
     normalized_fp32 = x.float() * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + 1e-6)
     variant_weight_fp32 = weight.float().reshape(1, 1, -1) * normalized_fp32
