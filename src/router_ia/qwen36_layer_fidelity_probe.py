@@ -8,9 +8,7 @@ being tested is materialized. Checkpoint tensors are loaded directly from
 safetensors, with FP8 tensors dequantized using the router's blockwise helper.
 
 A single token is advanced through all 40 layers. At every layer we compare the
-official Transformers layer against the router layer. This keeps reference
-memory bounded by roughly one decoder layer while exposing the first failing
-layer.
+official Transformers layer against the router layer. This keeps reference memory bounded by roughly one decoder layer while exposing the first failing layer.
 """
 
 import argparse
@@ -33,13 +31,11 @@ EXPERTS = 256
 
 def _load_config(root: Path):
     from transformers import AutoConfig
-
     return AutoConfig.from_pretrained(str(root), local_files_only=True)
 
 
 def _build_meta_model(config) -> torch.nn.Module:
     from transformers import AutoModelForCausalLM
-
     with torch.device("meta"):
         model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
     model.eval()
@@ -47,13 +43,7 @@ def _build_meta_model(config) -> torch.nn.Module:
 
 
 def _find_layers(model: torch.nn.Module) -> torch.nn.ModuleList:
-    candidates = (
-        ("model", "language_model", "layers"),
-        ("language_model", "layers"),
-        ("model", "layers"),
-        ("layers",),
-        ("transformer", "h"),
-    )
+    candidates = (("model", "language_model", "layers"), ("language_model", "layers"), ("model", "layers"), ("layers",), ("transformer", "h"))
     for path in candidates:
         obj: Any = model
         try:
@@ -67,12 +57,7 @@ def _find_layers(model: torch.nn.Module) -> torch.nn.ModuleList:
 
 
 def _find_rotary(meta_model: torch.nn.Module):
-    candidates = (
-        ("model", "language_model", "rotary_emb"),
-        ("model", "rotary_emb"),
-        ("language_model", "rotary_emb"),
-        ("rotary_emb",),
-    )
+    candidates = (("model", "language_model", "rotary_emb"), ("model", "rotary_emb"), ("language_model", "rotary_emb"), ("rotary_emb",))
     for path in candidates:
         obj: Any = meta_model
         try:
@@ -91,18 +76,13 @@ def _checkpoint_index(root: Path) -> dict[str, str]:
         weight_map = data.get("weight_map")
         if isinstance(weight_map, dict):
             return {str(k): str(v) for k, v in weight_map.items()}
-
     single = root / "model.safetensors"
     if single.is_file():
         return {"__single__": single.name}
-
     files = sorted(root.glob("*.safetensors"))
     if len(files) == 1:
         return {"__single__": files[0].name}
-    raise FileNotFoundError(
-        "Expected model.safetensors or model.safetensors.index.json under "
-        f"{root}"
-    )
+    raise FileNotFoundError(f"Expected model.safetensors or model.safetensors.index.json under {root}")
 
 
 def _filename(weight_map: dict[str, str], key: str) -> str:
@@ -115,7 +95,6 @@ def _filename(weight_map: dict[str, str], key: str) -> str:
 
 def _load_checkpoint_tensor(root: Path, weight_map: dict[str, str], key: str) -> torch.Tensor:
     from safetensors import safe_open
-
     filename = _filename(weight_map, key)
     with safe_open(str(root / filename), framework="pt", device="cpu") as handle:
         if key not in handle.keys():
@@ -130,63 +109,33 @@ def _load_checkpoint_tensor(root: Path, weight_map: dict[str, str], key: str) ->
         return tensor
 
 
-def _load_fused_expert_parameter(
-    root: Path,
-    weight_map: dict[str, str],
-    layer_idx: int,
-    local_name: str,
-    expected_shape: tuple[int, ...],
-) -> torch.Tensor:
-    """Build Transformers' fused MoE parameters from per-expert checkpoint tensors.
-
-    The Qwen3.6 safetensors checkpoint stores expert projections separately as
-    ``gate_proj`` and ``up_proj`` for each expert, while the Transformers module
-    exposes a fused ``experts.gate_up_proj`` parameter. The fused layout is
-    ``[expert, gate_rows + up_rows, hidden]``; therefore each expert is
-    concatenated along the projection-row dimension.
-    """
+def _load_fused_expert_parameter(root: Path, weight_map: dict[str, str], layer_idx: int, local_name: str, expected_shape: tuple[int, ...]) -> torch.Tensor:
     prefix = base.layer_prefix(layer_idx)
     if local_name.endswith("mlp.experts.gate_up_proj"):
-        parts: list[torch.Tensor] = []
+        parts = []
         for expert in range(EXPERTS):
-            gate_key = f"{prefix}mlp.experts.{expert}.gate_proj.weight"
-            up_key = f"{prefix}mlp.experts.{expert}.up_proj.weight"
-            gate = _load_checkpoint_tensor(root, weight_map, gate_key)
-            up = _load_checkpoint_tensor(root, weight_map, up_key)
+            gate = _load_checkpoint_tensor(root, weight_map, f"{prefix}mlp.experts.{expert}.gate_proj.weight")
+            up = _load_checkpoint_tensor(root, weight_map, f"{prefix}mlp.experts.{expert}.up_proj.weight")
             if gate.ndim != 2 or up.ndim != 2 or gate.shape[1] != up.shape[1]:
-                raise RuntimeError(
-                    f"Invalid expert projection shapes for layer={layer_idx} expert={expert}: "
-                    f"gate={tuple(gate.shape)} up={tuple(up.shape)}"
-                )
+                raise RuntimeError(f"Invalid expert projection shapes for layer={layer_idx} expert={expert}: gate={tuple(gate.shape)} up={tuple(up.shape)}")
             parts.append(torch.cat((gate, up), dim=0))
         fused = torch.stack(parts, dim=0)
     elif local_name.endswith("mlp.experts.down_proj"):
-        parts = []
-        for expert in range(EXPERTS):
-            down_key = f"{prefix}mlp.experts.{expert}.down_proj.weight"
-            parts.append(_load_checkpoint_tensor(root, weight_map, down_key))
-        fused = torch.stack(parts, dim=0)
+        fused = torch.stack([_load_checkpoint_tensor(root, weight_map, f"{prefix}mlp.experts.{expert}.down_proj.weight") for expert in range(EXPERTS)], dim=0)
     else:
         raise KeyError(local_name)
-
     if tuple(fused.shape) != expected_shape:
-        raise RuntimeError(
-            f"Fused expert shape mismatch for layer {layer_idx} {local_name}: "
-            f"built={tuple(fused.shape)} model={expected_shape}"
-        )
+        raise RuntimeError(f"Fused expert shape mismatch for layer {layer_idx} {local_name}: built={tuple(fused.shape)} model={expected_shape}")
     return fused
 
 
 def _materialize_layer(root: Path, layer: torch.nn.Module, layer_idx: int, device: str) -> tuple[int, int]:
-    """Materialize one meta decoder layer from checkpoint tensors."""
     weight_map = _checkpoint_index(root)
     prefix = base.layer_prefix(layer_idx)
     layer.to_empty(device=device)
-
     loaded = 0
     missing: list[str] = []
     destinations = {**dict(layer.named_parameters()), **dict(layer.named_buffers())}
-
     with torch.no_grad():
         for local_name, destination in destinations.items():
             checkpoint_key = prefix + local_name
@@ -195,13 +144,7 @@ def _materialize_layer(root: Path, layer: torch.nn.Module, layer_idx: int, devic
             except KeyError:
                 if local_name.endswith("mlp.experts.gate_up_proj") or local_name.endswith("mlp.experts.down_proj"):
                     try:
-                        tensor = _load_fused_expert_parameter(
-                            root,
-                            weight_map,
-                            layer_idx,
-                            local_name,
-                            tuple(destination.shape),
-                        )
+                        tensor = _load_fused_expert_parameter(root, weight_map, layer_idx, local_name, tuple(destination.shape))
                     except KeyError:
                         missing.append(checkpoint_key)
                         continue
@@ -209,20 +152,13 @@ def _materialize_layer(root: Path, layer: torch.nn.Module, layer_idx: int, devic
                     missing.append(checkpoint_key)
                     continue
             if tuple(tensor.shape) != tuple(destination.shape):
-                raise RuntimeError(
-                    f"Shape mismatch for {checkpoint_key}: checkpoint={tuple(tensor.shape)} "
-                    f"model={tuple(destination.shape)}"
-                )
+                raise RuntimeError(f"Shape mismatch for {checkpoint_key}: checkpoint={tuple(tensor.shape)} model={tuple(destination.shape)}")
             if destination.dtype.is_floating_point:
                 tensor = tensor.to(dtype=destination.dtype)
             destination.copy_(tensor.to(device=device))
             loaded += 1
-
     if missing:
-        raise RuntimeError(
-            f"Layer {layer_idx} is missing {len(missing)} checkpoint tensors. "
-            f"First missing: {missing[:5]}"
-        )
+        raise RuntimeError(f"Layer {layer_idx} is missing {len(missing)} checkpoint tensors. First missing: {missing[:5]}")
     return loaded, len(destinations)
 
 
@@ -241,25 +177,23 @@ def _position_embeddings(meta_model: torch.nn.Module, config, hidden: torch.Tens
         return rotary(hidden.unsqueeze(1), position_ids=position_ids)
 
 
-def _run_reference_layer(
-    root: Path,
-    layer: torch.nn.Module,
-    meta_model: torch.nn.Module,
-    config,
-    hidden: torch.Tensor,
-    layer_idx: int,
-) -> torch.Tensor:
-    is_full = base.attention_type(root, layer_idx) == "full_attention"
-    position_embeddings = _position_embeddings(meta_model, config, hidden) if is_full else None
-    position_ids = torch.zeros((1, 1), device=hidden.device, dtype=torch.long)
-    kwargs = {
-        "hidden_states": hidden.unsqueeze(1),
-        "position_embeddings": position_embeddings,
-        "position_ids": position_ids,
-        "attention_mask": None,
-        "past_key_values": None,
-    }
+def _module_input_dtype(layer: torch.nn.Module) -> torch.dtype:
+    for parameter in layer.parameters():
+        if parameter.dtype.is_floating_point:
+            return parameter.dtype
+    for buffer in layer.buffers():
+        if buffer.dtype.is_floating_point:
+            return buffer.dtype
+    return torch.float32
 
+
+def _run_reference_layer(root: Path, layer: torch.nn.Module, meta_model: torch.nn.Module, config, hidden: torch.Tensor, layer_idx: int) -> torch.Tensor:
+    is_full = base.attention_type(root, layer_idx) == "full_attention"
+    dtype = _module_input_dtype(layer)
+    hidden_input = hidden.to(dtype=dtype)
+    position_embeddings = _position_embeddings(meta_model, config, hidden_input) if is_full else None
+    position_ids = torch.zeros((1, 1), device=hidden_input.device, dtype=torch.long)
+    kwargs = {"hidden_states": hidden_input.unsqueeze(1), "position_embeddings": position_embeddings, "position_ids": position_ids, "attention_mask": None, "past_key_values": None}
     with torch.inference_mode():
         try:
             output = layer(**kwargs)
@@ -270,7 +204,6 @@ def _run_reference_layer(
             except TypeError:
                 kwargs.pop("position_ids", None)
                 output = layer(**kwargs)
-
     if isinstance(output, tuple):
         output = output[0]
     if not isinstance(output, torch.Tensor):
@@ -302,28 +235,23 @@ def main() -> None:
     parser.add_argument("--tolerance", type=float, default=DEFAULT_TOLERANCE)
     parser.add_argument("--stop-on-fail", action="store_true")
     args = parser.parse_args()
-
     if args.device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("CUDA unavailable")
     if args.tolerance <= 0:
         raise SystemExit("--tolerance must be > 0")
     if args.layer is not None and not 0 <= args.layer < base.DEFAULT_LAYERS:
         raise SystemExit(f"--layer must be in [0, {base.DEFAULT_LAYERS - 1}]")
-
     root = args.root.resolve()
     config = _load_config(root)
     meta_model = _build_meta_model(config)
     layers = _find_layers(meta_model)
     if len(layers) < base.DEFAULT_LAYERS:
         raise SystemExit(f"Expected {base.DEFAULT_LAYERS} layers, found {len(layers)}")
-
     hidden_ref = load_embedding_row(root, args.token_id).reshape(1, base.HIDDEN).to(args.device).float()
     hidden_router = hidden_ref.detach().clone()
-
     state = attention.state_for(root, args.device)
     state.reset()
     attention.activate(root, state)
-
     print("op=layer-fidelity")
     print(f"token_id={args.token_id}")
     print(f"device={args.device}")
@@ -331,44 +259,28 @@ def main() -> None:
     print(f"target_layer={args.layer if args.layer is not None else 'all'}")
     print(f"tolerance={args.tolerance}")
     print("\n=== LAYER COMPARISON ===")
-
     first_fail: int | None = None
     for layer_idx in range(base.DEFAULT_LAYERS):
         official_layer = layers[layer_idx]
         loaded, total = _materialize_layer(root, official_layer, layer_idx, args.device)
-
-        hidden_ref = _run_reference_layer(
-            root, official_layer, meta_model, config, hidden_ref, layer_idx
-        )
+        hidden_ref = _run_reference_layer(root, official_layer, meta_model, config, hidden_ref, layer_idx)
         hidden_router = attention.step_attention(root, layer_idx, hidden_router, args.device)
-        hidden_router, *_ = chat.batched_moe_step(
-            root, layer_idx, hidden_router, top_k=8, device=args.device
-        )
+        hidden_router, *_ = chat.batched_moe_step(root, layer_idx, hidden_router, top_k=8, device=args.device)
         hidden_router = hidden_router.detach().float()
-
         max_abs, mean_abs, rel, cosine, ref_norm, router_norm = _stats(hidden_ref, hidden_router)
         status = "PASS" if max_abs <= args.tolerance else "FAIL"
         if status == "FAIL" and first_fail is None:
             first_fail = layer_idx
-
         if args.layer is None or args.layer == layer_idx:
             kind = base.attention_type(root, layer_idx)
-            print(
-                f"L{layer_idx:02d} {status} kind={kind} loaded={loaded}/{total} | "
-                f"max_abs={max_abs:.6g} | mean_abs={mean_abs:.6g} | rel={rel:.6g} | "
-                f"cosine={cosine:.9f} | ref_norm={ref_norm:.6g} | router_norm={router_norm:.6g}"
-            )
-
+            print(f"L{layer_idx:02d} {status} kind={kind} loaded={loaded}/{total} | max_abs={max_abs:.6g} | mean_abs={mean_abs:.6g} | rel={rel:.6g} | cosine={cosine:.9f} | ref_norm={ref_norm:.6g} | router_norm={router_norm:.6g}")
         official_layer.to_empty(device="meta")
         gc.collect()
         if args.device == "cuda":
             torch.cuda.empty_cache()
-
         if status == "FAIL" and args.stop_on_fail:
             break
-
     attention.deactivate(root)
-
     print("\n=== RESULT ===")
     if first_fail is None:
         print("status=PASS")
