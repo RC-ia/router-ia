@@ -77,6 +77,36 @@ def causal_conv_step(mixed_qkv: torch.Tensor, conv_state: torch.Tensor, conv_wei
     return out[:, :, 0].to(dtype=mixed_qkv.dtype), new_state
 
 
+def gated_delta_chunk_initial(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Use Transformers' exact chunk implementation for the first token.
+
+    Qwen3.6 starts its linear-attention cache through the chunk kernel. Even for
+    a single token, its reduction order can differ from the scalar recurrent
+    loop enough to change the cached FP32 state at ~1e-3 scale.
+    """
+    from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as hf
+
+    output, final_state = hf.torch_chunk_gated_delta_rule(
+        query,
+        key,
+        value,
+        g=g,
+        beta=beta,
+        initial_state=None,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+    )
+    if final_state is None:
+        raise RuntimeError("HF chunk rule did not return final recurrent state")
+    return output, final_state.detach()
+
+
 def gated_delta_recurrent(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, state: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
     """HF-style recurrent gated-delta update using FP32 internal state/math."""
     batch, seq_len, num_heads, k_dim = query.shape
@@ -142,7 +172,14 @@ def linear_attention_step(root: Path, layer: int, x0: torch.Tensor, conv_state: 
     dt_bias = load_vector(root, layer, "linear_attn.dt_bias", device).reshape(1, base.LINEAR_NUM_V_HEADS)
     g = -a_log.float().exp() * F.softplus(a + dt_bias)
 
-    core, recurrent_state_new = gated_delta_recurrent(q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), g.unsqueeze(1), beta.unsqueeze(1), recurrent_state)
+    if recurrent_state is None:
+        core, recurrent_state_new = gated_delta_chunk_initial(
+            q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), g.unsqueeze(1), beta.unsqueeze(1)
+        )
+    else:
+        core, recurrent_state_new = gated_delta_recurrent(
+            q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), g.unsqueeze(1), beta.unsqueeze(1), recurrent_state
+        )
     attn = core[:, 0]
 
     z = F.linear(h, z_w).reshape(1, base.LINEAR_NUM_V_HEADS, HEAD_DIM)
@@ -152,4 +189,4 @@ def linear_attention_step(root: Path, layer: int, x0: torch.Tensor, conv_state: 
     return projected, conv_state_new, recurrent_state_new
 
 
-__all__ = ["gated_delta_recurrent", "linear_attention_step", "causal_conv_step", "load_linear_weight"]
+__all__ = ["gated_delta_recurrent", "gated_delta_chunk_initial", "linear_attention_step", "causal_conv_step", "load_linear_weight"]
