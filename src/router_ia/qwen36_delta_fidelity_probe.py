@@ -37,10 +37,15 @@ def _reference_step(root: Path, layer: int, x: torch.Tensor, linear_state: torch
         conv_bias = base.load_layer_weight(root, layer, "linear_attn.conv1d.bias", device)
     except KeyError:
         conv_bias = None
-    current = mixed.to(dtype=conv_weight.dtype).reshape(1, -1, 1)
-    history = torch.cat((conv_state, current), dim=-1)
+    # Keep the entire causal-convolution pipeline on one dtype. The model
+    # checkpoint may store conv weights/bias in BF16 while cached state or
+    # projections use FP32/FP16.
+    conv_dtype = conv_weight.dtype
+    current = mixed.to(dtype=conv_dtype).reshape(1, -1, 1)
+    conv_history = conv_state.to(dtype=conv_dtype)
+    history = torch.cat((conv_history, current), dim=-1)
     new_conv_state = history[:, :, -ours.LINEAR_CONV_STATE:].detach()
-    conv_out = F.conv1d(history, conv_weight, bias=conv_bias, padding=0, groups=ours.LINEAR_CONV_DIM)
+    conv_out = F.conv1d(history, conv_weight, bias=None if conv_bias is None else conv_bias.to(dtype=conv_dtype), padding=0, groups=ours.LINEAR_CONV_DIM)
     conv_out = F.silu(conv_out[:, :, -1:])[:, :, 0].to(dtype=mixed.dtype)
     q, k, v = torch.split(conv_out, [base.LINEAR_KEY_DIM, base.LINEAR_KEY_DIM, base.LINEAR_VALUE_DIM], dim=-1)
     q = q.reshape(1, base.LINEAR_NUM_K_HEADS, 128).repeat_interleave(2, dim=1)
@@ -106,8 +111,8 @@ def main() -> None:
     state.reset()
     ours.activate(root, state)
     ref_state = torch.zeros(1, base.LINEAR_NUM_V_HEADS, 128, 128, device=args.device, dtype=torch.float32)
-    conv_dtype = torch.float16 if args.device == "cuda" else torch.float32
-    ref_conv = torch.zeros(1, ours.LINEAR_CONV_DIM, ours.LINEAR_CONV_STATE, device=args.device, dtype=conv_dtype)
+    conv_weight0 = base.load_layer_weight(root, args.layer, "linear_attn.conv1d.weight", args.device)
+    ref_conv = torch.zeros(1, ours.LINEAR_CONV_DIM, ours.LINEAR_CONV_STATE, device=args.device, dtype=conv_weight0.dtype)
     print("op=gated-deltanet-fidelity")
     print(f"layer={args.layer}")
     print(f"tokens={args.tokens}")
