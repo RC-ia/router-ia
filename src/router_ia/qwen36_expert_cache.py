@@ -1,12 +1,6 @@
 from __future__ import annotations
 
-"""Persistent compressed GPU cache for Qwen3.6 routed experts.
-
-The VRAM expert cache keeps raw FP8 experts as the main resident tier and a
-smaller Q4 tier as a colder backup. FP16 is never kept persistently: when an
-expert is requested, its compressed matrices are reconstructed to temporary
-FP16 tensors for the existing GEMM path.
-"""
+"""Persistent compressed GPU cache for Qwen3.6 routed experts."""
 
 from collections import OrderedDict
 from threading import Lock
@@ -81,6 +75,21 @@ def _q4_dequantize_matrix(matrix: Q4Matrix) -> torch.Tensor:
     high = ((packed >> 4) & 0x0F).to(torch.int16) - 8
     q = torch.stack((low, high), dim=1).reshape(-1)[: shape[0] * shape[1]]
     return (q.float() * scale.float()).reshape(shape).to(torch.float16)
+
+
+def _q4_dequantize_entry_batch(entries: list[ColdEntry], projection: int) -> list[torch.Tensor]:
+    if not entries:
+        return []
+    packed = torch.stack([entry[projection][0] for entry in entries], dim=0)
+    scales = torch.stack([entry[projection][1] for entry in entries], dim=0)
+    shapes = [entry[projection][2] for entry in entries]
+    rows, cols = shapes[0]
+    if any(shape != (rows, cols) for shape in shapes):
+        return [_q4_dequantize_matrix(entry[projection]) for entry in entries]
+    low = (packed & 0x0F).to(torch.int16) - 8
+    high = ((packed >> 4) & 0x0F).to(torch.int16) - 8
+    q = torch.stack((low, high), dim=2).reshape(len(entries), -1)[:, : rows * cols]
+    return (q.float() * scales.float().reshape(len(entries), 1)).reshape(len(entries), rows, cols).to(torch.float16)
 
 
 def _q4_quantize_entry_from_fp8(entry: WarmEntry) -> ColdEntry:
@@ -172,34 +181,61 @@ class RoutedExpertCache:
             self._raw_projection_for_gpu(store, prefix + "." + name)
 
     def get(self, layer: int, expert_id: int):
-        layer = int(layer)
-        expert_id = int(expert_id)
-        with self.lock:
-            fp8 = self.fp8_entries.setdefault(layer, OrderedDict())
-            entry = fp8.get(expert_id)
-            if entry is not None:
-                self.hits += 1
-                self.fp8_hits += 1
-                fp8.move_to_end(expert_id)
-                hit_entry = entry
-            else:
-                q4 = self.q4_entries.setdefault(layer, OrderedDict())
-                entry_q4 = q4.get(expert_id)
-                if entry_q4 is not None:
-                    self.hits += 1
-                    self.q4_hits += 1
-                    q4.move_to_end(expert_id)
-                    hit_entry = entry_q4
-                    entry = None
-                else:
-                    self.misses += 1
-                    return None
+        results = self.get_batch(layer, [expert_id])
+        if not results:
+            return None
+        return results[0]
 
-        # Do not hold the cache lock while performing the expensive CUDA
-        # dequantization. Multiple routed experts can now dequantize in parallel.
+    def _find_compressed_locked(self, layer: int, expert_id: int):
+        fp8 = self.fp8_entries.setdefault(layer, OrderedDict())
+        entry = fp8.get(expert_id)
         if entry is not None:
-            return tuple(_fp8_dequantize_matrix(m) for m in entry)
-        return tuple(_q4_dequantize_matrix(m) for m in hit_entry)
+            self.hits += 1
+            self.fp8_hits += 1
+            fp8.move_to_end(expert_id)
+            return "fp8", entry
+        q4 = self.q4_entries.setdefault(layer, OrderedDict())
+        entry_q4 = q4.get(expert_id)
+        if entry_q4 is not None:
+            self.hits += 1
+            self.q4_hits += 1
+            q4.move_to_end(expert_id)
+            return "q4", entry_q4
+        self.misses += 1
+        return None, None
+
+    def get_batch(self, layer: int, expert_ids: list[int]) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Return a routed expert batch, dequantized on CUDA in grouped kernels."""
+        layer = int(layer)
+        ids = [int(x) for x in expert_ids]
+        found: list[tuple[str | None, WarmEntry | ColdEntry | None]] = []
+        with self.lock:
+            for expert_id in ids:
+                found.append(self._find_compressed_locked(layer, expert_id))
+
+        fp8_positions = [i for i, (tier, _) in enumerate(found) if tier == "fp8"]
+        q4_positions = [i for i, (tier, _) in enumerate(found) if tier == "q4"]
+        result: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None] = [None] * len(ids)
+
+        if fp8_positions:
+            for projection in range(3):
+                weights = torch.stack([found[i][1][projection][0] for i in fp8_positions], dim=0)  # type: ignore[index]
+                scales = torch.stack([found[i][1][projection][1] for i in fp8_positions], dim=0)  # type: ignore[index]
+                decoded = dequant.dequantize_fp8_blockwise_batch(weights, scales).to(dtype=torch.float16)
+                for local, position in enumerate(fp8_positions):
+                    if result[position] is None:
+                        result[position] = [None, None, None]  # type: ignore[list-item]
+                    result[position][projection] = decoded[local]  # type: ignore[index]
+
+        if q4_positions:
+            for projection in range(3):
+                decoded = _q4_dequantize_entry_batch([found[i][1] for i in q4_positions], projection)  # type: ignore[list-item]
+                for local, position in enumerate(q4_positions):
+                    if result[position] is None:
+                        result[position] = [None, None, None]  # type: ignore[list-item]
+                    result[position][projection] = decoded[local]  # type: ignore[index]
+
+        return [tuple(item) for item in result if item is not None]  # type: ignore[arg-type]
 
     def _insert_fp8_locked(self, layer: int, expert_id: int, entry: WarmEntry) -> None:
         bank = self.fp8_entries.setdefault(layer, OrderedDict())
@@ -231,7 +267,6 @@ class RoutedExpertCache:
                 self.evictions += 1
 
     def put_fp16(self, layer: int, expert_id: int, entry: FP16Entry) -> None:
-        # Quantization is intentionally GPU-only. Never run FP16→FP8 on CPU.
         if any(t.device.type != "cuda" for t in entry):
             entry = tuple(t.to(device="cuda", dtype=torch.float16) for t in entry)  # type: ignore[assignment]
         compact = _fp8_quantize_entry(entry)
@@ -267,6 +302,47 @@ class RoutedExpertCache:
         entry_fp16: FP16Entry = tuple(w.to(device="cuda", dtype=torch.float16) for w in raw_weights)  # type: ignore[assignment]
         self.put_fp16(layer, expert_id, entry_fp16)
         return entry_fp16
+
+    def get_or_load_batch(self, store, layer: int, expert_ids: list[int], layer_prefix: str) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Load misses into compressed GPU storage, then batch-dequantize all routed experts."""
+        misses: list[int] = []
+        for expert_id in expert_ids:
+            tier, _ = self._peek(layer, int(expert_id))
+            if tier is None:
+                misses.append(int(expert_id))
+
+        for expert_id in misses:
+            expert_prefix = f"{layer_prefix}mlp.experts.{expert_id}"
+            raw_weights = []
+            raw_scales = []
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                w, s = self._raw_projection_for_gpu(store, expert_prefix + "." + name)
+                raw_weights.append(w)
+                raw_scales.append(s)
+            if not all(w.dtype == torch.float8_e4m3fn for w in raw_weights):
+                raw_weights = [w.to(device="cuda", dtype=torch.float16) for w in raw_weights]
+                compact = _fp8_quantize_entry(tuple(raw_weights))  # type: ignore[arg-type]
+            else:
+                compact = (
+                    (raw_weights[0], raw_scales[0]),
+                    (raw_weights[1], raw_scales[1]),
+                    (raw_weights[2], raw_scales[2]),
+                )
+            with self.lock:
+                self._insert_fp8_locked(int(layer), expert_id, compact)  # type: ignore[arg-type]
+                self.loads += 1
+                if all(w.dtype != torch.float8_e4m3fn for w in raw_weights):
+                    self.fp16_to_fp8 += 1
+
+        return self.get_batch(layer, [int(x) for x in expert_ids])
+
+    def _peek(self, layer: int, expert_id: int):
+        with self.lock:
+            if expert_id in self.fp8_entries.setdefault(int(layer), OrderedDict()):
+                return "fp8", self.fp8_entries[int(layer)][expert_id]
+            if expert_id in self.q4_entries.setdefault(int(layer), OrderedDict()):
+                return "q4", self.q4_entries[int(layer)][expert_id]
+            return None, None
 
     def snapshot(self) -> dict[str, int | float]:
         with self.lock:
