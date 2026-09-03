@@ -20,7 +20,7 @@ from .qwen36_layer_fidelity_probe import (
     _pure_torch_causal_conv1d,
     _stage_stats,
 )
-from .qwen36_op_probe import load_embedding_row
+from .qwen36_op_probe import load_embedding_row, rmsnorm
 
 DEFAULT_TOLERANCE = 1e-3
 
@@ -118,14 +118,22 @@ def run_layer(
 
     try:
         input_dtype = _module_input_dtype(layer)
+        input_norm = None
         for position, token in enumerate(hidden_tokens):
             token = token.to(dtype=input_dtype)
             print(f"\n--- TOKEN {position} ---")
 
+            # DecoderLayer applies input_layernorm before dispatching into
+            # linear_attn. The runtime's step_attention does the same internally,
+            # so the official reference must receive the normalized hidden state.
+            if input_norm is None:
+                input_norm = base.load_layer_weight(root, layer_idx, "input_layernorm.weight", device)
+            normed = rmsnorm(token, input_norm)
+
             # Official Transformers reference. The first token goes through the
             # chunk path; later single-token calls reuse conv + recurrent state.
             reference = layer.linear_attn(
-                hidden_states=token.unsqueeze(1),
+                hidden_states=normed.unsqueeze(1),
                 cache_params=ref_cache,
                 attention_mask=None,
             )
