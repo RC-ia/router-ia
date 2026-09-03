@@ -101,13 +101,15 @@ def _stateful_attention_step(root: Path, layer: int, x0: torch.Tensor, device: s
 
 def _run_token_hidden(root: Path, token_id: int, device: str) -> torch.Tensor:
     """Consume one token through all layers and update persistent attention state."""
-    attention_state.activate(root, _state(root, device))
+    state = _state(root, device)
+    attention_state.activate(root, state)
     x = base.load_embedding_row(root, int(token_id)).reshape(1, base.HIDDEN).to(device).float()
     try:
         for layer in range(base.DEFAULT_LAYERS):
             residual = _stateful_attention_step(root, layer, x, device)
             x, *_ = chat.batched_moe_step(root, layer, residual, top_k=8, device=device)
             del residual
+        state.tokens_seen += 1
         return x
     except Exception:
         del x
@@ -125,8 +127,11 @@ def _run_generated_token_stateful(
     sampling_top_k: int,
     temperature: float,
 ) -> tuple[int, float, float]:
-    attention_state.activate(root, _state(root, device))
+    state = _state(root, device)
+    attention_state.activate(root, state)
     try:
+        # The original token runner executes the stateful attention path because
+        # base.linear_attention_step/full_attention_step are patched below.
         result = _ORIGINAL_CHAT_RUN_GENERATED_TOKEN(
             root,
             token_id,
@@ -138,6 +143,7 @@ def _run_generated_token_stateful(
             sampling_top_k,
             temperature,
         )
+        state.tokens_seen += 1
         return result
     finally:
         attention_state.deactivate(root)
