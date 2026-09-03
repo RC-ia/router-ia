@@ -10,7 +10,7 @@ The resident pool never evicts. The streaming window is the rotating expert
 staging area and receives all VRAM previously reserved for the hot-expert pool.
 
 Environment variables:
-    QWEN36_CACHE_GB: RAM cache budget, default 3.0 GiB.
+    QWEN36_CACHE_GB: RAM cache budget, default 5.0 GiB.
     QWEN36_VRAM_GB: optional CUDA allocator limit, default 0 (disabled).
     QWEN36_VRAM_CACHE_GB: persistent VRAM cache budget, default 3.0 GiB.
     QWEN36_RESIDENT_VRAM_RATIO: resident share, default 0.60.
@@ -47,7 +47,7 @@ def _env_float(name: str, default: float) -> float:
     return value if value > 0 else default
 
 
-CACHE_GB = _env_float("QWEN36_CACHE_GB", 3.0)
+CACHE_GB = _env_float("QWEN36_CACHE_GB", 5.0)
 CACHE_BUDGET_BYTES = int(CACHE_GB * 1024**3)
 VRAM_GB = _env_float("QWEN36_VRAM_GB", 0.0)
 VRAM_CACHE_GB = _env_float("QWEN36_VRAM_CACHE_GB", 3.0)
