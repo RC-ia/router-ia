@@ -231,6 +231,9 @@ class RoutedExpertCache:
                 self.evictions += 1
 
     def put_fp16(self, layer: int, expert_id: int, entry: FP16Entry) -> None:
+        # Quantization is intentionally GPU-only. Never run FP16→FP8 on CPU.
+        if any(t.device.type != "cuda" for t in entry):
+            entry = tuple(t.to(device="cuda", dtype=torch.float16) for t in entry)  # type: ignore[assignment]
         compact = _fp8_quantize_entry(entry)
         with self.lock:
             self._insert_fp8_locked(int(layer), int(expert_id), compact)
