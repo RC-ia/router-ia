@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from . import qwen36_40layer_loop as base
 from . import qwen36_attention_cache as cache
+from . import qwen36_cached_loop as cached
 from .qwen36_op_probe import rmsnorm
 
 TOLERANCE = 1e-3
@@ -45,12 +46,16 @@ def discover_full_attention_layers(root: Path) -> list[int]:
 def reference_full_attention(root: Path, layer: int, hidden_states: list[torch.Tensor], device: str):
     prefix = base.layer_prefix(layer)
     input_norm = base.load_layer_weight(root, layer, "input_layernorm.weight", device)
-    q_w = cache._projection(root, prefix + "self_attn.q_proj", device)
-    k_w = cache._projection(root, prefix + "self_attn.k_proj", device)
-    v_w = cache._projection(root, prefix + "self_attn.v_proj", device)
+    # Use the public-in-module loader that is actually provided by the cached
+    # loop. Do not depend on the private convenience wrapper in attention_cache,
+    # because older checkouts of that module did not expose _projection.
+    load_projection = cached._cached_load_projection
+    q_w = load_projection(root, prefix + "self_attn.q_proj", device)
+    k_w = load_projection(root, prefix + "self_attn.k_proj", device)
+    v_w = load_projection(root, prefix + "self_attn.v_proj", device)
     q_norm_w = base.load_layer_weight(root, layer, "self_attn.q_norm.weight", device)
     k_norm_w = base.load_layer_weight(root, layer, "self_attn.k_norm.weight", device)
-    out_w = cache._projection(root, prefix + "self_attn.o_proj", device)
+    out_w = load_projection(root, prefix + "self_attn.o_proj", device)
 
     q_tokens, k_tokens, v_tokens, gates = [], [], [], []
     for position, x in enumerate(hidden_states):
