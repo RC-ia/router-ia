@@ -71,7 +71,7 @@ def compare_scores(ref: torch.Tensor, got: torch.Tensor, tolerance: float) -> bo
         print("score interpretation: raw scores match")
     else:
         print("score interpretation: non-offset score difference detected")
-    return centered_ok
+    return raw_ok
 
 
 def apply_rope(q: torch.Tensor, k: torch.Tensor, position: int):
@@ -138,6 +138,9 @@ def reference_token(root: Path, layer: int, x: torch.Tensor, position: int, visi
         "k_norm": kn,
         "q_rope": qr,
         "k_rope": kr,
+        "q_now": q_now,
+        "k_expanded": k_expanded,
+        "v_expanded": v_expanded,
         "scores": scores,
         "weights": weights,
         "attn_raw": attn_raw,
@@ -172,7 +175,15 @@ def capture_runtime(fn):
 
     def einsum(equation, *operands, **kwargs):
         out = orig_einsum(equation, *operands, **kwargs)
-        captured["einsum"].append((equation, out.detach().clone()))
+        captured["einsum"].append(
+            {
+                "equation": equation,
+                "operands": tuple(
+                    op.detach().clone() if torch.is_tensor(op) else op for op in operands
+                ),
+                "out": out.detach().clone(),
+            }
+        )
         return out
 
     def softmax(input, dim=-1, _stacklevel=3, dtype=None):
@@ -180,7 +191,7 @@ def capture_runtime(fn):
         if dtype is not None:
             kwargs["dtype"] = dtype
         out = orig_softmax(input, **kwargs)
-        captured["softmax"].append(out.detach().clone())
+        captured["softmax"].append({"input": input.detach().clone(), "out": out.detach().clone()})
         return out
 
     cache.F.linear = linear
@@ -196,6 +207,11 @@ def capture_runtime(fn):
         cache._apply_rope = orig_rope
         cache.torch.einsum = orig_einsum
         cache.torch.softmax = orig_softmax
+
+
+def find_einsum(captured, equation: str, occurrence: int = 0):
+    matches = [item for item in captured["einsum"] if item["equation"] == equation]
+    return matches[occurrence] if occurrence < len(matches) else None
 
 
 def run(root: Path, layer: int, tokens: int, device: str, seed: int, tolerance: float) -> bool:
@@ -268,22 +284,42 @@ def run(root: Path, layer: int, tokens: int, device: str, seed: int, tolerance: 
                 print("k_after_rope                 MISSING")
                 all_pass = False
 
-            print("--- attention ---")
-            if len(cap["einsum"]) >= 2 and cap["softmax"]:
-                all_pass &= compare_scores(ref["scores"], cap["einsum"][0][1], tolerance)
-                all_pass &= compare("softmax", ref["weights"], cap["softmax"][0], tolerance)
-                all_pass &= compare("attn_raw", ref["attn_raw"], cap["einsum"][1][1], tolerance)
-            else:
+            print("--- attention operands ---")
+            score_op = find_einsum(cap, "bhd,bhld->bhl", 0)
+            attn_op = find_einsum(cap, "bhl,bhld->bhd", 0)
+            if score_op is None or attn_op is None or not cap["softmax"]:
                 print("attention intermediates       MISSING")
                 all_pass = False
+            else:
+                runtime_q, runtime_k = score_op["operands"]
+                runtime_score = score_op["out"]
+                runtime_weights_input = cap["softmax"][0]["input"]
+                runtime_weights = cap["softmax"][0]["out"]
+                runtime_attn_weights, runtime_v = attn_op["operands"]
+                runtime_attn = attn_op["out"]
+
+                all_pass &= compare("score_q_operand", ref["q_now"], runtime_q, tolerance)
+                all_pass &= compare("score_k_operand", ref["k_expanded"], runtime_k, tolerance)
+                all_pass &= compare("score_v_operand", ref["v_expanded"], runtime_v, tolerance)
+                all_pass &= compare("score_einsum_raw", ref["scores"] / (base.FULL_HEAD_DIM ** -0.5), runtime_score / (base.FULL_HEAD_DIM ** -0.5), tolerance)
+
+                reconstructed_score = torch.einsum("bhd,bhld->bhl", runtime_q, runtime_k)
+                reconstructed_score = reconstructed_score * (base.FULL_HEAD_DIM ** -0.5)
+                all_pass &= compare("score_reconstructed", runtime_score, reconstructed_score, tolerance)
+                all_pass &= compare("score_vs_softmax_input", runtime_score, runtime_weights_input, tolerance)
+                all_pass &= compare("softmax", ref["weights"], runtime_weights, tolerance)
+
+                all_pass &= compare("attn_weights_operand", ref["weights"], runtime_attn_weights, tolerance)
+                all_pass &= compare("attn_v_operand", ref["v_expanded"], runtime_v, tolerance)
+                all_pass &= compare("attn_raw", ref["attn_raw"], runtime_attn, tolerance)
 
             q_gate = cap["linear"][0]
             q_runtime = q_gate.reshape(1, base.FULL_NUM_HEADS, base.FULL_HEAD_DIM * 2)
             q_runtime, gate_runtime = torch.chunk(q_runtime, 2, dim=-1)
             all_pass &= compare("q_pre_rope", ref["q"], q_runtime, tolerance)
             all_pass &= compare("gate", ref["gate"], gate_runtime, tolerance)
-            if len(cap["einsum"]) >= 2:
-                attn_runtime = cap["einsum"][1][1] * torch.sigmoid(gate_runtime.float())
+            if attn_op is not None:
+                attn_runtime = attn_op["out"] * torch.sigmoid(gate_runtime.float())
                 all_pass &= compare("attn_gated", ref["attn_gated"], attn_runtime, tolerance)
 
             print("--- output / residual ---")
