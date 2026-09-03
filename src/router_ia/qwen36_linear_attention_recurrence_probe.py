@@ -26,11 +26,20 @@ def report(name: str, ref: torch.Tensor, got: torch.Tensor, tol: float) -> bool:
     s = _stage_stats(ref, got)
     ok = s[0] <= tol
     print(
-        f"  {name:<30} {'PASS' if ok else 'FAIL'} "
+        f"  {name:<32} {'PASS' if ok else 'FAIL'} "
         f"max_abs={s[0]:.6g} mean_abs={s[1]:.6g} "
         f"rel={s[2]:.6g} cosine={s[3]:.9f}"
     )
     return ok
+
+
+def _call_args(args, kwargs, index, name):
+    if len(args) > index:
+        return args[index]
+    value = kwargs.get(name)
+    if value is None:
+        raise TypeError(f"missing recurrence argument: {name}")
+    return value
 
 
 def main() -> int:
@@ -45,6 +54,8 @@ def main() -> int:
 
     if args.device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("CUDA unavailable")
+    if not 0 <= args.layer < base.DEFAULT_LAYERS:
+        raise SystemExit(f"--layer must be in [0, {base.DEFAULT_LAYERS - 1}]")
 
     root = args.root.resolve()
     config = _load_config(root)
@@ -70,54 +81,62 @@ def main() -> int:
     attention.activate(root, state)
     qwen, conv_originals = _patch_official_conv()
 
-    # The recurrent operation is a module-level symbol in Transformers, not
-    # an attribute on Qwen3_5MoeGatedDeltaNet. Patch that symbol so the probe
-    # can capture the exact tensors entering the official recurrence.
-    ref_original_recurrent = qwen.torch_recurrent_gated_delta_rule
     original_l2 = attention._l2norm
-    runtime_l2 = []
-    reference_raw = []
-    reference_norm = []
-    reference_final_state = []
+    original_recurrent = getattr(layer.linear_attn, "recurrent_gated_delta_rule", None)
+    original_chunk = getattr(layer.linear_attn, "chunk_gated_delta_rule", None)
+
+    runtime_l2: list[torch.Tensor] = []
+    reference_calls: list[dict[str, torch.Tensor | None]] = []
+    reference_states: list[torch.Tensor | None] = []
 
     def capture_runtime_l2(x, eps=1e-6):
         out = original_l2(x, eps)
         runtime_l2.append(out.detach().clone())
         return out
 
-    def reference_recurrent(*args, **kwargs):
-        query = args[0] if len(args) > 0 else kwargs["query"]
-        key = args[1] if len(args) > 1 else kwargs["key"]
-        value = args[2] if len(args) > 2 else kwargs["value"]
-        g = args[3] if len(args) > 3 else kwargs.get("g")
-        beta = args[4] if len(args) > 4 else kwargs.get("beta")
-        initial_state = args[5] if len(args) > 5 else kwargs.get("initial_state")
+    def capture_recurrent(*call_args, **call_kwargs):
+        query = _call_args(call_args, call_kwargs, 0, "query")
+        key = _call_args(call_args, call_kwargs, 1, "key")
+        value = _call_args(call_args, call_kwargs, 2, "value")
+        g = _call_args(call_args, call_kwargs, 3, "g")
+        beta = _call_args(call_args, call_kwargs, 4, "beta")
+        initial = _call_args(call_args, call_kwargs, 5, "initial_state")
+        output_final_state = _call_args(call_args, call_kwargs, 6, "output_final_state")
+        use_qk = call_args[7] if len(call_args) > 7 else call_kwargs.get("use_qk_l2norm_in_kernel", False)
 
-        reference_raw.append(
+        reference_calls.append(
             {
                 "q": query.detach().clone(),
                 "k": key.detach().clone(),
                 "v": value.detach().clone(),
                 "g": g.detach().clone(),
                 "beta": beta.detach().clone(),
-                "initial": None if initial_state is None else initial_state.detach().clone(),
+                "initial": None if initial is None else initial.detach().clone(),
             }
         )
 
-        q_native = query / torch.sqrt((query * query).sum(dim=-1, keepdim=True) + 1e-6)
-        k_native = key / torch.sqrt((key * key).sum(dim=-1, keepdim=True) + 1e-6)
-        reference_norm.append(
-            {
-                "q_native": q_native.detach().clone(),
-                "k_native": k_native.detach().clone(),
-            }
+        # Force the official pure-PyTorch implementation and preserve the same
+        # normalization flag used by the model. This lets us compare q/k exactly
+        # at the recurrence boundary.
+        out, final_state = qwen.torch_recurrent_gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=initial,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk,
         )
-
-        out, final_state = ref_original_recurrent(*args, **kwargs)
-        reference_final_state.append(None if final_state is None else final_state.detach().clone())
+        reference_states.append(None if final_state is None else final_state.detach().clone())
         return out, final_state
 
-    qwen.torch_recurrent_gated_delta_rule = reference_recurrent
+    # The instantiated Qwen module stores the chosen recurrent callable on the
+    # instance, so patch the bound attribute directly. The first token uses the
+    # chunk path; later tokens use this recurrent path.
+    if original_recurrent is None:
+        raise SystemExit("Reference layer has no recurrent_gated_delta_rule attribute")
+    layer.linear_attn.recurrent_gated_delta_rule = capture_recurrent
     attention._l2norm = capture_runtime_l2
 
     all_ok = True
@@ -131,6 +150,9 @@ def main() -> int:
             token = raw.to(dtype=input_dtype)
             normed = rmsnorm(token, input_norm)
 
+            # First token intentionally goes through the chunk implementation and
+            # therefore cannot populate reference_calls. We compare recurrence
+            # stages only once the reference switches to cached single-token mode.
             reference = layer.linear_attn(
                 hidden_states=normed.unsqueeze(1),
                 cache_params=ref_cache,
@@ -143,33 +165,38 @@ def main() -> int:
             got_residual = attention.step_attention(root, args.layer, token, args.device)
             got_linear = got_residual - token.float()
 
-            rr = reference_raw[-1]
-            rn = reference_norm[-1]
+            print(f"\nTOKEN {pos}")
+            all_ok &= report("linear_output", reference, got_linear, args.tolerance)
+
+            if not reference_calls:
+                print("  recurrence_capture              SKIP (initial chunk path)")
+                continue
+
+            rr = reference_calls[-1]
+            ref_state = reference_states[-1]
             l2 = runtime_l2[-2:] if len(runtime_l2) >= 2 else []
 
-            ref_q_native = rn["q_native"].transpose(1, 2).to(torch.float32)
-            ref_k_native = rn["k_native"].transpose(1, 2).to(torch.float32)
+            ref_q_native = rr["q"] / torch.sqrt((rr["q"] * rr["q"]).sum(dim=-1, keepdim=True) + 1e-6)
+            ref_k_native = rr["k"] / torch.sqrt((rr["k"] * rr["k"]).sum(dim=-1, keepdim=True) + 1e-6)
             qf = rr["q"].float()
             kf = rr["k"].float()
-            ref_q_fp32 = (qf / torch.sqrt((qf * qf).sum(dim=-1, keepdim=True) + 1e-6)).transpose(1, 2)
-            ref_k_fp32 = (kf / torch.sqrt((kf * kf).sum(dim=-1, keepdim=True) + 1e-6)).transpose(1, 2)
+            ref_q_fp32 = qf / torch.sqrt((qf * qf).sum(dim=-1, keepdim=True) + 1e-6)
+            ref_k_fp32 = kf / torch.sqrt((kf * kf).sum(dim=-1, keepdim=True) + 1e-6)
 
-            print(f"\nTOKEN {pos}")
             if len(l2) == 2:
-                all_ok &= report("q_l2_vs_reference_native", ref_q_native, l2[0], args.tolerance)
-                all_ok &= report("q_l2_vs_reference_fp32", ref_q_fp32, l2[0], args.tolerance)
-                all_ok &= report("k_l2_vs_reference_native", ref_k_native, l2[1], args.tolerance)
-                all_ok &= report("k_l2_vs_reference_fp32", ref_k_fp32, l2[1], args.tolerance)
+                all_ok &= report("q_l2_vs_reference_native", ref_q_native.transpose(1, 2).float(), l2[0], args.tolerance)
+                all_ok &= report("q_l2_vs_reference_fp32", ref_q_fp32.transpose(1, 2), l2[0], args.tolerance)
+                all_ok &= report("k_l2_vs_reference_native", ref_k_native.transpose(1, 2).float(), l2[1], args.tolerance)
+                all_ok &= report("k_l2_vs_reference_fp32", ref_k_fp32.transpose(1, 2), l2[1], args.tolerance)
             else:
-                print("  q/k runtime_l2_capture          UNAVAILABLE")
+                print("  q/k_runtime_l2_capture          UNAVAILABLE")
                 all_ok = False
 
             got_state = state.linear_states[args.layer]
-            ref_state = reference_final_state[-1]
             if ref_state is not None:
                 all_ok &= report("recurrent_final_state", ref_state, got_state, args.tolerance)
             else:
-                print("  recurrent_final_state           UNAVAILABLE")
+                print("  recurrent_final_state             UNAVAILABLE")
                 all_ok = False
 
             print(
@@ -177,13 +204,10 @@ def main() -> int:
                 f"reference_v_dtype={rr['v'].dtype} reference_g_dtype={rr['g'].dtype} "
                 f"reference_beta_dtype={rr['beta'].dtype}"
             )
-            print("  v_raw_self_check               PASS")
-            print("  beta_self_check                PASS")
-            print("  g_self_check                   PASS")
-            all_ok &= report("linear_output", reference, got_linear, args.tolerance)
-
     finally:
-        qwen.torch_recurrent_gated_delta_rule = ref_original_recurrent
+        layer.linear_attn.recurrent_gated_delta_rule = original_recurrent
+        if original_chunk is not None:
+            layer.linear_attn.chunk_gated_delta_rule = original_chunk
         attention._l2norm = original_l2
         attention.deactivate(root)
         qwen.causal_conv1d_fn, qwen.causal_conv1d_update = conv_originals
