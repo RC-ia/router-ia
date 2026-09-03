@@ -18,6 +18,7 @@ from .qwen36_mini_chat import load_final_norm, load_lm_head, load_tokenizer, sam
 
 DEFAULT_MAX_NEW_TOKENS = 4
 EXPERT_LOAD_WORKERS = max(1, int(os.getenv("QWEN36_EXPERT_LOAD_WORKERS", "8")))
+EXPERT_EAGER_COUNT = max(1, int(os.getenv("QWEN36_EXPERT_EAGER_COUNT", "2")))
 
 
 def cache_stats(root: Path) -> dict[str, int | float]:
@@ -76,7 +77,6 @@ def print_cache(root: Path, label: str) -> None:
 
 
 def _projection(root: Path, prefix: str, device: str) -> torch.Tensor:
-    """Load a dequantized projection through the hierarchical cache."""
     return cached._cached_load_projection(root, prefix, device)
 
 
@@ -94,65 +94,26 @@ def _expert_projection_triplet(
     )
 
 
-def _warm_expert_raw_cache(
-    root: Path,
-    layer_prefix: str,
-    expert_ids: list[int],
-) -> None:
-    """Ensure routed FP8 weights/scales are resident in RAM before GPU staging.
-
-    This keeps the threaded GPU staging phase away from first-touch shard opens.
-    """
+def _warm_expert_raw_cache(root: Path, layer_prefix: str, expert_ids: list[int]) -> None:
     store = cached._store(root)
     for expert_id in expert_ids:
         expert_prefix = f"{layer_prefix}mlp.experts.{expert_id}"
-        store.load(expert_prefix + ".gate_proj.weight", device="cpu")
-        store.load(expert_prefix + ".gate_proj.weight_scale_inv", device="cpu")
-        store.load(expert_prefix + ".up_proj.weight", device="cpu")
-        store.load(expert_prefix + ".up_proj.weight_scale_inv", device="cpu")
-        store.load(expert_prefix + ".down_proj.weight", device="cpu")
-        store.load(expert_prefix + ".down_proj.weight_scale_inv", device="cpu")
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            store.load(expert_prefix + f".{name}.weight", device="cpu")
+            store.load(expert_prefix + f".{name}.weight_scale_inv", device="cpu")
 
 
-def batched_moe_step(
-    root: Path,
-    layer: int,
-    residual: torch.Tensor,
-    top_k: int,
+def _run_expert_group(
+    triplets: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    moe_in: torch.Tensor,
+    weights: list[float],
     device: str,
-) -> tuple[torch.Tensor, list[int], list[float], float, float]:
-    """Run selected routed experts as one batched GPU workload."""
-    prefix = base.layer_prefix(layer)
-    post_norm = base.load_layer_weight(root, layer, "post_attention_layernorm.weight", device)
-    moe_in = base.rmsnorm(residual, post_norm).reshape(1, base.HIDDEN).float()
-    router_w = base.load_layer_weight(root, layer, "mlp.gate.weight", device).float()
+) -> torch.Tensor:
+    gate_w = torch.stack([triplet[0] for triplet in triplets], dim=0)
+    up_w = torch.stack([triplet[1] for triplet in triplets], dim=0)
+    down_w = torch.stack([triplet[2] for triplet in triplets], dim=0)
+    batch_x = moe_in.expand(len(triplets), -1)
 
-    routed = base.route(moe_in.reshape(-1), router_w, top_k=top_k)
-    expert_ids = [int(v) for v in routed.expert_ids.detach().cpu().tolist()]
-    weights = [float(v) for v in routed.weights.detach().cpu().tolist()]
-
-    # First make all routed raw tensors RAM-hot. Then stage the 24 dequantized
-    # matrices concurrently. The latter overlaps CPU-side orchestration and
-    # CUDA launches instead of serially feeding the GPU projection-by-projection.
-    if device == "cuda":
-        _warm_expert_raw_cache(root, prefix, expert_ids)
-
-    with ThreadPoolExecutor(max_workers=min(EXPERT_LOAD_WORKERS, len(expert_ids))) as pool:
-        futures = [
-            pool.submit(_expert_projection_triplet, root, prefix, expert_id, device)
-            for expert_id in expert_ids
-        ]
-        triplets = [future.result() for future in futures]
-
-    gate_weights = [triplet[0] for triplet in triplets]
-    up_weights = [triplet[1] for triplet in triplets]
-    down_weights = [triplet[2] for triplet in triplets]
-
-    gate_w = torch.stack(gate_weights, dim=0)
-    up_w = torch.stack(up_weights, dim=0)
-    down_w = torch.stack(down_weights, dim=0)
-
-    batch_x = moe_in.expand(len(expert_ids), -1)
     if device == "cuda":
         with torch.autocast(device_type="cuda", dtype=torch.float16):
             batch_x_compute = batch_x.to(dtype=torch.float16)
@@ -169,7 +130,58 @@ def batched_moe_step(
         expert_out = torch.bmm(down_w, hidden.unsqueeze(-1)).squeeze(-1)
         routing = torch.tensor(weights, device=device, dtype=expert_out.dtype).reshape(-1, 1)
         routed_sum = (expert_out * routing).sum(dim=0, keepdim=True)
-        batch_x_compute = batch_x
+
+    del gate_w, up_w, down_w, batch_x, gate, up, hidden, expert_out, routing
+    return routed_sum
+
+
+def batched_moe_step(
+    root: Path,
+    layer: int,
+    residual: torch.Tensor,
+    top_k: int,
+    device: str,
+) -> tuple[torch.Tensor, list[int], list[float], float, float]:
+    prefix = base.layer_prefix(layer)
+    post_norm = base.load_layer_weight(root, layer, "post_attention_layernorm.weight", device)
+    moe_in = base.rmsnorm(residual, post_norm).reshape(1, base.HIDDEN).float()
+    router_w = base.load_layer_weight(root, layer, "mlp.gate.weight", device).float()
+
+    routed = base.route(moe_in.reshape(-1), router_w, top_k=top_k)
+    expert_ids = [int(v) for v in routed.expert_ids.detach().cpu().tolist()]
+    weights = [float(v) for v in routed.weights.detach().cpu().tolist()]
+
+    if device == "cuda":
+        _warm_expert_raw_cache(root, prefix, expert_ids)
+
+    eager_count = min(EXPERT_EAGER_COUNT, len(expert_ids))
+    eager_ids = expert_ids[:eager_count]
+    eager_weights = weights[:eager_count]
+    rest_ids = expert_ids[eager_count:]
+    rest_weights = weights[eager_count:]
+
+    # Load a small eager group first. Remaining experts are staged in worker
+    # threads while the GPU executes this group, hiding H2D/dequant latency.
+    eager_triplets = [
+        _expert_projection_triplet(root, prefix, expert_id, device)
+        for expert_id in eager_ids
+    ]
+    rest_triplets: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    executor = ThreadPoolExecutor(max_workers=min(EXPERT_LOAD_WORKERS, max(len(rest_ids), 1)))
+    futures = [
+        executor.submit(_expert_projection_triplet, root, prefix, expert_id, device)
+        for expert_id in rest_ids
+    ]
+
+    try:
+        routed_sum = _run_expert_group(eager_triplets, moe_in, eager_weights, device)
+        if futures:
+            rest_triplets = [future.result() for future in futures]
+            rest_out = _run_expert_group(rest_triplets, moe_in, rest_weights, device)
+            routed_sum = routed_sum + rest_out
+            del rest_out
+    finally:
+        executor.shutdown(wait=True)
 
     shared_gate_w = base.load_layer_weight(root, layer, "mlp.shared_expert_gate.weight", device).float()
     shared_gate_proj = _projection(root, f"{prefix}mlp.shared_expert.gate_proj", device)
@@ -192,13 +204,9 @@ def batched_moe_step(
     moe_input_norm = float(torch.linalg.vector_norm(moe_in).item())
 
     del post_norm, moe_in, router_w, routed
-    del gate_weights, up_weights, down_weights, triplets
-    del gate_w, up_w, down_w, batch_x, batch_x_compute, gate, up, hidden, expert_out, routing, routed_sum
+    del eager_triplets, rest_triplets, futures
     del shared_gate_w, shared_gate, shared_gate_proj, shared_up_proj, shared_down_proj
-    del shared_hidden, shared_out, moe_out
-    # Deliberately do not call gc.collect() here. Python GC between all 40
-    # layers forces the CPU to stop and starves the GPU; collection is deferred
-    # to the token boundary below.
+    del shared_hidden, shared_out, moe_out, routed_sum
     return layer_out, expert_ids, weights, shared_gate_value, moe_input_norm
 
 
@@ -320,30 +328,22 @@ def generate_response(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Batch Qwen3.6 router mini-chat test")
-    parser.add_argument("root", type=Path)
-    parser.add_argument("--prompt", action="append", required=True, help="Prompt to test; repeat --prompt for multiple turns")
+    parser.add_argument("model_dir", type=Path)
+    parser.add_argument("--device", default="cpu")
     parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
+    parser.add_argument("--sampling-top-k", type=int, default=20)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--top-k", type=int, default=20, help="Sampling top-k")
-    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     args = parser.parse_args()
 
-    if args.device == "cuda" and not torch.cuda.is_available():
-        raise SystemExit("CUDA unavailable")
-    if args.max_new_tokens < 1:
-        raise SystemExit("--max-new-tokens must be >= 1")
-    if args.top_k < 1:
-        raise SystemExit("--top-k must be >= 1")
+    root = args.model_dir.resolve()
+    device = args.device.lower()
+    if device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but not available")
 
-    root = args.root.resolve()
+    cached._configure_vram_limit(device)
     tokenizer = load_tokenizer(root)
-    lm_name, lm_head, _ = load_lm_head(root)
-    norm_name, final_norm = load_final_norm(root)
-
-    if args.device == "cuda":
-        cached._configure_vram_limit("cuda")
-        cached.cached_runtime_tensor(root, norm_name, "cuda", dtype=torch.float32)
-        cached.cached_runtime_tensor(root, lm_name, "cuda", dtype=torch.float16)
+    final_norm, final_norm_name = load_final_norm(root, device)
+    lm_head, lm_head_name = load_lm_head(root, device)
 
     print("op=batch-mini-chat")
     print("mode=experimental-stateless-autoregressive")
@@ -353,33 +353,40 @@ def main() -> None:
     print("vram_dequantized_cache=fp16")
     print("cuda_compute=fp16-autocast")
     print(f"expert_load_workers={EXPERT_LOAD_WORKERS}")
-    print(f"prompts={len(args.prompt)}")
-    print(f"device={args.device}")
+    print(f"expert_eager_count={EXPERT_EAGER_COUNT}")
+    print("expert_prefetch=stream-overlap")
+    print("expert_compressed_tiers=FP16-hot|FP8-resident")
+    print("expert_eviction=FP16-drop|FP8-drop")
+    print("expert_fp8_promotion=disabled")
+    print("expert_q4_gpu_tier=disabled")
+    print("expert_kernel_fused_dequant=not-yet")
+    print("prompts=4")
+    print(f"device={device}")
     print(f"max_new_tokens={args.max_new_tokens}")
-    print(f"sampling_top_k={args.top_k}")
+    print(f"sampling_top_k={args.sampling_top_k}")
     print(f"temperature={args.temperature}")
-    print(f"lm_head={lm_name} shape={tuple(lm_head.shape)}")
-    print(f"final_norm={norm_name} shape={tuple(final_norm.shape)}")
-    print_cache(root, "initial")
+    print(f"lm_head={lm_head_name} shape={tuple(lm_head.shape)}")
+    print(f"final_norm={final_norm_name} shape={tuple(final_norm.shape)}")
 
+    print_cache(root, "initial")
+    prompts = [
+        "Olá",
+        "Como você está?",
+        "Explique o que é uma CPU",
+        "Quanto é 2 + 2?",
+    ]
     total_start = perf_counter()
-    for index, prompt in enumerate(args.prompt, start=1):
-        print(f"\n===== TURN {index}/{len(args.prompt)} =====")
+    for prompt in prompts:
         generate_response(
             root, prompt, tokenizer, final_norm, lm_head,
-            norm_name, lm_name, args.device,
-            max_new_tokens=args.max_new_tokens,
-            sampling_top_k=args.top_k,
-            temperature=args.temperature,
+            final_norm_name, lm_head_name, device,
+            args.max_new_tokens, args.sampling_top_k, args.temperature,
         )
 
     print("\n===== SUMMARY =====")
-    print(f"turns={len(args.prompt)}")
+    print(f"turns={len(prompts)}")
     print(f"total_wall={perf_counter() - total_start:.3f}s")
     print_cache(root, "final")
-
-    del lm_head, final_norm
-    gc.collect()
 
 
 if __name__ == "__main__":
