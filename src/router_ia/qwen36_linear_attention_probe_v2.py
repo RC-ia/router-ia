@@ -1,12 +1,6 @@
 from __future__ import annotations
 
-"""Stage-by-stage fidelity probe for Qwen3.6 Gated DeltaNet.
-
-The probe deliberately separates projection, causal convolution, Q/K
-normalization, beta/decay gates, recurrent core, gated RMSNorm and out_proj.
-It uses one token, so the router's recurrent decode path is compared directly
-against the official Transformers layer.
-"""
+"""Stage-by-stage fidelity probe for Qwen3.6 Gated DeltaNet."""
 
 import argparse
 import gc
@@ -29,27 +23,23 @@ from .qwen36_layer_fidelity_probe import (
 from .qwen36_op_probe import load_embedding_row, rmsnorm
 
 DEFAULT_TOLERANCE = 1e-3
+LINEAR_CONV_DIM = base.LINEAR_KEY_DIM * 2 + base.LINEAR_VALUE_DIM
 
 
 def report(name, reference, candidate, tolerance):
     s = _stage_stats(reference, candidate)
     status = "PASS" if s[0] <= tolerance else "FAIL"
-    print(
-        f"  {name:<24} {status} max_abs={s[0]:.6g} mean_abs={s[1]:.6g} "
-        f"rel={s[2]:.6g} cosine={s[3]:.9f} ref_norm={s[4]:.6g} router_norm={s[5]:.6g}"
-    )
+    print(f"  {name:<24} {status} max_abs={s[0]:.6g} mean_abs={s[1]:.6g} rel={s[2]:.6g} cosine={s[3]:.9f} ref_norm={s[4]:.6g} router_norm={s[5]:.6g}")
     return status == "PASS"
 
 
 def capture_linears(fn):
     original = F.linear
     calls = []
-
     def wrapped(x, weight, bias=None):
         y = original(x, weight, bias)
         calls.append(y.detach().clone())
         return y
-
     F.linear = wrapped
     try:
         result = fn()
@@ -60,16 +50,13 @@ def capture_linears(fn):
 
 def capture_conv(fn):
     import transformers.models.qwen3_5_moe.modeling_qwen3_5_moe as qwen
-
     original = qwen.causal_conv1d_fn
     captured = {}
-
     def wrapped(x, weight, bias=None, activation=None, *args, **kwargs):
         y = _pure_torch_causal_conv1d(x, weight, bias, activation, *args, **kwargs)
         captured["input"] = x.detach().clone()
         captured["output"] = y.detach().clone()
         return y
-
     qwen.causal_conv1d_fn = wrapped
     try:
         result = fn()
@@ -79,15 +66,11 @@ def capture_conv(fn):
 
 
 def split_qkv(conv):
-    mixed = conv.reshape(1, base.LINEAR_CONV_DIM)
-    q, k, v = torch.split(
-        mixed,
-        [base.LINEAR_KEY_DIM, base.LINEAR_KEY_DIM, base.LINEAR_VALUE_DIM],
-        dim=-1,
-    )
+    mixed = conv.reshape(1, LINEAR_CONV_DIM)
+    q, k, v = torch.split(mixed, [base.LINEAR_KEY_DIM, base.LINEAR_KEY_DIM, base.LINEAR_VALUE_DIM], dim=-1)
     q = q.reshape(1, base.LINEAR_NUM_K_HEADS, 128).repeat_interleave(2, dim=1)
     k = k.reshape(1, base.LINEAR_NUM_K_HEADS, 128).repeat_interleave(2, dim=1)
-    v = v.reshape(1, base.LINEAR_NUM_VALUE_HEADS, 128)
+    v = v.reshape(1, base.LINEAR_NUM_V_HEADS, 128)
     q = q.float()
     k = k.float()
     q_norm = q * torch.rsqrt((q * q).sum(dim=-1, keepdim=True) + 1e-6)
@@ -97,10 +80,10 @@ def split_qkv(conv):
 
 
 def gates(a, b, layer):
-    a = a.float().reshape(1, base.LINEAR_NUM_VALUE_HEADS)
-    b = b.float().reshape(1, base.LINEAR_NUM_VALUE_HEADS)
-    a_log = layer.linear_attn.A_log.float().reshape(1, base.LINEAR_NUM_VALUE_HEADS)
-    dt = layer.linear_attn.dt_bias.float().reshape(1, base.LINEAR_NUM_VALUE_HEADS)
+    a = a.float().reshape(1, base.LINEAR_NUM_V_HEADS)
+    b = b.float().reshape(1, base.LINEAR_NUM_V_HEADS)
+    a_log = layer.linear_attn.A_log.float().reshape(1, base.LINEAR_NUM_V_HEADS)
+    dt = layer.linear_attn.dt_bias.float().reshape(1, base.LINEAR_NUM_V_HEADS)
     beta = torch.sigmoid(b)
     g = -torch.exp(a_log) * F.softplus(a + dt)
     decay = torch.exp(g)
@@ -108,11 +91,7 @@ def gates(a, b, layer):
 
 
 def recurrent(q, k, v, beta, decay):
-    state = torch.zeros(
-        (1, base.LINEAR_NUM_VALUE_HEADS, 128, 128),
-        device=q.device,
-        dtype=torch.float32,
-    )
+    state = torch.zeros((1, base.LINEAR_NUM_V_HEADS, 128, 128), device=q.device, dtype=torch.float32)
     state = state * decay.unsqueeze(-1).unsqueeze(-1)
     retrieved = (state * k.unsqueeze(-1)).sum(dim=-2)
     delta = (v.float() - retrieved) * beta.unsqueeze(-1)
@@ -133,50 +112,40 @@ def run(root, layer, layer_idx, hidden, device, tolerance):
             y = y[0]
         return y.reshape(1, base.HIDDEN)
 
-    # Reference projections + causal conv.
     ref_result, ref_linear = capture_linears(lambda: capture_conv(official)[0])
     _, ref_conv = capture_conv(official)
     if len(ref_linear) < 5:
         raise RuntimeError(f"Official GatedDeltaNet exposed only {len(ref_linear)} linear calls")
 
-    # The current HF implementation uses qkv, z, b, a, out_proj.  Shape-based
-    # selection makes the probe robust to harmless call-order changes.
     def by_last_dim(calls, dim, occurrence=0):
         matches = [x for x in calls if x.shape[-1] == dim]
         if len(matches) <= occurrence:
             raise RuntimeError(f"Could not locate projection output with last dim {dim}")
         return matches[occurrence]
 
-    ref_qkv = by_last_dim(ref_linear, base.LINEAR_CONV_DIM)
+    ref_qkv = by_last_dim(ref_linear, LINEAR_CONV_DIM)
     ref_z = by_last_dim(ref_linear, base.LINEAR_VALUE_DIM)
-    ref_b = by_last_dim(ref_linear, base.LINEAR_NUM_VALUE_HEADS)
-    ref_a = by_last_dim(ref_linear, base.LINEAR_NUM_VALUE_HEADS, 1)
+    ref_b = by_last_dim(ref_linear, base.LINEAR_NUM_V_HEADS)
+    ref_a = by_last_dim(ref_linear, base.LINEAR_NUM_V_HEADS, 1)
     ref_out = by_last_dim(ref_linear, base.HIDDEN)
 
-    # Make the router call from a clean recurrent state.  This matters because
-    # this function is called several times below for independent captures.
     state = attention.active(root, device)
     state.reset()
-    router_result, router_linear = capture_linears(
-        lambda: attention.step_attention(root, layer_idx, hidden, device)
-    )
-    if len(router_linear) < 5:
-        raise RuntimeError(f"Router GatedDeltaNet exposed only {len(router_linear)} linear calls")
-
-    router_qkv = by_last_dim(router_linear, base.LINEAR_CONV_DIM)
+    router_result, router_linear = capture_linears(lambda: attention.step_attention(root, layer_idx, hidden, device))
+    router_qkv = by_last_dim(router_linear, LINEAR_CONV_DIM)
     router_z = by_last_dim(router_linear, base.LINEAR_VALUE_DIM)
-    router_b = by_last_dim(router_linear, base.LINEAR_NUM_VALUE_HEADS)
-    router_a = by_last_dim(router_linear, base.LINEAR_NUM_VALUE_HEADS, 1)
+    router_b = by_last_dim(router_linear, base.LINEAR_NUM_V_HEADS)
+    router_a = by_last_dim(router_linear, base.LINEAR_NUM_V_HEADS, 1)
     router_out = by_last_dim(router_linear, base.HIDDEN)
 
     print("\n=== PROJECTION ===")
-    ok = []
-    ok.append(report("in_proj_qkv", ref_qkv, router_qkv, tolerance))
-    ok.append(report("in_proj_z", ref_z, router_z, tolerance))
-    ok.append(report("in_proj_b", ref_b, router_b, tolerance))
-    ok.append(report("in_proj_a", ref_a, router_a, tolerance))
+    ok = [
+        report("in_proj_qkv", ref_qkv, router_qkv, tolerance),
+        report("in_proj_z", ref_z, router_z, tolerance),
+        report("in_proj_b", ref_b, router_b, tolerance),
+        report("in_proj_a", ref_a, router_a, tolerance),
+    ]
 
-    # Both sides start with an empty conv history for a one-token probe.
     tmp = attention.AttentionState()
     tmp.bind(device)
     conv_w = base.load_layer_weight(root, layer_idx, "linear_attn.conv1d.weight", device)
@@ -187,68 +156,40 @@ def run(root, layer, layer_idx, hidden, device, tolerance):
     ok.append(report("causal_conv", ref_conv_out, router_conv, tolerance))
     ref_q, ref_k, ref_v, ref_qn, ref_kn, ref_qs = split_qkv(ref_conv_out)
     r_q, r_k, r_v, r_qn, r_kn, r_qs = split_qkv(router_conv.reshape(1, -1, 1))
-    ok.append(report("q_l2norm", ref_qn, r_qn, tolerance))
-    ok.append(report("k_l2norm", ref_kn, r_kn, tolerance))
-    ok.append(report("q_scale", ref_qs, r_qs, tolerance))
-    ok.append(report("v_split", ref_v, r_v, tolerance))
+    ok += [report("q_l2norm", ref_qn, r_qn, tolerance), report("k_l2norm", ref_kn, r_kn, tolerance), report("q_scale", ref_qs, r_qs, tolerance), report("v_split", ref_v, r_v, tolerance)]
 
     print("\n=== BETA / DECAY ===")
     ref_beta, ref_g, ref_decay = gates(ref_a, ref_b, layer)
     r_beta, r_g, r_decay = gates(router_a, router_b, layer)
-    ok.append(report("beta=sigmoid(b)", ref_beta, r_beta, tolerance))
-    ok.append(report("g=-exp(A)*softplus", ref_g, r_g, tolerance))
-    ok.append(report("decay=exp(g)", ref_decay, r_decay, tolerance))
+    ok += [report("beta=sigmoid(b)", ref_beta, r_beta, tolerance), report("g=-exp(A)*softplus", ref_g, r_g, tolerance), report("decay=exp(g)", ref_decay, r_decay, tolerance)]
 
     print("\n=== RECURRENCE / GATED NORM ===")
-    # Reconstruct the exact recurrent fallback from the captured reference
-    # inputs. This isolates the recurrent state update from the gated norm.
     ref_core, _ = recurrent(ref_qs, ref_kn, ref_v, ref_beta, ref_decay)
-
     ref_norm = {}
-
     def pre(module, args):
-        if args:
-            ref_norm["x"] = args[0].detach().clone()
-        if len(args) > 1:
-            ref_norm["z"] = args[1].detach().clone()
-
+        if args: ref_norm["x"] = args[0].detach().clone()
+        if len(args) > 1: ref_norm["z"] = args[1].detach().clone()
     def post(module, args, output):
-        if isinstance(output, tuple):
-            output = output[0]
+        if isinstance(output, tuple): output = output[0]
         ref_norm["y"] = output.detach().clone()
-
     h1 = layer.linear_attn.norm.register_forward_pre_hook(pre)
     h2 = layer.linear_attn.norm.register_forward_hook(post)
-    try:
-        official()
+    try: official()
     finally:
-        h1.remove()
-        h2.remove()
+        h1.remove(); h2.remove()
 
-    # Reset before the second router run so the comparison is state=0 on both
-    # sides, then intercept the router's gated RMSNorm boundary.
     state.reset()
     router_norm = {}
     original_gated = attention.gated_rmsnorm
-
     def gated(x, z, weight, *args, **kwargs):
         y = original_gated(x, z, weight, *args, **kwargs)
-        router_norm["x"] = x.detach().clone()
-        router_norm["z"] = z.detach().clone()
-        router_norm["y"] = y[0].detach().clone()
+        router_norm["x"] = x.detach().clone(); router_norm["z"] = z.detach().clone(); router_norm["y"] = y[0].detach().clone()
         return y
-
     attention.gated_rmsnorm = gated
-    try:
-        router_norm_result = attention.step_attention(root, layer_idx, hidden, device)
-    finally:
-        attention.gated_rmsnorm = original_gated
+    try: router_norm_result = attention.step_attention(root, layer_idx, hidden, device)
+    finally: attention.gated_rmsnorm = original_gated
 
-    ok.append(report("recurrent_core", ref_norm["x"], router_norm["x"], tolerance))
-    ok.append(report("gate_z", ref_norm["z"], router_norm["z"], tolerance))
-    ok.append(report("gated_rmsnorm", ref_norm["y"], router_norm["y"], tolerance))
-    ok.append(report("out_proj", ref_out, router_out, tolerance))
-    ok.append(report("linear_attention_total", ref_result, router_result, tolerance))
+    ok += [report("recurrent_core", ref_norm["x"], router_norm["x"], tolerance), report("gate_z", ref_norm["z"], router_norm["z"], tolerance), report("gated_rmsnorm", ref_norm["y"], router_norm["y"], tolerance), report("out_proj", ref_out, router_out, tolerance), report("linear_attention_total", ref_result, router_norm_result, tolerance)]
 
     print("\n=== RESULT ===")
     print(f"status={'PASS' if all(ok) else 'FAIL'}")
@@ -263,40 +204,27 @@ def main():
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--tolerance", type=float, default=DEFAULT_TOLERANCE)
     args = parser.parse_args()
-
-    if args.device == "cuda" and not torch.cuda.is_available():
-        raise SystemExit("CUDA unavailable")
-    if not 0 <= args.layer < base.DEFAULT_LAYERS:
-        raise SystemExit(f"--layer must be in [0, {base.DEFAULT_LAYERS - 1}]")
-
+    if args.device == "cuda" and not torch.cuda.is_available(): raise SystemExit("CUDA unavailable")
+    if not 0 <= args.layer < base.DEFAULT_LAYERS: raise SystemExit(f"--layer must be in [0, {base.DEFAULT_LAYERS - 1}]")
     root = args.root.resolve()
-    if base.attention_type(root, args.layer) != "linear_attention":
-        raise SystemExit(f"Layer {args.layer} is not linear_attention")
-
+    if base.attention_type(root, args.layer) != "linear_attention": raise SystemExit(f"Layer {args.layer} is not linear_attention")
     config = _load_config(root)
     model = _build_meta_model(config)
     layers = _find_layers(model)
     layer = layers[args.layer]
     loaded, total = _materialize_layer(root, layer, args.layer, args.device)
-
     print("op=linear-attention-fidelity-detailed")
     print(f"layer={args.layer}")
     print(f"token_id={args.token_id}")
     print(f"device={args.device}")
     print(f"loaded={loaded}/{total}")
     print(f"tolerance={args.tolerance}")
-
     hidden = load_embedding_row(root, args.token_id).reshape(1, base.HIDDEN).to(args.device).float()
     state = attention.state_for(root, args.device)
-    state.reset()
-    attention.activate(root, state)
-    try:
-        run(root, layer, args.layer, hidden, args.device, args.tolerance)
+    state.reset(); attention.activate(root, state)
+    try: run(root, layer, args.layer, hidden, args.device, args.tolerance)
     finally:
-        attention.deactivate(root)
-        layer.to_empty(device="meta")
-        gc.collect()
+        attention.deactivate(root); layer.to_empty(device="meta"); gc.collect()
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
