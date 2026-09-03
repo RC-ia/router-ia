@@ -1,15 +1,6 @@
 from __future__ import annotations
 
-"""Layer-by-layer fidelity probe for Qwen3.6.
-
-The complete 35B reference model is never materialized with real weights.
-Transformers is instantiated on ``meta`` and only the decoder layer currently
-being tested is materialized. Checkpoint tensors are loaded directly from
-safetensors, with FP8 tensors dequantized using the router's blockwise helper.
-
-A single token is advanced through all 40 layers. At every layer we compare the
-official Transformers layer against the router layer. This keeps reference memory bounded by roughly one decoder layer while exposing the first failing layer.
-"""
+"""Layer-by-layer fidelity probe for Qwen3.6."""
 
 import argparse
 import gc
@@ -34,8 +25,19 @@ def _load_config(root: Path):
     return AutoConfig.from_pretrained(str(root), local_files_only=True)
 
 
+def _disable_optional_qwen_kernels() -> None:
+    """Force Qwen3.5/3.6 reference modules onto pure-PyTorch fallbacks."""
+    import transformers.models.qwen3_5_moe.modeling_qwen3_5_moe as qwen
+    qwen.causal_conv1d_fn = None
+    qwen.causal_conv1d_update = None
+    qwen.chunk_gated_delta_rule = None
+    qwen.fused_recurrent_gated_delta_rule = None
+    qwen.FusedRMSNormGated = None
+
+
 def _build_meta_model(config) -> torch.nn.Module:
     from transformers import AutoModelForCausalLM
+    _disable_optional_qwen_kernels()
     with torch.device("meta"):
         model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
     model.eval()
