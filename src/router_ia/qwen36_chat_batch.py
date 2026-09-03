@@ -94,20 +94,38 @@ def _expert_projection_triplet(
     )
 
 
-def _warm_expert_raw_cache(root: Path, layer_prefix: str, expert_ids: list[int]) -> None:
-    """Ensure routed FP8 weights/scales are resident in RAM before GPU staging."""
+def _prefetch_one_expert_raw(root: Path, layer_prefix: str, expert_id: int) -> None:
+    cache = __import__("router_ia.qwen36_expert_cache", fromlist=["RoutedExpertCache"])
     store = cached._store(root)
-    for expert_id in expert_ids:
-        expert_prefix = f"{layer_prefix}mlp.experts.{expert_id}"
-        for name in (
-            "gate_proj.weight",
-            "gate_proj.weight_scale_inv",
-            "up_proj.weight",
-            "up_proj.weight_scale_inv",
-            "down_proj.weight",
-            "down_proj.weight_scale_inv",
-        ):
-            store.load(expert_prefix + "." + name, device="cpu")
+    # Reuse the persistent expert cache's raw-prefetch path so the stream holds
+    # the original FP8 weights/scales instead of an unnecessary FP16 copy.
+    expert_cache = cache._EXPERT_CACHES.get(root.resolve()) if hasattr(cache, "_EXPERT_CACHES") else None
+    if expert_cache is None:
+        return
+    expert_cache.prefetch_expert_raw(store, layer_prefix, expert_id)
+
+
+def _warm_expert_raw_cache(root: Path, layer_prefix: str, expert_ids: list[int]) -> None:
+    """Prefetch routed FP8 weights/scales into the rotating VRAM stream in parallel."""
+    if not expert_ids:
+        return
+    store = cached._store(root)
+    # Import the active fused cache instance without creating a second cache.
+    from .qwen36_expert_cache import RoutedExpertCache
+    from .qwen36_chat_batch_fused import _EXPERT_CACHES  # type: ignore
+
+    expert_cache = _EXPERT_CACHES.get(root.resolve())
+    if expert_cache is None or not isinstance(expert_cache, RoutedExpertCache):
+        return
+
+    workers = min(EXPERT_LOAD_WORKERS, len(expert_ids))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(expert_cache.prefetch_expert_raw, store, layer_prefix, expert_id)
+            for expert_id in expert_ids
+        ]
+        for future in futures:
+            future.result()
 
 
 def batched_moe_step(
@@ -293,14 +311,14 @@ def main() -> None:
     print("warning=no DeltaNet recurrent state or full-attention KV cache yet")
     print("cache=hierarchical-vram-ram-ssd")
     print("vram_policy=resident-60pct-hot-experts-20pct-stream-20pct")
-    print("vram_dequantized_cache=fp16")
+    print("vram_dequantized_cache=fp16-temporary")
     print("cuda_compute=fp16-autocast")
     print(f"expert_load_workers={EXPERT_LOAD_WORKERS}")
-    print("expert_prefetch=stream-overlap")
-    print("expert_compressed_tiers=FP16-hot|FP8-resident")
-    print("expert_eviction=FP16-drop|FP8-drop")
+    print("expert_prefetch=stream-parallel")
+    print("expert_compressed_tiers=FP8-resident|Q4-cold")
+    print("expert_eviction=FP8-to-Q4-then-drop")
     print("expert_fp8_promotion=disabled")
-    print("expert_q4_gpu_tier=disabled")
+    print("expert_fp16_persistent_cache=disabled")
     print("expert_kernel_fused_dequant=not-yet")
     print("prompts=4")
     print(f"device={device}")
