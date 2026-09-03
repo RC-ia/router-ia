@@ -134,8 +134,10 @@ def run(root, layer, layer_idx, hidden, device, tolerance):
     router_result, router_linear = capture_linears(lambda: attention.step_attention(root, layer_idx, hidden, device))
     router_qkv = by_last_dim(router_linear, LINEAR_CONV_DIM)
     router_z = by_last_dim(router_linear, base.LINEAR_VALUE_DIM)
-    router_b = by_last_dim(router_linear, base.LINEAR_NUM_V_HEADS)
-    router_a = by_last_dim(router_linear, base.LINEAR_NUM_V_HEADS, 1)
+    # Runtime order is in_proj_a, then in_proj_b. The previous probe
+    # incorrectly assigned occurrence 0 to b and occurrence 1 to a.
+    router_a = by_last_dim(router_linear, base.LINEAR_NUM_V_HEADS)
+    router_b = by_last_dim(router_linear, base.LINEAR_NUM_V_HEADS, 1)
     router_out = by_last_dim(router_linear, base.HIDDEN)
 
     print("\n=== PROJECTION ===")
