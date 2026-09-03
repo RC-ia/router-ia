@@ -95,6 +95,16 @@ def _cache_shapes(cache, layer_idx: int) -> tuple[str, str]:
     )
 
 
+def _cache_tensors(cache, layer_idx: int):
+    """Return reference conv/recurrent tensors when DynamicCache exposes them."""
+    if layer_idx >= len(cache.layers):
+        return None, None
+    layer_cache = cache.layers[layer_idx]
+    conv = getattr(layer_cache, "conv_states", None)
+    rec = getattr(layer_cache, "recurrent_states", None)
+    return (conv if torch.is_tensor(conv) else None), (rec if torch.is_tensor(rec) else None)
+
+
 def run_layer(
     root: Path,
     layer_idx: int,
@@ -162,11 +172,24 @@ def run_layer(
             conv_shape, rec_shape = _cache_shapes(ref_cache, layer_idx)
             runtime_conv = state.linear_conv_states.get(layer_idx)
             runtime_rec = state.linear_states.get(layer_idx)
+            ref_conv, ref_rec = _cache_tensors(ref_cache, layer_idx)
             if runtime_conv is not None and runtime_rec is not None:
                 print(
                     f"  reference_cache_shapes       conv={conv_shape} recurrent={rec_shape} "
                     f"runtime_conv={tuple(runtime_conv.shape)} runtime_recurrent={tuple(runtime_rec.shape)}"
                 )
+
+            # Compare the actual persistent states. This distinguishes a final
+            # projection/rounding difference from divergence in the recurrent cache.
+            if ref_conv is not None and runtime_conv is not None:
+                all_pass &= report("conv_state", ref_conv, runtime_conv, tolerance)
+            else:
+                print("  conv_state                   UNAVAILABLE")
+
+            if ref_rec is not None and runtime_rec is not None:
+                all_pass &= report("recurrent_state", ref_rec, runtime_rec, tolerance)
+            else:
+                print("  recurrent_state              UNAVAILABLE")
 
             print(f"  transition={('initial' if position == 0 else 'recurrent')} ")
 
@@ -217,9 +240,11 @@ def main() -> int:
         target_layers = [args.layer]
 
     dtype = torch.bfloat16 if args.device == "cuda" else torch.float32
-    base_hidden = load_embedding_row(root, args.token_id).reshape(1, base.HIDDEN).to(args.device).to(dtype)
     hidden_tokens = [
-        base_hidden if position == 0 else load_embedding_row(root, args.token_id + position).reshape(1, base.HIDDEN).to(args.device).to(dtype)
+        load_embedding_row(root, args.token_id + position)
+        .reshape(1, base.HIDDEN)
+        .to(args.device)
+        .to(dtype)
         for position in range(args.tokens)
     ]
 
