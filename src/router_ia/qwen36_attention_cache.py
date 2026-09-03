@@ -15,6 +15,9 @@ from .qwen36_op_probe import rmsnorm
 
 ROPE_THETA = 10_000_000.0
 ROPE_DIM = int(base.FULL_HEAD_DIM * 0.25)
+LINEAR_CONV_KERNEL = 4
+LINEAR_CONV_STATE = LINEAR_CONV_KERNEL - 1
+LINEAR_CONV_DIM = base.LINEAR_KEY_DIM * 2 + base.LINEAR_VALUE_DIM
 
 
 @dataclass
@@ -22,6 +25,7 @@ class AttentionState:
     full_keys: dict[int, torch.Tensor] = field(default_factory=dict)
     full_values: dict[int, torch.Tensor] = field(default_factory=dict)
     linear_states: dict[int, torch.Tensor] = field(default_factory=dict)
+    linear_conv_states: dict[int, torch.Tensor] = field(default_factory=dict)
     tokens_seen: int = 0
     device: str | None = None
 
@@ -29,6 +33,7 @@ class AttentionState:
         self.full_keys.clear()
         self.full_values.clear()
         self.linear_states.clear()
+        self.linear_conv_states.clear()
         self.tokens_seen = 0
 
     def bind(self, device: str) -> None:
@@ -39,8 +44,22 @@ class AttentionState:
     def snapshot(self) -> dict[str, int | float]:
         full_tokens = sum(int(value.shape[-1]) for value in self.full_keys.values())
         linear_bytes = sum(int(value.numel() * value.element_size()) for value in self.linear_states.values())
-        full_bytes = sum(int(tensor.numel() * tensor.element_size()) for tensor in [*self.full_keys.values(), *self.full_values.values()])
-        return {"tokens_seen": int(self.tokens_seen), "full_layers_cached": len(self.full_keys), "full_tokens": full_tokens, "full_bytes": full_bytes, "linear_layers_cached": len(self.linear_states), "linear_bytes": linear_bytes, "bytes": full_bytes + linear_bytes}
+        conv_bytes = sum(int(value.numel() * value.element_size()) for value in self.linear_conv_states.values())
+        full_bytes = sum(
+            int(tensor.numel() * tensor.element_size())
+            for tensor in [*self.full_keys.values(), *self.full_values.values()]
+        )
+        return {
+            "tokens_seen": int(self.tokens_seen),
+            "full_layers_cached": len(self.full_keys),
+            "full_tokens": full_tokens,
+            "full_bytes": full_bytes,
+            "linear_layers_cached": len(self.linear_states),
+            "linear_bytes": linear_bytes,
+            "linear_conv_layers_cached": len(self.linear_conv_states),
+            "linear_conv_bytes": conv_bytes,
+            "bytes": full_bytes + linear_bytes + conv_bytes,
+        }
 
 
 _STATES: dict[Path, AttentionState] = {}
@@ -88,7 +107,10 @@ def active(root: Path, device: str) -> AttentionState:
 def _rope(position: int, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
     if ROPE_DIM <= 0 or ROPE_DIM % 2:
         raise ValueError(f"Invalid rotary dimension: {ROPE_DIM}")
-    inv_freq = 1.0 / (ROPE_THETA ** (torch.arange(0, ROPE_DIM, 2, device=device, dtype=torch.float32) / ROPE_DIM))
+    inv_freq = 1.0 / (
+        ROPE_THETA
+        ** (torch.arange(0, ROPE_DIM, 2, device=device, dtype=torch.float32) / ROPE_DIM)
+    )
     angles = float(position) * inv_freq
     emb = torch.cat((angles, angles), dim=-1)
     return emb.cos().to(dtype), emb.sin().to(dtype)
@@ -114,6 +136,49 @@ def _projection(root: Path, prefix: str, device: str) -> torch.Tensor:
     return cached._cached_load_projection(root, prefix, device)
 
 
+def _causal_conv1d_step(
+    state: AttentionState,
+    layer: int,
+    mixed_qkv: torch.Tensor,
+    conv_weight: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the exact one-token causal depthwise conv used by Qwen3.6.
+
+    The model uses kernel size 4 and therefore carries the previous three
+    pre-convolution QKV vectors between tokens. The cache stores those raw
+    vectors, then the current output is computed over ``[t-3, t-2, t-1, t]``.
+    """
+    if mixed_qkv.ndim != 2 or mixed_qkv.shape != (1, LINEAR_CONV_DIM):
+        raise ValueError(f"Unexpected mixed_qkv shape: {tuple(mixed_qkv.shape)}")
+    if conv_weight.ndim != 3:
+        raise ValueError(f"Unexpected conv weight shape: {tuple(conv_weight.shape)}")
+    if conv_weight.shape[0] != LINEAR_CONV_DIM or conv_weight.shape[1] != 1 or conv_weight.shape[2] != LINEAR_CONV_KERNEL:
+        raise ValueError(f"Unexpected conv weight shape: {tuple(conv_weight.shape)}")
+
+    conv_dtype = conv_weight.dtype
+    mixed = mixed_qkv.to(dtype=conv_dtype).reshape(1, LINEAR_CONV_DIM, 1)
+    conv_state = state.linear_conv_states.get(int(layer))
+    expected_shape = (1, LINEAR_CONV_DIM, LINEAR_CONV_STATE)
+    if conv_state is None or conv_state.device != mixed.device or tuple(conv_state.shape) != expected_shape:
+        conv_state = torch.zeros(expected_shape, device=mixed.device, dtype=conv_dtype)
+
+    history = torch.cat((conv_state, mixed), dim=-1)
+    conv_state = history[:, :, -LINEAR_CONV_STATE:].detach()
+    state.linear_conv_states[int(layer)] = conv_state
+
+    out = F.conv1d(
+        history,
+        conv_weight,
+        bias=None,
+        stride=1,
+        padding=0,
+        dilation=1,
+        groups=LINEAR_CONV_DIM,
+    )
+    out = F.silu(out[:, :, -1:])
+    return out[:, :, 0].to(dtype=mixed_qkv.dtype)
+
+
 def _linear_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> torch.Tensor:
     state = active(root, device)
     prefix = base.layer_prefix(layer)
@@ -121,14 +186,17 @@ def _linear_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> t
     h = rmsnorm(x0, input_norm)
     compute_dtype = torch.float16 if device == "cuda" else torch.float32
     h_compute = h.to(dtype=compute_dtype)
+
     qkv_w = _projection(root, prefix + "linear_attn.in_proj_qkv", device)
-    mixed = F.linear(h_compute.to(dtype=qkv_w.dtype), qkv_w).reshape(1, base.LINEAR_KEY_DIM * 2 + base.LINEAR_VALUE_DIM)
-    conv_w = base.load_layer_weight(root, layer, "linear_attn.conv1d.weight", device).float()
-    mixed = F.silu(mixed * conv_w[:, 0, -1].reshape(1, -1).to(dtype=mixed.dtype))
+    mixed = F.linear(h_compute.to(dtype=qkv_w.dtype), qkv_w).reshape(1, LINEAR_CONV_DIM)
+
+    conv_w = base.load_layer_weight(root, layer, "linear_attn.conv1d.weight", device)
+    mixed = _causal_conv1d_step(state, layer, mixed, conv_w)
     q, k, v = torch.split(mixed, [base.LINEAR_KEY_DIM, base.LINEAR_KEY_DIM, base.LINEAR_VALUE_DIM], dim=-1)
     q = q.reshape(1, base.LINEAR_NUM_K_HEADS, 128).repeat_interleave(2, dim=1)
     k = k.reshape(1, base.LINEAR_NUM_K_HEADS, 128).repeat_interleave(2, dim=1)
     v = v.reshape(1, base.LINEAR_NUM_VALUE_HEADS, 128)
+
     a_w = _projection(root, prefix + "linear_attn.in_proj_a", device)
     b_w = _projection(root, prefix + "linear_attn.in_proj_b", device)
     a_log = base.load_layer_weight(root, layer, "linear_attn.A_log", device).float().reshape(1, base.LINEAR_NUM_VALUE_HEADS)
@@ -138,26 +206,35 @@ def _linear_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> t
     beta = torch.sigmoid(b_raw)
     g = -torch.exp(a_log) * F.softplus(a_raw + dt_bias)
     decay = torch.exp(g)
-    q = F.normalize(q.float(), dim=-1, eps=base.EPS) * (128 ** -0.5)
-    k = F.normalize(k.float(), dim=-1, eps=base.EPS)
+
+    q = F.normalize(q.float(), dim=-1, eps=1e-6) * (128 ** -0.5)
+    k = F.normalize(k.float(), dim=-1, eps=1e-6)
     linear_state = state.linear_states.get(int(layer))
-    if linear_state is None or linear_state.device != x0.device:
-        linear_state = torch.zeros(1, base.LINEAR_NUM_VALUE_HEADS, 128, 128, device=device, dtype=torch.float32)
+    expected_state_shape = (1, base.LINEAR_NUM_VALUE_HEADS, 128, 128)
+    if linear_state is None or linear_state.device != x0.device or tuple(linear_state.shape) != expected_state_shape:
+        linear_state = torch.zeros(expected_state_shape, device=x0.device, dtype=torch.float32)
+
     linear_state = linear_state * decay.unsqueeze(-1).unsqueeze(-1)
     retrieved = (linear_state * k.unsqueeze(-1)).sum(dim=-2)
     delta = (v.float() - retrieved) * beta.unsqueeze(-1)
     linear_state = linear_state + k.unsqueeze(-1) * delta.unsqueeze(-2)
     state.linear_states[int(layer)] = linear_state.detach()
     attn = (linear_state * q.unsqueeze(-1)).sum(dim=-2)
+
     z_w = _projection(root, prefix + "linear_attn.in_proj_z", device)
     z = F.linear(h_compute.to(dtype=z_w.dtype), z_w).reshape(1, base.LINEAR_NUM_VALUE_HEADS, 128)
     norm_w = base.load_layer_weight(root, layer, "linear_attn.norm.weight", device)
     gated, _, _ = gated_rmsnorm(attn, z, norm_w)
     out_w = _projection(root, prefix + "linear_attn.out_proj", device)
-    gated_compute = gated.reshape(1, base.LINEAR_VALUE_DIM).to(dtype=out_w.dtype if device == "cuda" else compute_dtype)
+    gated_compute = gated.reshape(1, base.LINEAR_VALUE_DIM).to(
+        dtype=out_w.dtype if device == "cuda" else compute_dtype
+    )
     attn_projected = F.linear(gated_compute, out_w).float()
     residual = x0.reshape(1, base.HIDDEN).float() + attn_projected
-    del input_norm, h, h_compute, qkv_w, mixed, conv_w, q, k, v, a_w, b_w, a_log, dt_bias, a_raw, b_raw, beta, g, decay, retrieved, delta, attn, z_w, z, norm_w, gated, out_w, gated_compute, attn_projected
+
+    del input_norm, h, h_compute, qkv_w, mixed, conv_w, q, k, v
+    del a_w, b_w, a_log, dt_bias, a_raw, b_raw, beta, g, decay, retrieved, delta, attn
+    del z_w, z, norm_w, gated, out_w, gated_compute, attn_projected
     return residual
 
 
@@ -205,7 +282,8 @@ def _full_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> tor
     out_w = _projection(root, prefix + "self_attn.o_proj", device)
     attn_projected = F.linear(attn_flat.to(dtype=out_w.dtype), out_w).float()
     residual = x0.reshape(1, base.HIDDEN).float() + attn_projected
-    del input_norm, h, h_compute, q_w, k_w, v_w, q_gate, q, gate, k, v, q_norm_w, k_norm_w, k_token, v_token, k_expanded, v_expanded, q_now, scores, attn_weights, attn, attn_flat, out_w, attn_projected
+    del input_norm, h, h_compute, q_w, k_w, v_w, q_gate, q, gate, k, v, q_norm_w, k_norm_w, k_token, v_token
+    del k_expanded, v_expanded, q_now, scores, attn_weights, attn, attn_flat, out_w, attn_projected
     return residual
 
 
@@ -217,4 +295,18 @@ def step_attention(root: Path, layer: int, x0: torch.Tensor, device: str) -> tor
 
 def stats(root: Path) -> dict[str, int | float]:
     state = _STATES.get(root.resolve())
-    return state.snapshot() if state is not None else {"tokens_seen": 0, "full_layers_cached": 0, "full_tokens": 0, "full_bytes": 0, "linear_layers_cached": 0, "linear_bytes": 0, "bytes": 0}
+    return (
+        state.snapshot()
+        if state is not None
+        else {
+            "tokens_seen": 0,
+            "full_layers_cached": 0,
+            "full_tokens": 0,
+            "full_bytes": 0,
+            "linear_layers_cached": 0,
+            "linear_bytes": 0,
+            "linear_conv_layers_cached": 0,
+            "linear_conv_bytes": 0,
+            "bytes": 0,
+        }
+    )
