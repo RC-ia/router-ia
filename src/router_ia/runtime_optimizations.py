@@ -57,8 +57,9 @@ def _without_allocator_flush(fn: Callable[..., _T]) -> Callable[..., _T]:
 
 
 def _configure_fused_cache_budget() -> None:
-    """Keep fused-runner caches within roughly 3 GiB of configured cache VRAM."""
-    if "qwen36_chat_batch_fused" not in sys.argv[0]:
+    """Keep the fused runner's cache pools within roughly 3 GiB total."""
+    invocation = " ".join(str(arg) for arg in sys.argv)
+    if "qwen36_chat_batch_fused" not in invocation:
         return
 
     expert_budget = 1 * 1024**3
@@ -107,7 +108,6 @@ def _run_token_hidden(root: Path, token_id: int, device: str) -> torch.Tensor:
             residual = _stateful_attention_step(root, layer, x, device)
             x, *_ = chat.batched_moe_step(root, layer, residual, top_k=8, device=device)
             del residual
-        _state(root, device).tokens_seen += 1
         return x
     except Exception:
         del x
@@ -138,7 +138,6 @@ def _run_generated_token_stateful(
             sampling_top_k,
             temperature,
         )
-        _state(root, device).tokens_seen += 1
         return result
     finally:
         attention_state.deactivate(root)
@@ -202,8 +201,6 @@ def _generate_response_stateful(
         generated: list[int] = []
         print("IA> ", end="", flush=True)
 
-        # The first generated token is sampled directly from the final prompt
-        # hidden state, so it is already available without another model pass.
         if max_new_tokens > 0:
             generated.append(current_id)
             print(tokenizer.decode([current_id], skip_special_tokens=True), end="", flush=True)
