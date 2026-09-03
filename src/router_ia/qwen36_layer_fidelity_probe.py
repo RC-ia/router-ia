@@ -215,6 +215,10 @@ def _reference_moe(layer, residual):
 
 def _run_diagnostic(root, layer, hidden_ref, hidden_router, layer_idx, device, tolerance):
     dtype = _module_input_dtype(layer)
+    # The official decoder receives BF16 hidden states on this path.  RMSNorm
+    # computes in FP32 internally but returns the original input dtype, so the
+    # router must enter the layer in the same dtype before comparing anything.
+    hidden_router = hidden_router.to(dtype=dtype)
     kind = base.attention_type(root, layer_idx)
     if kind == "full_attention":
         ref_normed, ref_attn, ref_residual = _reference_full_attention(layer, hidden_ref, dtype)
@@ -222,23 +226,21 @@ def _run_diagnostic(root, layer, hidden_ref, hidden_router, layer_idx, device, t
         ref_normed, ref_attn, ref_residual = _reference_attention(layer, hidden_ref, dtype)
     router_norm_weight = base.load_layer_weight(root, layer_idx, "input_layernorm.weight", device)
     router_normed = rmsnorm(hidden_router, router_norm_weight).float()
-    _print_stage("input_layernorm", ref_normed, router_normed, tolerance)
-    if kind == "linear_attention":
-        router_residual = attention.step_attention(root, layer_idx, hidden_router, device)
-    else:
-        router_residual = attention.step_attention(root, layer_idx, hidden_router, device)
-    router_attn = router_residual - hidden_router
-    _print_stage("attention", ref_attn, router_attn, tolerance)
-    _print_stage("post_attn_residual", ref_residual, router_residual, tolerance)
+    statuses = []
+    statuses.append(_print_stage("input_layernorm", ref_normed, router_normed, tolerance)[0])
+    router_residual = attention.step_attention(root, layer_idx, hidden_router, device)
+    router_attn = router_residual - hidden_router.float()
+    statuses.append(_print_stage("attention", ref_attn, router_attn, tolerance)[0])
+    statuses.append(_print_stage("post_attn_residual", ref_residual, router_residual, tolerance)[0])
     ref_postnorm, ref_moe, ref_final = _reference_moe(layer, ref_residual)
     router_postnorm_weight = base.load_layer_weight(root, layer_idx, "post_attention_layernorm.weight", device)
     router_postnorm = rmsnorm(router_residual, router_postnorm_weight)
-    _print_stage("post_attention_norm", ref_postnorm, router_postnorm, tolerance)
+    statuses.append(_print_stage("post_attention_norm", ref_postnorm, router_postnorm, tolerance)[0])
     router_final, *_ = chat.batched_moe_step(root, layer_idx, router_residual, top_k=8, device=device)
     router_moe = router_final - router_residual
-    _print_stage("moe", ref_moe, router_moe, tolerance)
-    _print_stage("final", ref_final, router_final, tolerance)
-    return ref_final, router_final
+    statuses.append(_print_stage("moe", ref_moe, router_moe, tolerance)[0])
+    statuses.append(_print_stage("final", ref_final, router_final, tolerance)[0])
+    return ref_final, router_final, all(status == "PASS" for status in statuses)
 
 
 def main():
@@ -281,10 +283,12 @@ def main():
             loaded, total = _materialize_layer(root, official_layer, layer_idx, args.device)
             if args.layer is None or args.layer == layer_idx:
                 print(f"L{layer_idx:02d} kind={base.attention_type(root, layer_idx)} loaded={loaded}/{total}")
-                ref_out, router_out = _run_diagnostic(root, official_layer, hidden_ref, hidden_router, layer_idx, args.device, args.tolerance)
+                ref_out, router_out, target_pass = _run_diagnostic(root, official_layer, hidden_ref, hidden_router, layer_idx, args.device, args.tolerance)
                 max_abs, mean_abs, rel, cosine, ref_norm, router_norm = _stage_stats(ref_out, router_out)
                 status = "PASS" if max_abs <= args.tolerance else "FAIL"
                 print(f"  SUMMARY            {status} max_abs={max_abs:.6g} mean_abs={mean_abs:.6g} rel={rel:.6g} cosine={cosine:.9f} ref_norm={ref_norm:.6g} router_norm={router_norm:.6g}")
+                if not target_pass or status == "FAIL":
+                    first_fail = layer_idx
             else:
                 # Build the independent reference chain for earlier layers.
                 dtype = _module_input_dtype(official_layer)
@@ -294,21 +298,14 @@ def main():
                 hidden_router = attention.step_attention(root, layer_idx, hidden_router, args.device)
                 hidden_router, *_ = chat.batched_moe_step(root, layer_idx, hidden_router, top_k=8, device=args.device)
                 hidden_router = hidden_router.detach().float()
-            if args.layer == layer_idx:
-                # Diagnostic already produced the target output.
-                pass
             official_layer.to_empty(device="meta")
             gc.collect()
-            if args.device == "cuda":
-                torch.cuda.empty_cache()
-            if args.stop_on_fail and args.layer == layer_idx:
-                # Recompute summary status from the target vectors is unnecessary; the
-                # diagnostic itself reports stage failures. Stop after one target layer.
+            if args.stop_on_fail and first_fail is not None:
                 break
     finally:
         attention.deactivate(root)
     print("\n=== RESULT ===")
-    print("status=PASS")
+    print(f"status={'FAIL' if first_fail is not None else 'PASS'}")
 
 
 if __name__ == "__main__":
