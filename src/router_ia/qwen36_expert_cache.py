@@ -79,14 +79,34 @@ class RoutedExpertCache:
             raw_scales.append(store.load(proj + ".weight_scale_inv", device="cpu"))
 
         if all(weight.dtype == torch.float8_e4m3fn for weight in raw_weights):
-            weight_batch = torch.stack(raw_weights, dim=0).to(device="cuda")
-            scale_batch = torch.stack(raw_scales, dim=0).to(device="cuda")
-            output_batch = dequant.dequantize_fp8_blockwise_batch(weight_batch, scale_batch)
-            output_batch = output_batch.to(dtype=torch.float16)
-            entry = tuple(output_batch.unbind(dim=0))
-            del weight_batch, scale_batch, output_batch
+            # Qwen3.6 uses different orientations for down_proj:
+            # gate/up = [512, 2048], down = [2048, 512]. The batched
+            # dequantizer requires equal-shaped matrices, so dequantize the
+            # two matching projections together and down_proj separately.
+            gate_up_weights = torch.stack(raw_weights[:2], dim=0).to(device="cuda")
+            gate_up_scales = torch.stack(raw_scales[:2], dim=0).to(device="cuda")
+            gate_up_batch = dequant.dequantize_fp8_blockwise_batch(
+                gate_up_weights, gate_up_scales
+            ).to(dtype=torch.float16)
+
+            down_weight = raw_weights[2].to(device="cuda")
+            down_scale = raw_scales[2].to(device="cuda")
+            down_output = dequant.dequantize_fp8_blockwise(
+                down_weight, down_scale
+            ).to(dtype=torch.float16)
+
+            entry = (
+                gate_up_batch[0],
+                gate_up_batch[1],
+                down_output,
+            )
+            del gate_up_weights, gate_up_scales, gate_up_batch
+            del down_weight, down_scale, down_output
         else:
-            entry = tuple(weight.to(device="cuda", dtype=torch.float16) for weight in raw_weights)
+            entry = tuple(
+                weight.to(device="cuda", dtype=torch.float16)
+                for weight in raw_weights
+            )
 
         self.put(layer, expert_id, entry)
         return entry
