@@ -30,7 +30,7 @@ def capture_linears(fn):
     calls = []
     def wrapped(x, weight, bias=None):
         y = original(x, weight, bias)
-        calls.append(y.detach().clone())
+        calls.append((y.detach().clone(), weight))
         return y
     F.linear = wrapped
     try:
@@ -108,16 +108,16 @@ def run(root, layer, layer_idx, hidden, device, tolerance):
         raise RuntimeError(f"Official GatedDeltaNet exposed only {len(ref_linear)} linear calls")
 
     def by_last_dim(calls, dim, occurrence=0):
-        matches = [x for x in calls if x.shape[-1] == dim]
+        matches = [x for x in calls if x[0].shape[-1] == dim]
         if len(matches) <= occurrence:
             raise RuntimeError(f"Could not locate projection output with last dim {dim}")
-        return matches[occurrence]
+        return matches[occurrence][0]
 
+    # Transformers' Qwen3.6 implementation evaluates in_proj_b before in_proj_a,
+    # while the router loads/calls in_proj_a before in_proj_b. Do not assume a
+    # shared positional occurrence between the two implementations.
     ref_qkv = by_last_dim(ref_linear, LINEAR_CONV_DIM)
     ref_z = by_last_dim(ref_linear, base.LINEAR_VALUE_DIM)
-    # Qwen3.6 exposes the gating projections as A first, then B in the
-    # captured F.linear stream. The previous probe labeled occurrence 0/1
-    # backwards, which made beta/decay appear catastrophically wrong.
     ref_b = by_last_dim(ref_linear, base.LINEAR_NUM_V_HEADS)
     ref_a = by_last_dim(ref_linear, base.LINEAR_NUM_V_HEADS, 1)
     ref_out = by_last_dim(ref_linear, base.HIDDEN)
@@ -126,8 +126,8 @@ def run(root, layer, layer_idx, hidden, device, tolerance):
     router_result, router_linear = capture_linears(lambda: attention.step_attention(root, layer_idx, hidden, device))
     router_qkv = by_last_dim(router_linear, LINEAR_CONV_DIM)
     router_z = by_last_dim(router_linear, base.LINEAR_VALUE_DIM)
-    router_b = by_last_dim(router_linear, base.LINEAR_NUM_V_HEADS)
-    router_a = by_last_dim(router_linear, base.LINEAR_NUM_V_HEADS, 1)
+    router_a = by_last_dim(router_linear, base.LINEAR_NUM_V_HEADS)
+    router_b = by_last_dim(router_linear, base.LINEAR_NUM_V_HEADS, 1)
     router_out = by_last_dim(router_linear, base.HIDDEN)
 
     print("\n=== PROJECTION ===")
