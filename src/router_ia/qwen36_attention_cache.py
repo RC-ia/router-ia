@@ -206,14 +206,14 @@ def _linear_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> t
     q, k, v = torch.split(mixed, [base.LINEAR_KEY_DIM, base.LINEAR_KEY_DIM, base.LINEAR_VALUE_DIM], dim=-1)
     q = q.reshape(1, base.LINEAR_NUM_K_HEADS, 128).repeat_interleave(2, dim=1)
     k = k.reshape(1, base.LINEAR_NUM_K_HEADS, 128).repeat_interleave(2, dim=1)
-    v = v.reshape(1, base.LINEAR_NUM_VALUE_HEADS, 128)
+    v = v.reshape(1, base.LINEAR_NUM_V_HEADS, 128)
 
     a_w = _projection(root, prefix + "linear_attn.in_proj_a", device)
     b_w = _projection(root, prefix + "linear_attn.in_proj_b", device)
-    a_log = base.load_layer_weight(root, layer, "linear_attn.A_log", device).float().reshape(1, base.LINEAR_NUM_VALUE_HEADS)
-    dt_bias = base.load_layer_weight(root, layer, "linear_attn.dt_bias", device).float().reshape(1, base.LINEAR_NUM_VALUE_HEADS)
-    a_raw = F.linear(h_compute.to(dtype=a_w.dtype), a_w).reshape(1, base.LINEAR_NUM_VALUE_HEADS).float()
-    b_raw = F.linear(h_compute.to(dtype=b_w.dtype), b_w).reshape(1, base.LINEAR_NUM_VALUE_HEADS).float()
+    a_log = base.load_layer_weight(root, layer, "linear_attn.A_log", device).float().reshape(1, base.LINEAR_NUM_V_HEADS)
+    dt_bias = base.load_layer_weight(root, layer, "linear_attn.dt_bias", device).float().reshape(1, base.LINEAR_NUM_V_HEADS)
+    a_raw = F.linear(h_compute.to(dtype=a_w.dtype), a_w).reshape(1, base.LINEAR_NUM_V_HEADS).float()
+    b_raw = F.linear(h_compute.to(dtype=b_w.dtype), b_w).reshape(1, base.LINEAR_NUM_V_HEADS).float()
     beta = torch.sigmoid(b_raw)
     g = -torch.exp(a_log) * F.softplus(a_raw + dt_bias)
     decay = torch.exp(g)
@@ -223,7 +223,7 @@ def _linear_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> t
     k = _l2norm(k)
 
     linear_state = state.linear_states.get(int(layer))
-    expected_state_shape = (1, base.LINEAR_NUM_VALUE_HEADS, 128, 128)
+    expected_state_shape = (1, base.LINEAR_NUM_V_HEADS, 128, 128)
     if linear_state is None or linear_state.device != x0.device or tuple(linear_state.shape) != expected_state_shape:
         linear_state = torch.zeros(expected_state_shape, device=x0.device, dtype=torch.float32)
 
@@ -235,7 +235,7 @@ def _linear_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> t
     attn = (linear_state * q.unsqueeze(-1)).sum(dim=-2)
 
     z_w = _projection(root, prefix + "linear_attn.in_proj_z", device)
-    z = F.linear(h_compute.to(dtype=z_w.dtype), z_w).reshape(1, base.LINEAR_NUM_VALUE_HEADS, 128)
+    z = F.linear(h_compute.to(dtype=z_w.dtype), z_w).reshape(1, base.LINEAR_NUM_V_HEADS, 128)
     norm_w = base.load_layer_weight(root, layer, "linear_attn.norm.weight", device)
     gated, _, _ = gated_rmsnorm(attn, z, norm_w)
     out_w = _projection(root, prefix + "linear_attn.out_proj", device)
