@@ -190,7 +190,7 @@ def _generate_response_stateful(
                 logits = F.linear(hidden, lm_head_runtime)
         else:
             logits = F.linear(hidden, lm_head_runtime)
-        current_id = sample_next(logits, temperature, sampling_top_k)
+        current_id = int(sample_next(logits, temperature, sampling_top_k))
         if device == "cuda":
             torch.cuda.synchronize()
         del hidden, logits
@@ -201,36 +201,43 @@ def _generate_response_stateful(
         generated: list[int] = []
         print("IA> ", end="", flush=True)
 
-        for step in range(1, max_new_tokens + 1):
-            before = chat.cache_stats(root)
-            next_id, elapsed, peak = _run_generated_token_stateful(
-                root,
-                int(current_id),
-                final_norm,
-                lm_head,
-                final_norm_name,
-                lm_head_name,
-                device,
-                sampling_top_k,
-                temperature,
-            )
-            after = chat.cache_stats(root)
-            delta_hits = int(after.get("hits", 0)) - int(before.get("hits", 0))
-            delta_misses = int(after.get("misses", 0)) - int(before.get("misses", 0))
-            step_hit_rate = delta_hits / max(delta_hits + delta_misses, 1) * 100.0
-            generated.append(next_id)
-            current_id = next_id
-            print(tokenizer.decode([next_id], skip_special_tokens=True), end="", flush=True)
-            print(
-                f"\n  [step {step:02d}] token={next_id} | time={elapsed:.3f}s | "
-                f"step_hit_rate={step_hit_rate:.1f}% | global_hit_rate={after.get('hit_rate', 0.0):.2f}% | "
-                f"ram_hit={after.get('ram_hit_rate', 0.0):.2f}% | vram_hit={after.get('vram_hit_rate', 0.0):.2f}% | "
-                f"expert_vram_hit={after.get('vram_expert_hit_rate', 0.0):.2f}% | stream_hit={after.get('vram_stream_hit_rate', 0.0):.2f}% | "
-                f"hits+{delta_hits} misses+{delta_misses} | peak_logit={peak:.4f}",
-                flush=True,
-            )
-            if eos_id is not None and next_id == int(eos_id):
-                break
+        # The first generated token is sampled directly from the final prompt
+        # hidden state, so it is already available without another model pass.
+        if max_new_tokens > 0:
+            generated.append(current_id)
+            print(tokenizer.decode([current_id], skip_special_tokens=True), end="", flush=True)
+
+        if max_new_tokens > 0 and (eos_id is None or current_id != int(eos_id)):
+            for step in range(2, max_new_tokens + 1):
+                before = chat.cache_stats(root)
+                next_id, elapsed, peak = _run_generated_token_stateful(
+                    root,
+                    current_id,
+                    final_norm,
+                    lm_head,
+                    final_norm_name,
+                    lm_head_name,
+                    device,
+                    sampling_top_k,
+                    temperature,
+                )
+                after = chat.cache_stats(root)
+                delta_hits = int(after.get("hits", 0)) - int(before.get("hits", 0))
+                delta_misses = int(after.get("misses", 0)) - int(before.get("misses", 0))
+                step_hit_rate = delta_hits / max(delta_hits + delta_misses, 1) * 100.0
+                generated.append(next_id)
+                current_id = next_id
+                print(tokenizer.decode([next_id], skip_special_tokens=True), end="", flush=True)
+                print(
+                    f"\n  [step {step:02d}] token={next_id} | time={elapsed:.3f}s | "
+                    f"step_hit_rate={step_hit_rate:.1f}% | global_hit_rate={after.get('hit_rate', 0.0):.2f}% | "
+                    f"ram_hit={after.get('ram_hit_rate', 0.0):.2f}% | vram_hit={after.get('vram_hit_rate', 0.0):.2f}% | "
+                    f"expert_vram_hit={after.get('vram_expert_hit_rate', 0.0):.2f}% | stream_hit={after.get('vram_stream_hit_rate', 0.0):.2f}% | "
+                    f"hits+{delta_hits} misses+{delta_misses} | peak_logit={peak:.4f}",
+                    flush=True,
+                )
+                if eos_id is not None and next_id == int(eos_id):
+                    break
 
         attention = attention_state.stats(root)
         print()
