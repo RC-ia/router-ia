@@ -5,9 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 from . import qwen36_cached_loop as cached
 from . import qwen36_chat_batch as chat
+from . import qwen36_40layer_loop as base
 from .qwen36_expert_cache import RoutedExpertCache
 
 
@@ -42,6 +44,65 @@ def _cached_expert_projection_triplet(
     except (ValueError, IndexError):
         return _ORIGINAL_EXPERT_TRIPLET(root, layer_prefix, expert_id, device)
     return _expert_cache(root).get_or_load(cached._store(root), layer, expert_id, layer_prefix)
+
+
+def _batched_moe_step_gpu(
+    root: Path,
+    layer: int,
+    residual: torch.Tensor,
+    top_k: int,
+    device: str,
+):
+    """MoE step whose routed expert weights are dequantized as GPU batches."""
+    if device != "cuda":
+        return _ORIGINAL_BATCHED_MOE_STEP(root, layer, residual, top_k, device)
+
+    prefix = base.layer_prefix(layer)
+    post_norm = base.load_layer_weight(root, layer, "post_attention_layernorm.weight", device)
+    moe_in = base.rmsnorm(residual, post_norm).reshape(1, base.HIDDEN).float()
+    router_w = base.load_layer_weight(root, layer, "mlp.gate.weight", device).float()
+    routed = base.route(moe_in.reshape(-1), router_w, top_k=top_k)
+    expert_ids = [int(v) for v in routed.expert_ids.detach().cpu().tolist()]
+    weights = [float(v) for v in routed.weights.detach().cpu().tolist()]
+
+    expert_cache = _expert_cache(root)
+    triplets = expert_cache.get_or_load_batch(
+        cached._store(root), layer, expert_ids, prefix
+    )
+    gate_w = torch.stack([triplet[0] for triplet in triplets], dim=0)
+    up_w = torch.stack([triplet[1] for triplet in triplets], dim=0)
+    down_w = torch.stack([triplet[2] for triplet in triplets], dim=0)
+    batch_x = moe_in.expand(len(expert_ids), -1).to(dtype=torch.float16)
+
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        gate = torch.bmm(gate_w, batch_x.unsqueeze(-1)).squeeze(-1)
+        up = torch.bmm(up_w, batch_x.unsqueeze(-1)).squeeze(-1)
+        hidden = F.silu(gate) * up
+        expert_out = torch.bmm(down_w, hidden.unsqueeze(-1)).squeeze(-1)
+        routing = torch.tensor(weights, device=device, dtype=expert_out.dtype).reshape(-1, 1)
+        routed_sum = (expert_out * routing).sum(dim=0, keepdim=True)
+
+    shared_gate_w = base.load_layer_weight(root, layer, "mlp.shared_expert_gate.weight", device).float()
+    shared_gate_proj = chat._projection(root, f"{prefix}mlp.shared_expert.gate_proj", device)
+    shared_up_proj = chat._projection(root, f"{prefix}mlp.shared_expert.up_proj", device)
+    shared_down_proj = chat._projection(root, f"{prefix}mlp.shared_expert.down_proj", device)
+
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        shared_gate = torch.sigmoid(F.linear(moe_in, shared_gate_w))
+        shared_hidden = F.silu(F.linear(moe_in.to(shared_gate_proj.dtype), shared_gate_proj)) * F.linear(moe_in.to(shared_up_proj.dtype), shared_up_proj)
+        shared_out = F.linear(shared_hidden, shared_down_proj) * shared_gate
+
+    moe_out = routed_sum.float() + shared_out.float()
+    layer_out = residual + moe_out
+    shared_gate_value = float(shared_gate.float().item())
+    moe_input_norm = float(torch.linalg.vector_norm(moe_in).item())
+
+    del post_norm, moe_in, router_w, routed
+    del triplets, gate_w, up_w, down_w, batch_x
+    del gate, up, hidden, expert_out, routing, routed_sum
+    del shared_gate_w, shared_gate, shared_gate_proj, shared_up_proj, shared_down_proj
+    del shared_hidden, shared_out, moe_out
+    return layer_out, expert_ids, weights, shared_gate_value, moe_input_norm
 
 
 def _cache_stats_with_experts(root: Path) -> dict[str, int | float]:
@@ -94,6 +155,8 @@ def _print_cache_with_experts(root: Path, label: str) -> None:
 
 
 chat._expert_projection_triplet = _cached_expert_projection_triplet
+_ORIGINAL_BATCHED_MOE_STEP = chat.batched_moe_step
+chat.batched_moe_step = _batched_moe_step_gpu
 chat.cache_stats = _cache_stats_with_experts
 chat.print_cache = _print_cache_with_experts
 
@@ -110,6 +173,7 @@ def main() -> None:
     print("expert_cache_fp8_promotion=disabled")
     print("expert_cache_prefetch=parallel-raw-fp8-stream")
     print("expert_cache_compute=temporary-fp16")
+    print("expert_cache_compute_batch=8-experts")
     print(f"expert_cache_total_slots={cache.total_slots}")
     print(f"expert_cache_slots_per_layer={cache.slots_per_layer}")
     print(f"expert_cache_fp8_slots_per_layer={cache.fp8_slots}")
