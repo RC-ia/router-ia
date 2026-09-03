@@ -213,12 +213,17 @@ def _full_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> tor
     state.full_keys[int(layer)] = full_k.detach()
     state.full_values[int(layer)] = full_v.detach()
 
-    k_expanded = full_k.repeat_interleave(base.FULL_NUM_KV_GROUPS, dim=1)
+    k_expanded = full_k.repeat_interleave(base.FULL_NUM_KV_GROUPS, dim=1).float()
     v_expanded = full_v.repeat_interleave(base.FULL_NUM_KV_GROUPS, dim=1).float()
     q_float = q.float()
-    scores = torch.matmul(q_float.unsqueeze(2), k_expanded.transpose(-1, -2)) * (base.FULL_HEAD_DIM ** -0.5)
+    scores = torch.matmul(q_float.unsqueeze(2), k_expanded.transpose(-1, -2)).squeeze(-2) * (base.FULL_HEAD_DIM ** -0.5)
     attn_weights = torch.softmax(scores, dim=-1)
-    attn = torch.matmul(attn_weights.unsqueeze(-2), v_expanded).squeeze(-2)
+
+    # Explicit contraction avoids an accidental extra singleton/head dimension
+    # from matmul broadcasting. Result is always [batch, heads, head_dim].
+    attn = torch.einsum("bht,bhtd->bhd", attn_weights, v_expanded)
+    if attn.shape != (1, base.FULL_NUM_HEADS, base.FULL_HEAD_DIM):
+        raise RuntimeError(f"Unexpected full-attention output shape: {tuple(attn.shape)}")
     attn = attn * torch.sigmoid(gate.float())
     attn_flat = attn.reshape(1, base.FULL_Q_DIM).to(dtype=compute_dtype)
 
