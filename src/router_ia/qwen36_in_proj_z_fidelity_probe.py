@@ -24,6 +24,7 @@ from .qwen36_op_probe import dequantize_fp8_blockwise, load_embedding_row, rmsno
 
 
 def report(name, reference, candidate, tolerance=1e-3):
+    candidate = candidate.to(device=reference.device)
     s = _stage_stats(reference, candidate)
     status = "PASS" if s[0] <= tolerance else "FAIL"
     print(
@@ -93,9 +94,6 @@ def main():
     print(f"loaded={loaded}/{total}")
     print(f"tolerance={args.tolerance}")
 
-    # Both implementations must receive exactly the same BF16 post-RMSNorm
-    # input. This removes recurrence, convolution, z-gating and out_proj from
-    # the experiment entirely.
     input_dtype = _module_input_dtype(layer)
     hidden = load_embedding_row(root, args.token_id).reshape(1, base.HIDDEN).to(args.device).float()
     norm_weight = base.load_layer_weight(root, args.layer, "input_layernorm.weight", args.device)
@@ -129,8 +127,6 @@ def main():
     state.reset()
     attention.activate(root, state)
     try:
-        # Call the runtime's exact projection path, but do not run conv/recurrent
-        # code. Loading and applying this single weight is the object under test.
         router_w = attention._projection(root, z_key, args.device)
         router_input = captured["input"]
         router_output = F.linear(router_input.to(dtype=router_w.dtype), router_w)
@@ -150,16 +146,17 @@ def main():
     print("\n=== WEIGHT REPRESENTATION ===")
     ok.append(report("official_weight_vs_router_weight", captured["weight"], router_w, args.tolerance))
 
-    raw_weight, raw_scale = raw_checkpoint_tensor(root, checkpoint_index(root), z_key)
+    weight_map = checkpoint_index(root)
+    raw_weight, raw_scale = raw_checkpoint_tensor(root, weight_map, z_key)
     if raw_scale is not None:
         deq = dequantize_fp8_blockwise(raw_weight, raw_scale)
-        ok.append(report("checkpoint_dequant_vs_router_weight", deq, router_w.detach().cpu(), args.tolerance))
+        ok.append(report("checkpoint_dequant_vs_router_weight", deq, router_w, args.tolerance))
         print(f"  checkpoint raw   : dtype={raw_weight.dtype} shape={tuple(raw_weight.shape)}")
         print(f"  checkpoint scale : dtype={raw_scale.dtype} shape={tuple(raw_scale.shape)}")
         print(f"  dequant dtype    : {deq.dtype}")
     else:
         deq = raw_weight.float()
-        ok.append(report("checkpoint_float_vs_router_weight", deq, router_w.detach().cpu(), args.tolerance))
+        ok.append(report("checkpoint_float_vs_router_weight", deq, router_w, args.tolerance))
         print(f"  checkpoint raw   : dtype={raw_weight.dtype} shape={tuple(raw_weight.shape)}")
 
     print("\n=== SAME INPUT, DIFFERENT WEIGHTS ===")
@@ -173,8 +170,6 @@ def main():
     ]
 
     print("\n=== INPUT DTYPE SENSITIVITY ===")
-    # These runs deliberately keep the router weight fixed. If the discrepancy
-    # changes substantially here, input casting/accumulation is implicated.
     for dtype in (torch.float32, torch.float16, torch.bfloat16):
         try:
             candidate = original_linear(same_input.to(dtype=dtype), router_w)
@@ -194,5 +189,4 @@ def main():
     gc.collect()
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
