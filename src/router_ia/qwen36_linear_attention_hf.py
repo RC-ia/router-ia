@@ -36,6 +36,20 @@ def _raw_weight(root: Path, name: str) -> tuple[torch.Tensor, torch.Tensor | Non
     raise KeyError(f"Missing tensor: {name}")
 
 
+def _raw_tensor(root: Path, name: str) -> torch.Tensor:
+    index = root / "model.safetensors.index.json"
+    if index.is_file():
+        payload = json.loads(index.read_text(encoding="utf-8"))
+        shard_names = [payload["weight_map"][name]]
+    else:
+        shard_names = [p.name for p in sorted(root.glob("*.safetensors"))]
+    for shard_name in shard_names:
+        with safe_open(str(root / shard_name), framework="pt", device="cpu") as handle:
+            if name in handle.keys():
+                return handle.get_tensor(name)
+    raise KeyError(f"Missing tensor: {name}")
+
+
 def load_linear_weight(root: Path, prefix: str, device: str, *, dtype: torch.dtype) -> torch.Tensor:
     name = prefix + ".weight"
     weight, scale = _raw_weight(root, name)
@@ -49,7 +63,8 @@ def load_linear_weight(root: Path, prefix: str, device: str, *, dtype: torch.dty
 
 
 def load_vector(root: Path, layer: int, suffix: str, device: str) -> torch.Tensor:
-    return base.load_layer_weight(root, layer, suffix, device).float().reshape(-1)
+    """Load scalar/vector parameters without the generic FP16 projection cast."""
+    return _raw_tensor(root, base.layer_prefix(layer) + suffix).to(device=device)
 
 
 def causal_conv_step(mixed_qkv: torch.Tensor, conv_state: torch.Tensor, conv_weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -72,7 +87,6 @@ def gated_delta_recurrent(query: torch.Tensor, key: torch.Tensor, value: torch.T
     g = g.transpose(1, 2).contiguous().float()
     beta = beta.transpose(1, 2).contiguous().float()
 
-    # HF torch recurrent path: optional L2 normalization in FP32, then q scale.
     q = q / torch.sqrt((q * q).sum(dim=-1, keepdim=True) + 1e-6)
     k = k / torch.sqrt((k * k).sum(dim=-1, keepdim=True) + 1e-6)
     q = q * (k_dim ** -0.5)
@@ -98,7 +112,6 @@ def gated_delta_recurrent(query: torch.Tensor, key: torch.Tensor, value: torch.T
 
 
 def linear_attention_step(root: Path, layer: int, x0: torch.Tensor, conv_state: torch.Tensor | None, recurrent_state: torch.Tensor | None, device: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run a complete reference-style one-token Qwen3.6 linear-attention step."""
     compute_dtype = torch.bfloat16 if device == "cuda" else torch.float32
     x = x0.to(device=device, dtype=compute_dtype)
     prefix = base.layer_prefix(layer)
@@ -126,20 +139,15 @@ def linear_attention_step(root: Path, layer: int, x0: torch.Tensor, conv_state: 
     beta = torch.sigmoid(b)
     a_log = load_vector(root, layer, "linear_attn.A_log", device).reshape(1, base.LINEAR_NUM_V_HEADS)
     dt_bias = load_vector(root, layer, "linear_attn.dt_bias", device).reshape(1, base.LINEAR_NUM_V_HEADS)
-    g = -torch.exp(a_log) * F.softplus(a + dt_bias)
+    g = -a_log.float().exp() * F.softplus(a + dt_bias)
 
-    core, recurrent_state_new = gated_delta_recurrent(
-        q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), g.unsqueeze(1), beta.unsqueeze(1), recurrent_state
-    )
+    core, recurrent_state_new = gated_delta_recurrent(q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), g.unsqueeze(1), beta.unsqueeze(1), recurrent_state)
     attn = core[:, 0]
 
     z = F.linear(h, z_w).reshape(1, base.LINEAR_NUM_V_HEADS, HEAD_DIM)
     norm_w = base.load_layer_weight(root, layer, "linear_attn.norm.weight", device)
     gated, _, _ = gated_rmsnorm(attn, z, norm_w)
-    # gated_rmsnorm performs its accumulation in FP32, while the module's
-    # out_proj weight is BF16 on CUDA. Match the module input dtype here.
-    gated_for_proj = gated.reshape(1, base.LINEAR_VALUE_DIM).to(dtype=out_w.dtype)
-    projected = F.linear(gated_for_proj, out_w).float()
+    projected = F.linear(gated.reshape(1, base.LINEAR_VALUE_DIM).to(dtype=out_w.dtype), out_w).float()
     return projected, conv_state_new, recurrent_state_new
 
 
