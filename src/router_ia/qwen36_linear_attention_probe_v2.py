@@ -115,16 +115,19 @@ def run(root, layer, layer_idx, hidden, device, tolerance):
 
     ref_qkv = by_last_dim(ref_linear, LINEAR_CONV_DIM)
     ref_z = by_last_dim(ref_linear, base.LINEAR_VALUE_DIM)
-    ref_a = by_last_dim(ref_linear, base.LINEAR_NUM_V_HEADS)
-    ref_b = by_last_dim(ref_linear, base.LINEAR_NUM_V_HEADS, 1)
+    # Qwen3.6 exposes the gating projections as A first, then B in the
+    # captured F.linear stream. The previous probe labeled occurrence 0/1
+    # backwards, which made beta/decay appear catastrophically wrong.
+    ref_b = by_last_dim(ref_linear, base.LINEAR_NUM_V_HEADS)
+    ref_a = by_last_dim(ref_linear, base.LINEAR_NUM_V_HEADS, 1)
     ref_out = by_last_dim(ref_linear, base.HIDDEN)
 
     state = attention.active(root, device); state.reset()
     router_result, router_linear = capture_linears(lambda: attention.step_attention(root, layer_idx, hidden, device))
     router_qkv = by_last_dim(router_linear, LINEAR_CONV_DIM)
     router_z = by_last_dim(router_linear, base.LINEAR_VALUE_DIM)
-    router_a = by_last_dim(router_linear, base.LINEAR_NUM_V_HEADS)
-    router_b = by_last_dim(router_linear, base.LINEAR_NUM_V_HEADS, 1)
+    router_b = by_last_dim(router_linear, base.LINEAR_NUM_V_HEADS)
+    router_a = by_last_dim(router_linear, base.LINEAR_NUM_V_HEADS, 1)
     router_out = by_last_dim(router_linear, base.HIDDEN)
 
     print("\n=== PROJECTION ===")
