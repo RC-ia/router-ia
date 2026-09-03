@@ -34,6 +34,19 @@ def report(name: str, ref: torch.Tensor, got: torch.Tensor, tol: float) -> bool:
     return ok
 
 
+def _last_token(x: torch.Tensor) -> torch.Tensor:
+    if x.ndim == 3:
+        return x[:, -1, :]
+    return x
+
+
+def _conv_token_view(x: torch.Tensor) -> torch.Tensor:
+    """Normalize [B,C] runtime or [B,C,1] reference to the same shape."""
+    if x.ndim == 2:
+        return x.unsqueeze(-1)
+    return x
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("root", type=Path)
@@ -80,7 +93,6 @@ def main() -> int:
     runtime_conv_out: list[torch.Tensor] = []
     runtime_conv_state_after: list[torch.Tensor] = []
 
-    # Capture the reference projection exactly at the module output.
     hook = None
     if hasattr(layer.linear_attn, "in_proj_qkv"):
         def qkv_hook(module, inputs, output):
@@ -110,7 +122,6 @@ def main() -> int:
         ref_conv_state_after.append(conv_state.detach().clone())
         return out.to(hidden_states.dtype)
 
-    # Initial token uses causal_conv1d_fn rather than update. Capture it too.
     def capture_fn(hidden_states, weight, bias=None, activation=None, **kwargs):
         ref_conv_in.append(hidden_states.detach().clone())
         padding = weight.shape[-1] - 1
@@ -167,38 +178,59 @@ def main() -> int:
             print(f"\nTOKEN {pos}")
             all_ok &= report("linear_output", reference, got, args.tolerance)
 
-            # Reference projection hook emits [B,S,3D]. Runtime has [B,3D].
             if len(ref_qkv) <= pos or len(runtime_qkv) <= pos:
                 print("  qkv_capture                     UNAVAILABLE")
                 all_ok = False
                 continue
-            rq = ref_qkv[pos]
-            if rq.ndim == 3:
-                rq = rq[:, -1, :]
+
+            rq = _last_token(ref_qkv[pos])
             gotq = runtime_qkv[pos]
             all_ok &= report("qkv_projection", rq, gotq, args.tolerance)
 
-            # Each conv capture is one invocation per token. The initial function
-            # and recurrent update are both normalized to the same boundary.
+            # Diagnose whether projection mismatch is caused by the loaded weight
+            # dtype or by the matmul itself. Both sides use the exact same input
+            # vector at this boundary.
+            qkv_module_weight = layer.linear_attn.in_proj_qkv.weight.detach()
+            module_repro = F.linear(normed.to(qkv_module_weight.dtype), qkv_module_weight)
+            if module_repro.shape == rq.shape:
+                all_ok &= report("qkv_module_repro", rq, module_repro, args.tolerance)
+            runtime_w = qkv_module_weight.to(runtime_qkv[pos].dtype)
+            runtime_repro = F.linear(normed.to(runtime_w.dtype), runtime_w)
+            all_ok &= report("qkv_runtime_dtype_repro", rq, runtime_repro, args.tolerance)
+            print(
+                f"  reference_qkv_dtype={ref_qkv[pos].dtype} runtime_qkv_dtype={runtime_qkv[pos].dtype} "
+                f"module_weight_dtype={qkv_module_weight.dtype}"
+            )
+
             if len(ref_conv_in) <= pos or len(runtime_conv_in) <= pos:
                 print("  conv_input_capture              UNAVAILABLE")
                 all_ok = False
                 continue
-            all_ok &= report("conv_input", ref_conv_in[pos], runtime_conv_in[pos].reshape_as(ref_conv_in[pos]), args.tolerance)
-            all_ok &= report("conv_output", ref_conv_out[pos], runtime_conv_out[pos].reshape_as(ref_conv_out[pos]), args.tolerance)
+
+            ref_ci = _conv_token_view(ref_conv_in[pos])
+            got_ci = _conv_token_view(runtime_conv_in[pos])
+            all_ok &= report("conv_input", ref_ci, got_ci, args.tolerance)
+
+            ref_co = _conv_token_view(ref_conv_out[pos])
+            got_co = _conv_token_view(runtime_conv_out[pos])
+            all_ok &= report("conv_output", ref_co, got_co, args.tolerance)
 
             if pos > 0 and len(ref_conv_state_after) > pos and len(runtime_conv_state_after) >= pos + 1:
-                # DynamicCache stores kernel-sized state. Compare exact state shape.
                 rs = ref_conv_state_after[pos]
                 gs = runtime_conv_state_after[pos]
                 if tuple(rs.shape) == tuple(gs.shape):
                     all_ok &= report("conv_state_after", rs, gs, args.tolerance)
                 else:
-                    print(f"  conv_state_after                 SHAPE_FAIL reference={tuple(rs.shape)} runtime={tuple(gs.shape)}")
+                    print(
+                        f"  conv_state_after                 SHAPE_FAIL "
+                        f"reference={tuple(rs.shape)} runtime={tuple(gs.shape)}"
+                    )
                     all_ok = False
 
-            print(f"  reference_qkv_dtype={ref_qkv[pos].dtype} runtime_qkv_dtype={runtime_qkv[pos].dtype}")
-            print(f"  reference_conv_dtype={ref_conv_out[pos].dtype} runtime_conv_dtype={runtime_conv_out[pos].dtype}")
+            print(
+                f"  reference_conv_dtype={ref_conv_out[pos].dtype} "
+                f"runtime_conv_dtype={runtime_conv_out[pos].dtype}"
+            )
 
     finally:
         attention._causal_conv1d_step = original_runtime_conv
