@@ -19,7 +19,7 @@ from . import qwen36_attention_cache as attention
 from . import qwen36_chat_batch as chat
 from . import qwen36_40layer_loop as base
 from . import qwen36_cached_loop as cached
-from .qwen36_mini_chat import load_tokenizer
+from .qwen36_mini_chat import find_tensor_name, load_tokenizer
 from .qwen36_op_probe import rmsnorm
 from .qwen36_reference_model import load_reference_model
 
@@ -81,11 +81,11 @@ def _reference_snapshot(model: torch.nn.Module, input_ids: torch.Tensor) -> dict
 
 
 def _load_router_output_weights(root: Path, device: str) -> tuple[torch.Tensor, torch.Tensor]:
-    norm_name = cached._find_tensor_name(
+    norm_name = find_tensor_name(
         root,
         ("language_model.norm.weight", "model.norm.weight", ".norm.weight"),
     )
-    lm_name = cached._find_tensor_name(root, ("lm_head.weight",))
+    lm_name = find_tensor_name(root, ("lm_head.weight",))
     norm = cached._cached_load_tensor(root, norm_name, device=device).float()
     lm_head = cached._cached_load_tensor(root, lm_name, device=device).float()
     return norm, lm_head
@@ -143,7 +143,7 @@ def _top_ids(logits: torch.Tensor, k: int) -> list[int]:
     return [int(x) for x in torch.topk(logits.reshape(-1), k).indices.tolist()]
 
 
-def _compare(snapshot: dict[str, torch.Tensor], router_states: torch.Tensor, router_final: torch.Tensor, router_logits: torch.Tensor, top_k: int, tolerance: float) -> int:
+def _compare(snapshot: dict[str, torch.Tensor], router_states: torch.Tensor, router_logits: torch.Tensor, top_k: int, tolerance: float) -> int:
     reference_states = snapshot["layer_hidden"]
     if tuple(reference_states.shape) != (base.DEFAULT_LAYERS, 1, base.HIDDEN):
         raise RuntimeError(f"Unexpected snapshot layer shape: {tuple(reference_states.shape)}")
@@ -157,7 +157,7 @@ def _compare(snapshot: dict[str, torch.Tensor], router_states: torch.Tensor, rou
             failing_layer = layer
         print(f"L{layer:02d} {status} | max_abs={stats[0]:.6g} | mean_abs={stats[1]:.6g} | rel={stats[2]:.6g} | cosine={stats[3]:.9f}")
 
-    print("\n=== FINAL LOGITS ===")
+    print("\n=== LOGITS ===")
     stats = _stats(snapshot["logits"], router_logits)
     print(f"max_abs={stats[0]:.6g} | mean_abs={stats[1]:.6g} | rel={stats[2]:.6g} | cosine={stats[3]:.9f}")
 
@@ -237,10 +237,10 @@ def main() -> None:
         raise SystemExit(f"Prompt/token mismatch: snapshot={stored_ids} current={token_ids}")
 
     print("\n[ROUTER] Running router alone...")
-    router_states, router_final, router_logits = _router_forward(root, token_ids, args.device)
-    exit_code = _compare(snapshot, router_states, router_final, router_logits, args.top_k, args.tolerance)
+    router_states, _router_final_norm, router_logits = _router_forward(root, token_ids, args.device)
+    exit_code = _compare(snapshot, router_states, router_logits, args.top_k, args.tolerance)
 
-    del snapshot, router_states, router_final, router_logits
+    del snapshot, router_states, _router_final_norm, router_logits
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
