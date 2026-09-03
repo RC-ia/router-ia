@@ -21,6 +21,9 @@ ROPE_DIM = int(base.FULL_HEAD_DIM * 0.25)
 def compare(name: str, ref: torch.Tensor, got: torch.Tensor, tolerance: float) -> bool:
     ref = ref.float()
     got = got.float()
+    if ref.shape != got.shape:
+        print(f"{name:<28} SHAPE_MISMATCH ref={tuple(ref.shape)} got={tuple(got.shape)}")
+        return False
     diff = (ref - got).abs()
     max_abs = float(diff.max().item())
     mean_abs = float(diff.mean().item())
@@ -66,10 +69,13 @@ def reference_token(root: Path, layer: int, x: torch.Tensor, position: int, visi
     out_w = cached._cached_load_projection(root, prefix + "self_attn.o_proj", device)
 
     h = rmsnorm(x, input_norm)
-    q_gate = F.linear(h.to(dtype=q_w.dtype), q_w).reshape(1, base.FULL_NUM_HEADS, base.FULL_HEAD_DIM * 2)
+    q_gate_raw = F.linear(h.to(dtype=q_w.dtype), q_w)
+    q_gate = q_gate_raw.reshape(1, base.FULL_NUM_HEADS, base.FULL_HEAD_DIM * 2)
     q, gate = torch.chunk(q_gate, 2, dim=-1)
-    k = F.linear(h.to(dtype=k_w.dtype), k_w).reshape(1, base.FULL_NUM_KV_HEADS, base.FULL_HEAD_DIM)
-    v = F.linear(h.to(dtype=v_w.dtype), v_w).reshape(1, base.FULL_NUM_KV_HEADS, base.FULL_HEAD_DIM)
+    k_raw = F.linear(h.to(dtype=k_w.dtype), k_w)
+    v_raw = F.linear(h.to(dtype=v_w.dtype), v_w)
+    k = k_raw.reshape(1, base.FULL_NUM_KV_HEADS, base.FULL_HEAD_DIM)
+    v = v_raw.reshape(1, base.FULL_NUM_KV_HEADS, base.FULL_HEAD_DIM)
     qn = rmsnorm(q, q_norm_w).float().unsqueeze(2)
     kn = rmsnorm(k, k_norm_w).float().unsqueeze(2)
     qr, kr = apply_rope(qn, kn, position)
@@ -84,10 +90,13 @@ def reference_token(root: Path, layer: int, x: torch.Tensor, position: int, visi
     residual = x.float().reshape(1, base.HIDDEN) + projected
     return {
         "h": h,
+        "q_gate_raw": q_gate_raw,
         "q_gate": q_gate,
         "q": q,
         "gate": gate,
+        "k_raw": k_raw,
         "k": k,
+        "v_raw": v_raw,
         "v": v,
         "q_norm": qn,
         "k_norm": kn,
@@ -116,9 +125,6 @@ def capture_runtime(fn):
         return out
 
     def norm(input, weight, eps=1e-6):
-        # Runtime rmsnorm currently accepts exactly (x, weight). Keep the
-        # optional eps in the wrapper only so it is compatible with callers
-        # that use the conventional three-argument signature.
         out = orig_norm(input, weight)
         captured["norm"].append(out.detach().clone())
         return out
@@ -137,7 +143,6 @@ def capture_runtime(fn):
         kwargs = {"dim": dim}
         if dtype is not None:
             kwargs["dtype"] = dtype
-
         out = orig_softmax(input, **kwargs)
         captured["softmax"].append(out.detach().clone())
         return out
@@ -162,13 +167,10 @@ def run(root: Path, layer: int, tokens: int, device: str, seed: int, tolerance: 
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
     hidden = [torch.randn(1, base.HIDDEN, device=device, dtype=dtype) for _ in range(tokens)]
 
-    # Build the exact reference K/V once, so the residual comparison can focus
-    # on the current-token Q/gate/attention/output path.
     prefix = base.layer_prefix(layer)
     k_w = cached._cached_load_projection(root, prefix + "self_attn.k_proj", device)
     v_w = cached._cached_load_projection(root, prefix + "self_attn.v_proj", device)
     input_norm = base.load_layer_weight(root, layer, "input_layernorm.weight", device)
-    q_norm_w = base.load_layer_weight(root, layer, "self_attn.q_norm.weight", device)
     k_norm_w = base.load_layer_weight(root, layer, "self_attn.k_norm.weight", device)
     ref_k, ref_v = [], []
     for x in hidden:
@@ -199,37 +201,58 @@ def run(root: Path, layer: int, tokens: int, device: str, seed: int, tolerance: 
             ref = reference_token(root, layer, x, position, full_k[:, :, :position + 1], full_v[:, :, :position + 1], device)
 
             print("--- projections ---")
-            names = ["q_gate", "k", "v", "o_proj"]
-            for i, name in enumerate(names):
-                if i < len(cap["linear"]):
-                    all_pass &= compare(name, ref[name] if name != "o_proj" else ref["projected"], cap["linear"][i], tolerance)
+            projection_specs = (
+                ("q_gate", "q_gate_raw", 0),
+                ("k", "k_raw", 1),
+                ("v", "v_raw", 2),
+                ("o_proj", "projected", 3),
+            )
+            for name, ref_name, idx in projection_specs:
+                if idx < len(cap["linear"]):
+                    all_pass &= compare(name, ref[ref_name], cap["linear"][idx], tolerance)
                 else:
                     print(f"{name:<28} MISSING")
                     all_pass = False
 
             print("--- norms / rope ---")
-            # Runtime rmsnorm calls: input h, q norm, k norm.
             for name, ref_name, idx in (("input_norm", "h", 0), ("q_norm", "q_norm", 1), ("k_norm", "k_norm", 2)):
-                all_pass &= compare(name, ref[ref_name], cap["norm"][idx], tolerance)
-            all_pass &= compare("q_after_rope", ref["q_rope"], cap["rope"][0][0], tolerance)
-            all_pass &= compare("k_after_rope", ref["k_rope"], cap["rope"][0][1], tolerance)
+                if idx < len(cap["norm"]):
+                    all_pass &= compare(name, ref[ref_name], cap["norm"][idx], tolerance)
+                else:
+                    print(f"{name:<28} MISSING")
+                    all_pass = False
+            if cap["rope"]:
+                all_pass &= compare("q_after_rope", ref["q_rope"], cap["rope"][0][0], tolerance)
+                all_pass &= compare("k_after_rope", ref["k_rope"], cap["rope"][0][1], tolerance)
+            else:
+                print("q_after_rope                 MISSING")
+                print("k_after_rope                 MISSING")
+                all_pass = False
 
             print("--- attention ---")
-            all_pass &= compare("scores", ref["scores"], cap["einsum"][0][1], tolerance)
-            all_pass &= compare("softmax", ref["weights"], cap["softmax"][0], tolerance)
-            all_pass &= compare("attn_raw", ref["attn_raw"], cap["einsum"][1][1], tolerance)
-            gate = cap["linear"][0][..., base.FULL_HEAD_DIM:]
+            if len(cap["einsum"]) >= 2 and cap["softmax"]:
+                all_pass &= compare("scores", ref["scores"], cap["einsum"][0][1], tolerance)
+                all_pass &= compare("softmax", ref["weights"], cap["softmax"][0], tolerance)
+                all_pass &= compare("attn_raw", ref["attn_raw"], cap["einsum"][1][1], tolerance)
+            else:
+                print("attention intermediates       MISSING")
+                all_pass = False
+
             q_gate = cap["linear"][0]
-            q_runtime = q_gate[..., :base.FULL_HEAD_DIM]
-            gate_runtime = gate
-            # q/gate are slices of the captured fused projection.
+            q_runtime = q_gate.reshape(1, base.FULL_NUM_HEADS, base.FULL_HEAD_DIM * 2)
+            q_runtime, gate_runtime = torch.chunk(q_runtime, 2, dim=-1)
             all_pass &= compare("q_pre_rope", ref["q"], q_runtime, tolerance)
             all_pass &= compare("gate", ref["gate"], gate_runtime, tolerance)
-            attn_runtime = cap["einsum"][1][1] * torch.sigmoid(gate_runtime.float())
-            all_pass &= compare("attn_gated", ref["attn_gated"], attn_runtime, tolerance)
+            if len(cap["einsum"]) >= 2:
+                attn_runtime = cap["einsum"][1][1] * torch.sigmoid(gate_runtime.float())
+                all_pass &= compare("attn_gated", ref["attn_gated"], attn_runtime, tolerance)
 
             print("--- output / residual ---")
-            all_pass &= compare("projected", ref["projected"], cap["linear"][3], tolerance)
+            if len(cap["linear"]) >= 4:
+                all_pass &= compare("projected", ref["projected"], cap["linear"][3], tolerance)
+            else:
+                print("projected                    MISSING")
+                all_pass = False
             all_pass &= compare("residual", ref["residual"], got, tolerance)
     finally:
         cache.deactivate(root)
