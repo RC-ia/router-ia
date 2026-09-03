@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-"""Qwen3.6 chat runner with persistent per-layer expert GPU cache.
+"""Qwen3.6 chat runner with persistent adaptive per-layer expert GPU cache.
 
 Routed experts are cached as complete (layer, expert) triplets. Each entry
-contains gate/up/down FP16 matrices and is evicted atomically with LRU. The
-cache uses the full VRAM stream budget, so it replaces projection-level
-streaming for routed experts without allocating a second VRAM budget.
+contains gate/up/down FP16 matrices and is evicted atomically. Every layer
+keeps a small protected minimum while a shared overflow LRU lets hot layers
+consume spare expert slots.
 """
 
 from pathlib import Path
@@ -71,6 +71,10 @@ def _cache_stats_with_experts(root: Path) -> dict[str, int | float]:
             "expert_cache_hit_rate": float(expert["hit_rate"]),
             "expert_cache_loads": int(expert["loads"]),
             "expert_cache_evictions": int(expert["evictions"]),
+            "expert_cache_shared_items": int(expert["shared_items"]),
+            "expert_cache_protected_items": int(expert["protected_items"]),
+            "expert_cache_min_slots_per_layer": int(expert["min_slots_per_layer"]),
+            "expert_cache_shared_slots": int(expert["shared_slots"]),
         }
     )
     return stats
@@ -87,7 +91,8 @@ def _print_cache_with_experts(root: Path, label: str) -> None:
         f"vram={expert['bytes'] / 1024**2:.1f}/{expert['budget_bytes'] / 1024**2:.1f} MiB | "
         f"hit_rate={expert['hit_rate']:.2f}% | "
         f"hits={expert['hits']} | misses={expert['misses']} | "
-        f"loads={expert['loads']} | evictions={expert['evictions']}"
+        f"loads={expert['loads']} | evictions={expert['evictions']} | "
+        f"protected={expert['protected_items']} | shared={expert['shared_items']}"
     )
 
 
@@ -97,12 +102,16 @@ chat.print_cache = _print_cache_with_experts
 
 
 def main() -> None:
+    cache = RoutedExpertCache(cached.STREAM_BUDGET_BYTES)
     print("expert_cache=complete-layer-expert")
     print("expert_cache_key=(layer,expert)")
-    print("expert_cache_policy=atomic-lru")
+    print("expert_cache_policy=per-layer-minimum+shared-lru")
     print("expert_cache_budget=full-stream-vram-budget")
     print("expert_cache_entry=gate+up+down-fp16")
     print("expert_cache_eviction=whole-expert")
+    print(f"expert_cache_total_slots={cache.total_slots}")
+    print(f"expert_cache_min_slots_per_layer={cache.min_slots_per_layer}")
+    print(f"expert_cache_shared_slots={cache.shared_slots}")
     chat.main()
 
 
