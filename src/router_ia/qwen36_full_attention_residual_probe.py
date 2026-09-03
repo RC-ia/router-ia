@@ -38,6 +38,42 @@ def compare(name: str, ref: torch.Tensor, got: torch.Tensor, tolerance: float) -
     return ok
 
 
+def compare_scores(ref: torch.Tensor, got: torch.Tensor, tolerance: float) -> bool:
+    """Compare attention scores while diagnosing softmax-invariant row offsets."""
+    ref = ref.float()
+    got = got.float()
+    if ref.shape != got.shape:
+        print(f"{'scores':<28} SHAPE_MISMATCH ref={tuple(ref.shape)} got={tuple(got.shape)}")
+        return False
+
+    print("scores diagnostics:")
+    raw_ok = compare("scores", ref, got, tolerance)
+
+    ref_centered = ref - ref.mean(dim=-1, keepdim=True)
+    got_centered = got - got.mean(dim=-1, keepdim=True)
+    centered_ok = compare("scores_centered", ref_centered, got_centered, tolerance)
+
+    delta = got - ref
+    row_offset = delta.mean(dim=-1, keepdim=True)
+    offset_residual = delta - row_offset
+    offset_max = float(row_offset.abs().max().item())
+    offset_mean = float(row_offset.abs().mean().item())
+    residual_max = float(offset_residual.abs().max().item())
+    residual_mean = float(offset_residual.abs().mean().item())
+    print(
+        f"{'score_row_offset':<28} max_abs={offset_max:.8g} mean_abs={offset_mean:.8g} "
+        f"residual_max={residual_max:.8g} residual_mean={residual_mean:.8g}"
+    )
+
+    if centered_ok and residual_max <= tolerance:
+        print("score interpretation: differences are only softmax-invariant row offsets")
+    elif raw_ok:
+        print("score interpretation: raw scores match")
+    else:
+        print("score interpretation: non-offset score difference detected")
+    return centered_ok
+
+
 def apply_rope(q: torch.Tensor, k: torch.Tensor, position: int):
     inv_freq = 1.0 / (
         ROPE_THETA ** (torch.arange(0, ROPE_DIM, 2, device=q.device, dtype=torch.float32) / ROPE_DIM)
@@ -217,7 +253,10 @@ def run(root: Path, layer: int, tokens: int, device: str, seed: int, tolerance: 
             print("--- norms / rope ---")
             for name, ref_name, idx in (("input_norm", "h", 0), ("q_norm", "q_norm", 1), ("k_norm", "k_norm", 2)):
                 if idx < len(cap["norm"]):
-                    all_pass &= compare(name, ref[ref_name], cap["norm"][idx], tolerance)
+                    ref_value = ref[ref_name]
+                    if name in ("q_norm", "k_norm"):
+                        ref_value = ref_value.squeeze(2)
+                    all_pass &= compare(name, ref_value, cap["norm"][idx], tolerance)
                 else:
                     print(f"{name:<28} MISSING")
                     all_pass = False
@@ -231,7 +270,7 @@ def run(root: Path, layer: int, tokens: int, device: str, seed: int, tolerance: 
 
             print("--- attention ---")
             if len(cap["einsum"]) >= 2 and cap["softmax"]:
-                all_pass &= compare("scores", ref["scores"], cap["einsum"][0][1], tolerance)
+                all_pass &= compare_scores(ref["scores"], cap["einsum"][0][1], tolerance)
                 all_pass &= compare("softmax", ref["weights"], cap["softmax"][0], tolerance)
                 all_pass &= compare("attn_raw", ref["attn_raw"], cap["einsum"][1][1], tolerance)
             else:
