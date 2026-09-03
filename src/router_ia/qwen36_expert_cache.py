@@ -98,14 +98,13 @@ class RoutedExpertCache:
         self.fp8_hits = 0
         self.fp16_to_fp8 = 0
         self.fp8_drops = 0
+        self.stream_prefetch_hits = 0
+        self.stream_prefetch_misses = 0
         self.lock = Lock()
 
     def _budget_slots(self) -> int:
         if not self.budget_bytes:
             return 0
-        # Ensure the original two-FP16-hot working set can exist on every
-        # layer, then add the compact FP8 tier without exceeding the nominal
-        # persistent-expert envelope.
         old_per_layer = HOT_SLOTS_PER_LAYER * FP16_EXPERT_BYTES_ESTIMATE
         layer_count = max(self.layers, 1)
         supported_layers = self.budget_bytes // old_per_layer
@@ -137,6 +136,37 @@ class RoutedExpertCache:
     def _erase_bytes(self, layer: int, expert_id: int, tier: str) -> None:
         self.bytes_used -= self.entry_bytes.pop((layer, expert_id, tier), 0)
 
+    @staticmethod
+    def _stream_key(proj: str, kind: str) -> str:
+        return f"{proj}.{kind}.__expert_prefetch__"
+
+    def _raw_projection_for_gpu(self, store, proj: str):
+        """Get raw FP8+scale, using the rotating VRAM stream as a raw prefetch tier."""
+        if hasattr(store, "vram_cache"):
+            weight_key = self._stream_key(proj, "weight")
+            scale_key = self._stream_key(proj, "scale")
+            streamed_weight = store.vram_cache.get_stream(weight_key)
+            streamed_scale = store.vram_cache.get_stream(scale_key)
+            if streamed_weight is not None and streamed_scale is not None:
+                self.stream_prefetch_hits += 1
+                return streamed_weight, streamed_scale
+
+            self.stream_prefetch_misses += 1
+
+        weight = store.load(proj + ".weight", device="cpu")
+        scale = store.load(proj + ".weight_scale_inv", device="cpu")
+
+        if weight.dtype == torch.float8_e4m3fn and hasattr(store, "vram_cache"):
+            # Keep the raw model representation in the rotating stream. This
+            # avoids storing an additional dequantized FP16 copy before compute.
+            gpu_weight = weight.to(device="cuda")
+            gpu_scale = scale.to(device="cuda")
+            store.vram_cache.put_stream(self._stream_key(proj, "weight"), gpu_weight)
+            store.vram_cache.put_stream(self._stream_key(proj, "scale"), gpu_scale)
+            return gpu_weight, gpu_scale
+
+        return weight, scale
+
     def get(self, layer: int, expert_id: int):
         layer = int(layer)
         expert_id = int(expert_id)
@@ -155,9 +185,8 @@ class RoutedExpertCache:
                 self.hits += 1
                 self.fp8_hits += 1
                 fp8_bank.move_to_end(expert_id)
-                # Important: do not promote/move the FP8 entry into the hot
-                # tier. Reconstruct only a transient compute copy, leaving
-                # the compact resident representation untouched.
+                # Do not promote the FP8 representation back to hot. The FP16
+                # reconstruction is transient for this operation only.
                 return _fp8_dequantize_entry(compact)
 
             self.misses += 1
@@ -174,8 +203,8 @@ class RoutedExpertCache:
             self._erase_bytes(layer, victim_id, "fp16")
 
             if self.fp8_slots > 0:
-                # Compress exactly once, to the source model's FP8 family.
-                # There is deliberately no FP8->Q4 compression on eviction.
+                # Compact once to FP8. Do not create a second Q4 representation
+                # during eviction; the RAM tier remains the authoritative source.
                 compact = _fp8_quantize_entry(victim)
                 fp8_bank = self.fp8_entries[layer]
                 previous = fp8_bank.pop(victim_id, None)
@@ -185,7 +214,6 @@ class RoutedExpertCache:
                 self._record_fp8(layer, victim_id, compact)
                 self.bytes_used += self.entry_bytes[(layer, victim_id, "fp8")]
                 self.fp16_to_fp8 += 1
-
                 while len(fp8_bank) > self.fp8_slots:
                     cold_id, _ = fp8_bank.popitem(last=False)
                     self._erase_bytes(layer, cold_id, "fp8")
@@ -197,7 +225,6 @@ class RoutedExpertCache:
         if expert_id in self.fp8_entries[layer]:
             self.fp8_entries[layer].pop(expert_id, None)
             self._erase_bytes(layer, expert_id, "fp8")
-
         hot[expert_id] = entry
         self._record_hot(layer, expert_id, entry)
         self.bytes_used += self.entry_bytes[(layer, expert_id, "fp16")]
@@ -223,27 +250,26 @@ class RoutedExpertCache:
         raw_scales = []
         for name in names:
             proj = expert_prefix + "." + name
-            raw_weights.append(store.load(proj + ".weight", device="cpu"))
-            raw_scales.append(store.load(proj + ".weight_scale_inv", device="cpu"))
+            raw_weight, raw_scale = self._raw_projection_for_gpu(store, proj)
+            raw_weights.append(raw_weight)
+            raw_scales.append(raw_scale)
 
         if all(weight.dtype == torch.float8_e4m3fn for weight in raw_weights):
-            gate_up_weights = torch.stack(raw_weights[:2], dim=0).to(device="cuda")
-            gate_up_scales = torch.stack(raw_scales[:2], dim=0).to(device="cuda")
+            gate_up_weights = torch.stack(raw_weights[:2], dim=0)
+            gate_up_scales = torch.stack(raw_scales[:2], dim=0)
             gate_up_batch = dequant.dequantize_fp8_blockwise_batch(
                 gate_up_weights, gate_up_scales
             ).to(dtype=torch.float16)
 
-            down_weight = raw_weights[2].to(device="cuda")
-            down_scale = raw_scales[2].to(device="cuda")
             down_output = dequant.dequantize_fp8_blockwise(
-                down_weight, down_scale
+                raw_weights[2], raw_scales[2]
             ).to(dtype=torch.float16)
             entry = (gate_up_batch[0], gate_up_batch[1], down_output)
             del gate_up_weights, gate_up_scales, gate_up_batch
-            del down_weight, down_scale
         else:
             entry = tuple(
-                weight.to(device="cuda", dtype=torch.float16) for weight in raw_weights
+                weight.to(device="cuda", dtype=torch.float16)
+                for weight in raw_weights
             )
 
         self.put(layer, expert_id, entry)
@@ -282,6 +308,8 @@ class RoutedExpertCache:
                 "fp16_to_fp8": self.fp16_to_fp8,
                 "fp8_to_q4": 0,
                 "q4_drops": self.fp8_drops,
+                "stream_prefetch_hits": self.stream_prefetch_hits,
+                "stream_prefetch_misses": self.stream_prefetch_misses,
                 "shared_items": fp8_items,
                 "protected_items": hot_items,
                 "min_slots_per_layer": self.hot_slots,
