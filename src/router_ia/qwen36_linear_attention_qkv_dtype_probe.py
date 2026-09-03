@@ -22,14 +22,51 @@ from .qwen36_layer_fidelity_probe import (
 from .qwen36_linear_attention_stateful_probe import _make_reference_cache, _patch_official_conv
 from .qwen36_op_probe import load_embedding_row, rmsnorm
 
+LINEAR_CONV_DIM = int(base.LINEAR_KEY_DIM * 2 + base.LINEAR_VALUE_DIM)
 
-def report(name: str, ref: torch.Tensor, got: torch.Tensor, tol: float) -> None:
+
+def report(name: str, ref: torch.Tensor, got: torch.Tensor, tol: float) -> bool:
     s = _stage_stats(ref, got)
     print(
         f"  {name:<34} {'PASS' if s[0] <= tol else 'FAIL'} "
         f"max_abs={s[0]:.6g} mean_abs={s[1]:.6g} "
         f"rel={s[2]:.6g} cosine={s[3]:.9f}"
     )
+    return s[0] <= tol
+
+
+def _run_reference(layer, tokens, input_norm, input_dtype, config, upto: int) -> torch.Tensor:
+    ref_cache = _make_reference_cache(config)
+    out = None
+    for pos in range(upto + 1):
+        token = tokens[pos].to(dtype=input_dtype)
+        normed = rmsnorm(token, input_norm)
+        out = layer.linear_attn(
+            hidden_states=normed.unsqueeze(1),
+            cache_params=ref_cache,
+            attention_mask=None,
+        )
+        if isinstance(out, tuple):
+            out = out[0]
+    return out.reshape(1, base.HIDDEN)
+
+
+def _run_runtime(root, layer_idx, tokens, input_dtype, device, projection_override=None):
+    state = attention.state_for(root, device)
+    state.reset()
+    attention.activate(root, state)
+    original_projection = attention._projection
+    if projection_override is not None:
+        attention._projection = projection_override
+    out = None
+    try:
+        for token in tokens:
+            token = token.to(dtype=input_dtype)
+            out = attention.step_attention(root, layer_idx, token, device)
+        return out - tokens[-1].to(dtype=input_dtype).float()
+    finally:
+        attention._projection = original_projection
+        attention.deactivate(root)
 
 
 def main() -> int:
@@ -63,27 +100,16 @@ def main() -> int:
         for i in range(args.tokens)
     ]
 
-    ref_cache = _make_reference_cache(config)
+    # One official reference cache is used only for the normal reference pass.
+    # The selective BF16 runtime test uses fresh independent state.
     qwen, originals = _patch_official_conv()
-    state = attention.state_for(root, args.device)
-    state.reset()
-    attention.activate(root, state)
-
-    ref_qkv: list[torch.Tensor] = []
+    hook_values: list[torch.Tensor] = []
     hook = layer.linear_attn.in_proj_qkv.register_forward_hook(
-        lambda module, inputs, output: ref_qkv.append(output.detach().clone())
+        lambda module, inputs, output: hook_values.append(output.detach().clone())
     )
 
     original_projection = attention._projection
-    force_bf16 = False
-
-    def projection(root_path, prefix, dev):
-        weight = original_projection(root_path, prefix, dev)
-        if force_bf16 and dev == "cuda":
-            return weight.to(torch.bfloat16)
-        return weight
-
-    attention._projection = projection
+    all_ok = True
 
     print(
         f"op=linear-attention-qkv-dtype layer={args.layer} tokens={args.tokens} "
@@ -91,11 +117,11 @@ def main() -> int:
     )
 
     try:
+        ref_cache = _make_reference_cache(config)
         for pos, raw in enumerate(tokens):
             token = raw.to(dtype=input_dtype)
             normed = rmsnorm(token, input_norm)
 
-            # Reference: exact module computation.
             ref_out = layer.linear_attn(
                 hidden_states=normed.unsqueeze(1),
                 cache_params=ref_cache,
@@ -104,64 +130,55 @@ def main() -> int:
             if isinstance(ref_out, tuple):
                 ref_out = ref_out[0]
             ref_out = ref_out.reshape(1, base.HIDDEN)
-            ref_q = ref_qkv[pos].reshape(1, base.LINEAR_CONV_DIM)
+            ref_q = hook_values[pos]
+            if ref_q.ndim == 3:
+                ref_q = ref_q[:, -1, :]
+            ref_q = ref_q.reshape(1, LINEAR_CONV_DIM)
 
-            # Router's normal projection path.
-            normal_w = original_projection(root, base.layer_prefix(args.layer) + "linear_attn.in_proj_qkv", args.device)
-            normal_w = normal_w.to(dtype=normal_w.dtype)
+            normal_w = original_projection(
+                root,
+                base.layer_prefix(args.layer) + "linear_attn.in_proj_qkv",
+                args.device,
+            )
             normal = F.linear(normed.to(dtype=normal_w.dtype), normal_w)
-
-            # Same cached weight explicitly recast to BF16, matching the module.
             bf_w = normal_w.to(torch.bfloat16) if args.device == "cuda" else normal_w
             bf = F.linear(normed.to(dtype=bf_w.dtype), bf_w)
 
             print(f"\nTOKEN {pos}")
-            report("qkv_vs_router_normal", ref_q, normal, args.tolerance)
-            report("qkv_vs_router_bf16", ref_q, bf, args.tolerance)
+            all_ok &= report("qkv_vs_router_normal", ref_q, normal, args.tolerance)
+            all_ok &= report("qkv_vs_router_bf16", ref_q, bf, args.tolerance)
             print(
                 f"  reference_dtype={ref_q.dtype} cached_dtype={normal_w.dtype} "
                 f"bf16_test_dtype={bf.dtype}"
             )
 
-            # Also prove the complete runtime linear-attention result with only
-            # this one projection forced to BF16. All other projections remain
-            # at their normal cached dtypes.
+            # Only for the current position, replay the complete sequence with
+            # fresh reference/runtime state. This avoids double-advancing caches.
             def selective_projection(root_path, prefix, dev):
                 weight = original_projection(root_path, prefix, dev)
                 if dev == "cuda" and prefix.endswith("linear_attn.in_proj_qkv"):
                     return weight.to(torch.bfloat16)
                 return weight
 
-            attention._projection = selective_projection
-            state.reset()
-            # Rebuild reference cache to keep both paths at the same token position.
-            ref_cache = _make_reference_cache(config)
-            ref_out2 = None
-            for prior in range(pos + 1):
-                t = tokens[prior].to(dtype=input_dtype)
-                n = rmsnorm(t, input_norm)
-                ro = layer.linear_attn(hidden_states=n.unsqueeze(1), cache_params=ref_cache, attention_mask=None)
-                if isinstance(ro, tuple):
-                    ro = ro[0]
-                if prior == pos:
-                    ref_out2 = ro.reshape(1, base.HIDDEN)
-                attention.step_attention(root, args.layer, t, args.device)
-            got2 = attention.step_attention(root, args.layer, token, args.device) if False else None
-            # The loop above already advanced runtime for all prior tokens only
-            # through step_attention; for the current token it also advanced it.
-            # Recover current runtime linear output from the final state by replaying
-            # once in a fresh state for a clean comparison.
-            state.reset()
-            got_current = None
-            for prior in range(pos + 1):
-                t = tokens[prior].to(dtype=input_dtype)
-                got_r = attention.step_attention(root, args.layer, t, args.device)
-                if prior == pos:
-                    got_current = got_r - t.float()
-            report("linear_with_qkv_bf16", ref_out2, got_current, args.tolerance)
+            reference_current = _run_reference(
+                layer,
+                tokens,
+                input_norm,
+                input_dtype,
+                config,
+                pos,
+            )
+            runtime_current = _run_runtime(
+                root,
+                args.layer,
+                tokens[: pos + 1],
+                input_dtype,
+                args.device,
+                selective_projection,
+            )
+            all_ok &= report("linear_with_qkv_bf16", reference_current, runtime_current, args.tolerance)
 
-            attention._projection = projection
-
+        
     finally:
         attention._projection = original_projection
         attention.deactivate(root)
@@ -173,7 +190,8 @@ def main() -> int:
         if args.device == "cuda":
             torch.cuda.empty_cache()
 
-    return 0
+    print(f"\nRESULT status={'PASS' if all_ok else 'FAIL'}")
+    return 0 if all_ok else 1
 
 
 if __name__ == "__main__":
