@@ -88,15 +88,15 @@ def _batched_moe_step_gpu(
     weights = [float(v) for v in routed.weights.detach().cpu().tolist()]
 
     triplets = _load_route_batch_preserving_duplicates(root, layer, prefix, expert_ids)
-    gate_w = torch.stack([triplet[0] for triplet in triplets], dim=0)
-    up_w = torch.stack([triplet[1] for triplet in triplets], dim=0)
-    down_w = torch.stack([triplet[2] for triplet in triplets], dim=0)
-    batch_x = moe_in.expand(len(expert_ids), -1).to(dtype=torch.float16)
-
     if len(triplets) != len(expert_ids):
         raise RuntimeError(
             f"Expert route batch mismatch: requested {len(expert_ids)}, loaded {len(triplets)}"
         )
+
+    gate_w = torch.stack([triplet[0] for triplet in triplets], dim=0)
+    up_w = torch.stack([triplet[1] for triplet in triplets], dim=0)
+    down_w = torch.stack([triplet[2] for triplet in triplets], dim=0)
+    batch_x = moe_in.expand(len(expert_ids), -1).to(dtype=torch.float16)
 
     with torch.autocast(device_type="cuda", dtype=torch.float16):
         gate = torch.bmm(gate_w, batch_x.unsqueeze(-1)).squeeze(-1)
@@ -139,6 +139,7 @@ def _cache_stats_with_experts(root: Path) -> dict[str, int | float]:
         "expert_cache_items": int(expert["items"]),
         "expert_cache_bytes": int(expert["bytes"]),
         "expert_cache_budget": int(expert["budget_bytes"]),
+        "expert_cache_q4_ram_bytes": int(expert["q4_ram_bytes"]),
         "expert_cache_total_slots": int(expert["total_slots"]),
         "expert_cache_hits": int(expert["hits"]),
         "expert_cache_misses": int(expert["misses"]),
@@ -152,6 +153,7 @@ def _cache_stats_with_experts(root: Path) -> dict[str, int | float]:
         "expert_cache_fp16_to_fp8": int(expert["fp16_to_fp8"]),
         "expert_cache_fp8_to_q4": int(expert["fp8_to_q4"]),
         "expert_cache_q4_drops": int(expert["q4_drops"]),
+        "expert_cache_q4_ram_evictions": int(expert["q4_ram_evictions"]),
         "expert_cache_stream_prefetch_hits": int(expert["stream_prefetch_hits"]),
         "expert_cache_stream_prefetch_misses": int(expert["stream_prefetch_misses"]),
     })
@@ -165,15 +167,18 @@ def _print_cache_with_experts(root: Path, label: str) -> None:
         return
     expert = cache.snapshot()
     print(
-        f"  expert_cache: entries={expert['items']} | "
-        f"vram={expert['bytes'] / 1024**2:.1f}/{expert['budget_bytes'] / 1024**2:.1f} MiB | "
+        f"  expert_cache: fp8_vram_entries={expert['warm_items']} | "
+        f"fp8_vram={expert['bytes'] / 1024**2:.1f}/{expert['budget_bytes'] / 1024**2:.1f} MiB | "
+        f"q4_ram_entries={expert['cold_items']} | "
+        f"q4_ram={expert['q4_ram_bytes'] / 1024**2:.1f} MiB | "
         f"hit_rate={expert['hit_rate']:.2f}% | hits={expert['hits']} | "
-        f"misses={expert['misses']} | loads={expert['loads']} | evictions={expert['evictions']}"
+        f"misses={expert['misses']} | loads={expert['loads']}"
     )
     print(
-        f"    tiers: FP8={expert['warm_items']} | Q4={expert['cold_items']} | "
+        f"    tiers: FP8=VRAM:{expert['warm_items']} | Q4=RAM:{expert['cold_items']} | "
         f"hits FP8={expert['fp8_hits']} Q4={expert['q4_hits']} | "
-        f"compressions FP8>Q4={expert['fp8_to_q4']} | drops={expert['q4_drops']} | "
+        f"GPU compressions FP8>Q4={expert['fp8_to_q4']} | "
+        f"Q4 RAM evictions={expert['q4_ram_evictions']} | "
         f"prefetch hits={expert['stream_prefetch_hits']} misses={expert['stream_prefetch_misses']}"
     )
 
@@ -189,10 +194,10 @@ def main() -> None:
     cache = _expert_cache(Path("."))
     print("expert_cache=complete-layer-expert")
     print("expert_cache_key=(layer,expert)")
-    print("expert_cache_policy=per-layer-tiered-8fp8-4q4")
-    print("expert_cache_budget=full-stream-vram-budget")
-    print("expert_cache_entry=FP8-resident|Q4-cold")
-    print("expert_cache_eviction=FP8-to-Q4-then-drop")
+    print("expert_cache_policy=per-layer-8fp8-vram-3q4-ram")
+    print("expert_cache_budget=fp8-vram-stream-budget")
+    print("expert_cache_entry=FP8-VRAM|Q4-RAM")
+    print("expert_cache_eviction=FP8-to-Q4-RAM")
     print("expert_cache_fp16_persistent=disabled")
     print("expert_cache_fp8_promotion=disabled")
     print("expert_cache_prefetch=parallel-raw-fp8-stream")
@@ -201,7 +206,7 @@ def main() -> None:
     print(f"expert_cache_total_slots={cache.total_slots}")
     print(f"expert_cache_slots_per_layer={cache.slots_per_layer}")
     print(f"expert_cache_fp8_slots_per_layer={cache.fp8_slots}")
-    print(f"expert_cache_q4_slots_per_layer={cache.q4_slots}")
+    print(f"expert_cache_q4_ram_slots_per_layer={cache.q4_slots}")
     chat.main()
 
 
