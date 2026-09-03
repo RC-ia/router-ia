@@ -116,12 +116,16 @@ def main():
     F.linear = wrapped
     try:
         with torch.no_grad():
-            official = layer.linear_attn(hidden_states=normed.unsqueeze(1), cache_params=None, attention_mask=None)
-            if isinstance(official, tuple):
-                official = official[0]
-            official = official.reshape(1, base.LINEAR_VALUE_DIM)
+            official_full = layer.linear_attn(hidden_states=normed.unsqueeze(1), cache_params=None, attention_mask=None)
+            if isinstance(official_full, tuple):
+                official_full = official_full[0]
     finally:
         F.linear = original_linear
+
+    # The captured 4096-wide F.linear is the actual in_proj_z result. The
+    # complete linear-attention module output is only the final 2048-wide
+    # attention vector and must never be reshaped as LINEAR_VALUE_DIM.
+    official_z = captured["output"].detach()
 
     state = attention.state_for(root, args.device)
     state.reset()
@@ -137,8 +141,9 @@ def main():
     print(f"  official input : shape={tuple(captured['input'].shape)} dtype={captured['input'].dtype}")
     print(f"  official weight: shape={tuple(captured['weight'].shape)} dtype={captured['weight'].dtype}")
     print(f"  router weight  : shape={tuple(router_w.shape)} dtype={router_w.dtype}")
-    print(f"  official output: shape={tuple(official.shape)} dtype={official.dtype}")
-    print(f"  router output  : shape={tuple(router_output.shape)} dtype={router_output.dtype}")
+    print(f"  official z     : shape={tuple(official_z.shape)} dtype={official_z.dtype}")
+    print(f"  router z       : shape={tuple(router_output.shape)} dtype={router_output.dtype}")
+    print(f"  full attn out  : shape={tuple(official_full.shape)} dtype={official_full.dtype}")
 
     print("\n=== INPUT ===")
     ok = [report("official_input_vs_normed", captured["input"], normed)]
@@ -164,9 +169,9 @@ def main():
     official_weight_output = original_linear(same_input, captured["weight"])
     router_weight_output = original_linear(same_input.to(dtype=router_w.dtype), router_w)
     ok += [
-        report("official_layer_vs_captured_linear", official, captured["output"], args.tolerance),
+        report("official_layer_vs_captured_linear", official_z, captured["output"], args.tolerance),
         report("official_weight_linear_vs_router", official_weight_output, router_weight_output, args.tolerance),
-        report("official_layer_vs_router", official, router_output, args.tolerance),
+        report("official_layer_vs_router", official_z, router_output, args.tolerance),
     ]
 
     print("\n=== INPUT DTYPE SENSITIVITY ===")
@@ -174,7 +179,7 @@ def main():
         try:
             candidate = original_linear(same_input.to(dtype=dtype), router_w)
             print(f"  input={str(dtype):<18}", end="")
-            s = _stage_stats(official, candidate)
+            s = _stage_stats(official_z, candidate)
             print(
                 f" max_abs={s[0]:.6g} mean_abs={s[1]:.6g} "
                 f"cosine={s[3]:.9f} norm={s[5]:.6g}"
