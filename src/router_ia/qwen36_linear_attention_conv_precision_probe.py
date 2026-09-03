@@ -37,12 +37,17 @@ def report(name: str, ref: torch.Tensor, got: torch.Tensor, tol: float) -> bool:
 
 
 def _token_channel_view(x: torch.Tensor) -> torch.Tensor:
-    """Normalize one-token [B,C] / [B,C,1] tensors to [B,C]."""
+    """Normalize conv captures to one-token [B,C].
+
+    The reference functional causal-conv path can capture the whole sequence as
+    [B,C,T], while the runtime step path captures one token as [B,C] or
+    [B,C,1].  For a per-token boundary comparison, use the final time position.
+    """
     if x.ndim == 2:
         return x
-    if x.ndim == 3 and x.shape[-1] == 1:
-        return x[..., 0]
-    raise ValueError(f"Expected one-token conv tensor [B,C] or [B,C,1], got {tuple(x.shape)}")
+    if x.ndim == 3:
+        return x[..., -1]
+    raise ValueError(f"Expected conv tensor [B,C] or [B,C,T], got {tuple(x.shape)}")
 
 
 def raw_weight(root: Path, name: str) -> tuple[torch.Tensor, torch.Tensor | None]:
