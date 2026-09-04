@@ -4,10 +4,10 @@ Experimental MoE inference harness for Qwen3.6-35B-A3B, written from
 scratch in PyTorch without `llama.cpp`.
 
 The project started as byte-level GGUF expert indexing, then evolved
-into a full 40-layer single-token runtime that runs on CPU or CUDA
-with hierarchical RAM/VRAM caches and bounded async expert prefetch.
-This README tracks what is actually in the tree right now, not what
-was planned a month ago.
+into a 40-layer hybrid runtime and an end-to-end generation path that
+runs on CPU or CUDA with hierarchical RAM/VRAM caches, expert streaming,
+and bounded async prefetch. This README tracks what is actually in the
+tree right now, not what was planned a month ago.
 
 ## Target model
 
@@ -25,7 +25,7 @@ The hardware target remains **4 GB VRAM + 8 GB RAM**.
 
 ## Current state
 
-The repo is split into three rough layers:
+The project is now divided into three functional layers:
 
 ### 1. GGUF indexing (frozen — superseded by the FP8 path)
 
@@ -36,12 +36,11 @@ The repo is split into three rough layers:
 | `expert_cache.py` | done — 2-tier RAM/VRAM LRU cache over packed GGUF bytes; VRAM currently holds raw quantized bytes |
 | `expert_runner.py` | done — single-expert GGUF execution via `ggml.dll` ctypes (IQ3_XXS / IQ4_XS) |
 
-This path is kept around as a correctness probe and a residency
-simulator, but it is not on the active inference path. The GGUF
-single-expert runner still dequantizes on CPU. A future revision will
-either port it to GPU dequantization or drop it.
+This path is kept as a correctness probe and residency simulator, but it
+is not on the active inference path. The GGUF single-expert runner still
+dequantizes on CPU.
 
-### 2. FP8 Safetensors cache layer
+### 2. FP8 Safetensors and expert-cache layer
 
 | Module | Status |
 |---|---|
@@ -49,70 +48,141 @@ either port it to GPU dequantization or drop it.
 | `qwen36_layer1_structure_probe.py`, `qwen36_load_trace.py` | done — crash-resistant Safetensors load tracer and one-layer structure probe |
 | `fp8_expert_cache.py`, `fp8_expert_cache_v2.py` | done — RAM/VRAM LRU cache for FP8 routed experts; v2 sidesteps `safe_open.get_dtype()` |
 | `fp8_expert_runner.py` | done — single-expert FP8 execution (E4M3 + 128×128 inverse scales) |
-| `qwen36_dequant.py` | done — memory-conscious FP8 blockwise dequant + a batched triplet path used by the routed-expert streamer |
+| `qwen36_dequant.py` | done — memory-conscious FP8 blockwise dequant + batched triplet path |
 | `qwen36_router.py` | done — top-k router via `mlp.gate.weight` |
 | `qwen36_lru_benchmark.py` | done — repeated single-token RAM LRU benchmark |
+| `qwen36_cached_loop.py` | done — hierarchical RAM/VRAM tensor cache wrapped around the reference runtime; configurable cache budgets and expert streaming |
 
-### 3. Single-token runtime (the active path)
+### 3. Validated runtime + generation path
 
-The repo no longer ends at "single expert probe". There is now a
-real 40-layer single-token forward path with hierarchical caching,
-async prefetch, and a fused routed-expert FP8 staging path.
+The mathematical runtime now covers the complete hybrid Qwen3.6 block:
+
+- 30 Gated DeltaNet / linear-attention layers + 10 full-attention layers.
+- Top-8 MoE routing over 256 experts plus the shared expert on every layer.
+- FP8 expert weights with blockwise dequantization for execution.
+- Gated RMSNorm with the validated computation order.
+- Full-attention RoPE and KV-cache implementation validated independently.
+- Gated DeltaNet Q/K normalization and recurrent update validated against
+  the reference recurrence.
+- Hierarchical RAM/VRAM caching and routed-expert streaming for the
+  low-memory hardware target.
+
+The 40-layer runner remains the reference executor, while the chat path
+is now the place where these pieces are assembled into text generation.
 
 | Module | What it does |
 |---|---|
-| `qwen36_op_probe.py` | Building block: `load_tensor`, `load_projection`, `load_embedding_row`, `rmsnorm`, FP8 blockwise dequant |
-| `qwen36_gated_norm_probe.py` | Gated RMSNorm (Qwen3.6 RMSNorm with the gating term) |
-| `qwen36_out_proj_probe.py` | Isolated out-projection (the linear after the value heads) |
-| `qwen36_residual_probe.py` | Layer-0 residual probe |
-| `qwen36_shared_expert_probe.py` | Shared-expert execution in isolation |
-| `qwen36_moe8_probe.py` | Router-selected top-k experts + aggregation (Layer 0 reference) |
-| `qwen36_expert_probe.py`, `qwen36_to_router_probe.py` | One-expert and one-router isolation |
-| `qwen36_chain_probe.py` | Consecutive layers for one token |
-| `qwen36_delta_sequence_probe.py` | Gated Delta Rule recurrence across two tokens (state persistence) |
-| `qwen36_layer0.py`, `qwen36_layer0_executor.py` | Validated single-token Layer-0 forward (DeltaNet + MoE) |
-| `qwen36_layer_executor.py` | Generic single-token executor for any layer |
-| `qwen36_40layer_loop.py` | Sequential 40-layer single-token loop; detects linear-vs-full attention per layer, runs MoE + shared expert; CPU and CUDA |
-| `qwen36_cached_loop.py` | Same 40-layer loop wrapped in a hierarchical cache layer with env-tunable budgets (`QWEN36_CACHE_GB`, `QWEN36_VRAM_GB`, `QWEN36_VRAM_CACHE_GB`, `QWEN36_RESIDENT_VRAM_RATIO`, `QWEN36_VRAM_STREAM_GB`, `QWEN36_EXPERT_BONUS`) |
-| `qwen36_cuda_loop.py` | CUDA-first runner with preflight and load diagnostics |
-| `qwen36_cuda_prefetch_test.py`, `qwen36_cuda_tokens_test.py` | GPU-resident layer prefetch cache + benchmark for token-pass cache reuse |
-| `qwen36_moe_weight_prefetch_loop.py` | Bounded async prefetch of guaranteed MoE weights before the layer needs them |
-| `qwen36_planned_loop.py` | Planned expert prefetch (router-aware schedule) |
-| `qwen36_mini_chat.py` | Mini chat smoke test that does a real `token → router → hidden → lm_head` cycle per generated token; **not yet a stateful decoder** (see below) |
-| `qwen36_chat_batch.py` | Batch mini-chat smoke test over the cached loop |
-| `qwen36_chat_batch_fused.py` | Same but with fused routed-expert FP8 staging: one H2D copy per stacked expert triplet + one vectorized GPU dequant |
-| `qwen36_profile.py`, `qwen36_profile_chat.py` | Profilers around the existing reference loops |
+| `qwen36_op_probe.py` | Building blocks: tensor loading, projection loading, embedding rows, RMSNorm, FP8 dequant |
+| `qwen36_gated_norm_probe.py` | Gated RMSNorm validation |
+| `qwen36_out_proj_probe.py` | Isolated out-projection validation |
+| `qwen36_residual_probe.py` | Layer-0 residual validation |
+| `qwen36_shared_expert_probe.py` | Shared-expert execution validation |
+| `qwen36_moe8_probe.py` | Router-selected top-k experts + aggregation validation |
+| `qwen36_expert_probe.py`, `qwen36_to_router_probe.py` | Expert/router isolation |
+| `qwen36_chain_probe.py` | Consecutive-layer execution |
+| `qwen36_delta_sequence_probe.py` | Gated Delta Rule recurrence across tokens |
+| `qwen36_linear_attention_hf.py` | Reference-aligned Gated DeltaNet implementation |
+| `qwen36_linear_attention_hf_probe.py` | HF/reference comparison probe |
+| `qwen36_40layer_loop.py` | Canonical sequential 40-layer reference executor; detects linear-vs-full attention and runs the full MoE block |
+| `qwen36_cached_loop.py` | Cache infrastructure around the canonical executor |
+| `qwen36_chat_batch.py` | **Official generator**: end-to-end tokenizer → 40-layer runtime → final norm → `lm_head` → token sampling/decoding |
+| `qwen36_chat_batch_fused.py` | Experimental optimized generator path with fused routed-expert FP8 staging |
+| `qwen36_mini_chat.py` | Earlier mini-chat smoke path; retained as a smaller diagnostic |
+| `qwen36_cuda_loop.py` | CUDA-first runtime diagnostics |
+| `qwen36_profile.py`, `qwen36_profile_chat.py` | Profiling tools for the runtime and generator |
 
-The `qwen36_moe_probe.py` / `qwen36_moe_validate.py` pair at the top
-level are now a partial MoE-only probe and a runtime-vs-checkpoint
-validator — both still work but are below the 40-layer loop in the
-hierarchy.
+## Official generator: `qwen36_chat_batch.py`
 
-### What is implemented but limited
+`qwen36_chat_batch.py` is the **official generation entry point** for
+this project.
 
-- **Single-token only.** Each generated token is decoded from the
-  previous token alone. The 40-layer runner does not preserve the
-  recurrent DeltaNet state or the full-attention KV cache across
-  generated tokens. `qwen36_mini_chat` documents this explicitly:
-  "router/runtime smoke-test, not yet a faithful autoregressive
-  decoder."
-- **Stateful decoding is partially started.** `qwen36_delta_sequence_probe.py`
-  shows Gated Delta Rule recurrence working across two tokens; that
-  is the seed for the real autoregressive loop but is not yet wired
-  into the chat path.
-- **Two expert-cache flavours** (GGUF + FP8) are kept side-by-side.
-  They share the LRU shape but not the API. Unification is deferred.
+It is responsible for the end-to-end path:
 
-### What is intentionally not implemented yet
+```text
+prompt
+  ↓
+tokenizer
+  ↓
+embedding
+  ↓
+40 hybrid transformer layers
+  ├─ Gated DeltaNet / linear attention
+  ├─ full attention
+  └─ top-8 MoE + shared expert
+  ↓
+final RMSNorm
+  ↓
+lm_head
+  ↓
+logits / sampling
+  ↓
+next token
+  ↓
+decode
+```
 
-- Stateful autoregressive decoder across multiple generated tokens.
-- Real KV-cache for the 10 full-attention layers.
-- SSD cold tier (was the original milestone 6).
-- GPU-side dequantization of GGUF experts (the GGUF branch is frozen).
-- `torch.compile`, FlashAttention, or any Triton kernel.
-- Any HTTP / OpenAI-compatible serving layer.
-- Tests as a separate suite (`tests/` does not exist); validation is
-  done through the `*_validate.py` and `*_probe.py` scripts.
+The generator already exercises the real tokenizer, full 40-layer
+forward path, final normalization, LM head, and autoregressive token
+loop. Its cache path is backed by `qwen36_cached_loop.py`, including the
+RAM/VRAM hierarchy and routed expert staging.
+
+The current functional gate before calling the generator fully faithful
+is **persistent state integration**: generated tokens must reuse the
+Gated DeltaNet recurrent states and the full-attention KV caches instead
+of recomputing each token from only the previous token. Those two pieces
+are already validated independently; the remaining work is to wire them
+into this official path and verify multi-token output against a reference
+implementation.
+
+`qwen36_chat_batch_fused.py` is deliberately kept as an optimization
+variant. It should not become a second official implementation.
+
+## Validation status
+
+The following building blocks have already been validated independently:
+
+| Area | Status |
+|---|---|
+| 40-layer hybrid dispatch | **PASS** — all 40 layers execute with the expected 30/10 attention split |
+| MoE router / top-8 selection | **PASS** — runtime routing agrees with `mlp.gate.weight` reference routing |
+| FP8 expert MLP | **PASS** — routed expert outputs match the direct reference path |
+| Shared expert + aggregation | **PASS** |
+| Gated RMSNorm | **PASS** |
+| Gated DeltaNet recurrence | **PASS** — reference-aligned state update validated across multiple tokens |
+| Full-attention KV cache | **PASS** — K/V, lengths, reset and detach behavior validated |
+| Hierarchical RAM/VRAM cache | **PASS** — cache hits, misses, streaming and eviction paths exercised |
+| End-to-end tokenizer → runtime → `lm_head` | **RUNNING** — generator path exists; final stateful integration is the remaining correctness gate |
+
+## What remains before optimization
+
+The project is deliberately close to the optimization phase.
+
+### Final correctness steps
+
+1. Wire persistent Gated DeltaNet recurrent state into
+   `qwen36_chat_batch.py`.
+2. Wire the persistent full-attention KV cache into
+   `qwen36_chat_batch.py`.
+3. Run multi-token correctness tests against the reference implementation.
+4. Confirm that the generated text is stable and valid across several
+   short prompts and generation lengths.
+
+### Then: optimization only
+
+Once the stateful generator passes correctness checks, the remaining
+work is primarily performance and memory engineering:
+
+- reduce RAM ↔ VRAM transfers;
+- improve routed-expert cache hit rate;
+- overlap prefetch with computation;
+- fuse/accelerate FP8 dequantization;
+- reduce Python and allocator overhead;
+- improve batching and token throughput;
+- evaluate `torch.compile`, Triton and specialized CUDA kernels;
+- tune VRAM/RAM/SSD residency policies for the target hardware.
+
+SSD cold storage and the older GGUF path are optional memory/compatibility
+work, not blockers for the official generator.
 
 ## CLI entry points
 
@@ -122,52 +192,48 @@ Only one script is installed as a console entry:
 router-inspect path/to/model.gguf
 ```
 
-Everything else is reachable as a module. The most useful for
-end-to-end smoke tests:
+Everything else is reachable as a module. The main runtime tools are:
 
 ```bash
-# CPU/CUDA 40-layer single-token loop (the canonical reference path)
-python -m router_ia.qwen36_40layer_loop /path/to/safetensors/dir --device cpu
+# Canonical 40-layer reference executor
+python -m router_ia.qwen36_40layer_loop /path/to/safetensors/dir --device cuda
 
-# Same loop, but routed through the hierarchical RAM/VRAM caches
+# Hierarchical cache wrapper around the reference executor
 python -m router_ia.qwen36_cached_loop /path/to/safetensors/dir --device cuda
 
-# CUDA-first runner with load diagnostics
-python -m router_ia.qwen36_cuda_loop /path/to/safetensors/dir
+# OFFICIAL GENERATOR
+python -m router_ia.qwen36_chat_batch /path/to/safetensors/dir \
+  --device cuda --max-new-tokens 16
 
-# Mini chat (router + lm_head, no stateful decoder yet)
-python -m router_ia.qwen36_mini_chat /path/to/safetensors/dir
-
-# Batched chat over the cached loop, with fused expert FP8 staging
+# Experimental fused optimization variant
 python -m router_ia.qwen36_chat_batch_fused /path/to/safetensors/dir
 
-# FP8 expert / router / cache probes
-python -m router_ia.qwen36_layer0_executor /path/to/safetensors/dir
-python -m router_ia.qwen36_layer_executor  /path/to/safetensors/dir --layer 0
-python -m router_ia.qwen36_moe_validate    /path/to/safetensors/dir
-python -m router_ia.qwen36_lru_benchmark   /path/to/safetensors/dir
-```
+# Smaller diagnostic chat path
+python -m router_ia.qwen36_mini_chat /path/to/safetensors/dir
 
-The `qwen36_moe_probe.py` file at the repo root is a compatibility
-launcher for `python qwen36_moe_probe.py ...`.
+# Validation probes
+python -m router_ia.qwen36_layer0_executor /path/to/safetensors/dir
+python -m router_ia.qwen36_layer_executor /path/to/safetensors/dir --layer 0
+python -m router_ia.qwen36_moe_validate /path/to/safetensors/dir
+python -m router_ia.qwen36_lru_benchmark /path/to/safetensors/dir
+```
 
 ## Constraints
 
 - Do not modify `llama.cpp`.
 - Keep the first implementation small and inspectable.
 - Correctness first; performance comes later.
+- `qwen36_chat_batch.py` is the single official generation path; other
+  runners exist for reference, diagnostics, validation, or optimization
+  experiments.
 
 ## Roadmap
 
-1. Wire the persistent DeltaNet state and KV-cache into the
-   `qwen36_mini_chat` path so it becomes a real autoregressive
-   decoder (the Gated Delta Rule recurrence already works across two
-   tokens in `qwen36_delta_sequence_probe`).
-2. Unify the GGUF and FP8 expert caches into one
-   `MoEExpertCache` over both formats.
-3. SSD cold tier (original milestone 6).
-4. GPU dequantization of GGUF experts or, more likely, drop the GGUF
-   runner entirely and keep the FP8 path only.
-5. Decide whether to lift this into a serving layer or hand it to
-   `llama.cpp` / `vLLM` and keep this repo as the measurement
-   harness.
+1. **Official generator correctness:** finish persistent DeltaNet state
+   + full-attention KV-cache integration in `qwen36_chat_batch.py`.
+2. **Generation validation:** compare multi-token outputs against a
+   reference and confirm valid text.
+3. **Optimization pass:** cache policy, memory movement, prefetch,
+   dequantization, batching, kernels/compiler, and throughput.
+4. **Optional packaging/serving:** only after the runtime itself is
+   stable and optimized.
