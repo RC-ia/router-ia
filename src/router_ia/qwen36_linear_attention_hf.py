@@ -109,8 +109,8 @@ def _hf_l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 
 def gated_delta_recurrent(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, state: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
-    """HF-style recurrent gated-delta update using FP32 internal state/math."""
-    batch, seq_len, num_heads, k_dim = query.shape
+    """HF-compatible recurrent gated-delta update."""
+    batch, seq_len, _, k_dim = query.shape
     v_heads, v_dim = value.shape[2], value.shape[3]
     initial_dtype = query.dtype
     q = query.transpose(1, 2).contiguous().float()
@@ -123,12 +123,14 @@ def gated_delta_recurrent(query: torch.Tensor, key: torch.Tensor, value: torch.T
     k = _hf_l2norm(k)
     q = q * (k_dim ** -0.5)
 
+    # Transformers keeps recurrent state in value.dtype. The official fallback
+    # uses initial_state.to(value), not an unconditional FP32 state.
     if state is None:
-        recurrent = torch.zeros((batch, v_heads, k_dim, v_dim), device=value.device, dtype=torch.float32)
+        recurrent = torch.zeros((batch, v_heads, k_dim, v_dim), device=value.device, dtype=value.dtype)
     else:
-        recurrent = state.to(device=value.device, dtype=torch.float32)
+        recurrent = state.to(value)
 
-    outputs = torch.empty((batch, v_heads, seq_len, v_dim), device=value.device, dtype=torch.float32)
+    outputs = torch.zeros_like(v)
     for i in range(seq_len):
         q_t = q[:, :, i]
         k_t = k[:, :, i]
