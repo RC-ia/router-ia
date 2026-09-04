@@ -9,8 +9,9 @@ attention hooks, expert-tier routing, adaptive Q4 retention, VRAM governor,
 prompt-scoped generation heat, shared adaptive Q4 RAM bank, GPU-only Q4
 materialization, higher-concurrency current-route prefetch, GPU FP16 expert
 materialization, batch-first expert planning, batch-planner hot-path
-refinements, memory residency policy, Q4 routed-expert hierarchy, and
-optional profiler patch the exact module instance executed by ``main()``.
+refinements, memory residency policy, Q4 routed-expert hierarchy, physical
+RAM-only cache governor, and optional profiler patch the exact module instance
+executed by ``main()``.
 """
 
 import os
@@ -32,6 +33,7 @@ from . import qwen36_fp16_expert_cache as _fp16_expert_cache  # noqa: F401
 from . import qwen36_expert_batch_plan_v2 as _expert_batch_plan_v2  # noqa: F401
 from . import qwen36_expert_batch_plan_v3 as _expert_batch_plan_v3  # noqa: F401
 from . import qwen36_expert_q4_hierarchy as _expert_q4_hierarchy  # noqa: F401
+from . import qwen36_physical_memory_guard as _physical_memory_guard  # noqa: F401
 from . import qwen36_memory_policy_v2 as _memory_policy_v2  # noqa: F401
 
 if os.getenv("QWEN36_PROFILE", "0").strip().lower() in {"1", "true", "yes", "on"}:
