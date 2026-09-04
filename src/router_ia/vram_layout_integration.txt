@@ -1,0 +1,10 @@
+VRAM layout integration is implemented in qwen36_vram_layout.py.
+
+Defaults for a 4 GiB GPU:
+- 1.0 GiB compute reserve
+- 3.0 GiB persistent cache envelope
+- resident: 60% of persistent cache
+- routed experts: up to 1.0 GiB
+- remaining cache capacity: transfer/stream window
+
+The transfer window is the first tier sacrificed when compute pressure is detected; allocator-wide empty_cache() is not used on the hot path.
