@@ -2,10 +2,9 @@ from __future__ import annotations
 
 """Stable Q4 expert hierarchy used by the canonical runner.
 
-The existing routing, adaptive heat, batch planner and scheduler stay intact.
-Only the storage format of routed experts changes to packed Q4:
-
-    checkpoint FP8 -> Q4 -> VRAM <-> RAM <-> temporary SSD
+Experts are stored as packed Q4 across VRAM, RAM and temporary SSD. The cache
+lock protects metadata only; disk IO, CPU quantization and H2D transfers never
+run while holding it, preventing scheduler/forward deadlocks.
 """
 
 import os
@@ -196,6 +195,7 @@ def _source_to_q4(store: Any, root: Path, layer: int, expert_id: int, layer_pref
 def _get_or_load(cache: Any, store: Any, root: Path, layer: int, expert_id: int, layer_prefix: str):
     layer, expert_id = int(layer), int(expert_id)
     key = (layer, expert_id)
+
     with cache.lock:
         entry = cache._q4_vram_entries.get(key)
         if entry is not None:
@@ -208,9 +208,20 @@ def _get_or_load(cache: Any, store: Any, root: Path, layer: int, expert_id: int,
             cache.q4_entries[layer].move_to_end(expert_id)
             cache.hits += 1
             cache._q4_ram_hits += 1
-            return _vram_insert(cache, root, layer, expert_id, entry), "ram"
-        entry = _load_ssd(root, layer, expert_id)
-        if entry is not None:
+            ram_entry = entry
+        else:
+            ram_entry = None
+        if ram_entry is not None:
+            # Metadata access only. Perform H2D after releasing the lock.
+            pass
+
+    if ram_entry is not None:
+        cuda_entry = _vram_insert(cache, root, layer, expert_id, ram_entry)
+        return cuda_entry, "ram"
+
+    ssd_entry = _load_ssd(root, layer, expert_id)
+    if ssd_entry is not None:
+        with cache.lock:
             cache.hits += 1
             cache._q4_ssd_hits += 1
             cache._q4_ssd_reads += 1
@@ -218,20 +229,20 @@ def _get_or_load(cache: Any, store: Any, root: Path, layer: int, expert_id: int,
                 cache._q4_ssd_bytes_read += _ssd_path(root, layer, expert_id).stat().st_size
             except OSError:
                 pass
-            _ram_insert(cache, root, layer, expert_id, entry)
-            return _vram_insert(cache, root, layer, expert_id, entry), "ssd"
+        _ram_insert(cache, root, layer, expert_id, ssd_entry)
+        return _vram_insert(cache, root, layer, expert_id, ssd_entry), "ssd"
+
+    with cache.lock:
         cache.misses += 1
 
     q4 = _source_to_q4(store, root, layer, expert_id, layer_prefix)
+    _ram_insert(cache, root, layer, expert_id, q4)
+    cuda_entry = _vram_insert(cache, root, layer, expert_id, q4)
     with cache.lock:
-        existing = cache._q4_vram_entries.get(key)
-        if existing is not None:
-            return existing, "vram"
-        _ram_insert(cache, root, layer, expert_id, q4)
-        cuda_entry = _vram_insert(cache, root, layer, expert_id, q4)
         cache.loads += 1
+        cache._q4_source_quantizations += 1
         cache.fp8_to_q4 += 1
-        return cuda_entry, "source"
+    return cuda_entry, "source"
 
 
 def _hierarchy_get_or_load_batch(self: Any, store: Any, layer: int, expert_ids: list[int], layer_prefix: str):
@@ -261,7 +272,7 @@ def _plan_layer_q4(root: Path, layer: int, layer_prefix: str, expert_ids: list[i
     entries = {}
     tiers = {}
     for expert_id in unique:
-        entry, tier = _get_or_load(cache, store, root, int(layer), expert_id, layer_prefix)
+        entry, tier = _get_or_load(cache, store, layer, expert_id, layer_prefix)
         entries[expert_id] = entry
         tiers[expert_id] = tier
         policy.record(layer, expert_id, "q4")
@@ -277,25 +288,29 @@ def _plan_layer_q4(root: Path, layer: int, layer_prefix: str, expert_ids: list[i
 def _snapshot(self: Any) -> dict[str, int | float]:
     base = dict(_ORIGINAL_SNAPSHOT(self))
     cache = _ensure(self)
-    ram_items = sum(len(bank) for bank in cache.q4_entries.values())
-    base.update({
-        "bytes": int(cache._q4_vram_bytes),
-        "budget_bytes": int(cache._q4_vram_budget),
-        "warm_items": len(cache._q4_vram_entries),
-        "cold_items": ram_items,
-        "q4_ram_bytes": int(cache.q4_bytes_used),
-        "q4_vram_bytes": int(cache._q4_vram_bytes),
-        "q4_vram_budget": int(cache._q4_vram_budget),
-        "q4_ram_budget": int(cache._q4_ram_budget),
-        "fp8_hits": int(cache._q4_vram_hits),
-        "q4_hits": int(cache._q4_ram_hits + cache._q4_ssd_hits),
-        "fp8_to_q4": int(cache._q4_source_quantizations),
-        "q4_ssd_hits": int(cache._q4_ssd_hits),
-        "q4_ssd_writes": int(cache._q4_ssd_writes),
-        "q4_ssd_reads": int(cache._q4_ssd_reads),
-        "q4_vram_evictions": int(cache._q4_vram_evictions),
-        "q4_ram_evictions_to_ssd": int(cache._q4_ram_evictions_to_ssd),
-    })
+    with cache.lock:
+        ram_items = sum(len(bank) for bank in cache.q4_entries.values())
+        vram_items = len(cache._q4_vram_entries)
+        vram_bytes = cache._q4_vram_bytes
+        ram_bytes = cache.q4_bytes_used
+        base.update({
+            "bytes": int(vram_bytes),
+            "budget_bytes": int(cache._q4_vram_budget),
+            "warm_items": vram_items,
+            "cold_items": ram_items,
+            "q4_ram_bytes": int(ram_bytes),
+            "q4_vram_bytes": int(vram_bytes),
+            "q4_vram_budget": int(cache._q4_vram_budget),
+            "q4_ram_budget": int(cache._q4_ram_budget),
+            "fp8_hits": int(cache._q4_vram_hits),
+            "q4_hits": int(cache._q4_ram_hits + cache._q4_ssd_hits),
+            "fp8_to_q4": int(cache._q4_source_quantizations),
+            "q4_ssd_hits": int(cache._q4_ssd_hits),
+            "q4_ssd_writes": int(cache._q4_ssd_writes),
+            "q4_ssd_reads": int(cache._q4_ssd_reads),
+            "q4_vram_evictions": int(cache._q4_vram_evictions),
+            "q4_ram_evictions_to_ssd": int(cache._q4_ram_evictions_to_ssd),
+        })
     return base
 
 
@@ -305,15 +320,16 @@ def _print_cache(root: Path, label: str) -> None:
     if cache is None:
         return
     cache = _ensure(cache)
-    print(
-        "  q4 hierarchy: "
-        f"vram={cache._q4_vram_bytes / 1024**2:.1f}/{cache._q4_vram_budget / 1024**2:.1f} MiB | "
-        f"ram={cache.q4_bytes_used / 1024**2:.1f}/{cache._q4_ram_budget / 1024**2:.1f} MiB | "
-        f"vram_items={len(cache._q4_vram_entries)} | "
-        f"ram_items={sum(len(bank) for bank in cache.q4_entries.values())} | "
-        f"ssd_hits={cache._q4_ssd_hits} | ssd_writes={cache._q4_ssd_writes} | "
-        f"ssd_reads={cache._q4_ssd_reads} | vram_evictions={cache._q4_vram_evictions}"
-    )
+    with cache.lock:
+        print(
+            "  q4 hierarchy: "
+            f"vram={cache._q4_vram_bytes / 1024**2:.1f}/{cache._q4_vram_budget / 1024**2:.1f} MiB | "
+            f"ram={cache.q4_bytes_used / 1024**2:.1f}/{cache._q4_ram_budget / 1024**2:.1f} MiB | "
+            f"vram_items={len(cache._q4_vram_entries)} | "
+            f"ram_items={sum(len(bank) for bank in cache.q4_entries.values())} | "
+            f"ssd_hits={cache._q4_ssd_hits} | ssd_writes={cache._q4_ssd_writes} | "
+            f"ssd_reads={cache._q4_ssd_reads} | vram_evictions={cache._q4_vram_evictions}"
+        )
 
 
 def _clear(self: Any) -> None:
@@ -322,6 +338,7 @@ def _clear(self: Any) -> None:
         cache._q4_vram_entries.clear()
         cache._q4_vram_bytes = 0
     _ORIGINAL_CLEAR(self)
+
 
 
 def _cache_factory(root: Path):
@@ -333,6 +350,7 @@ expert_cache.RoutedExpertCache.get_or_load = _hierarchy_get_or_load
 expert_cache.RoutedExpertCache.prefetch_expert_raw = _hierarchy_prefetch
 expert_cache.RoutedExpertCache.snapshot = _snapshot
 expert_cache.RoutedExpertCache.clear = _clear
+planner_v2._plan_layer = _plan_layer_q4
 planner_v3._expert_cache = _cache_factory
 planner_v3._plan_layer = _plan_layer_q4
 official._expert_cache = _cache_factory
@@ -343,5 +361,5 @@ print(
     f"vram={Q4_VRAM_BUDGET_BYTES / 1024**3:.2f}GiB|"
     f"ram={Q4_RAM_GB:.2f}GiB|ram_slots_per_layer={Q4_RAM_SLOTS_PER_LAYER}|"
     f"generic_resident={cached.RESIDENT_VRAM_GB:.2f}GiB|"
-    f"generic_stream={cached.STREAM_GB:.2f}GiB|ssd=temporary|stable=planner-v2-decode"
+    f"generic_stream={cached.STREAM_GB:.2f}GiB|ssd=temporary"
 )
