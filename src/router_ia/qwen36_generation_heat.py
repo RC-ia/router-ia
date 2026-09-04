@@ -74,7 +74,35 @@ def _generation_generate_response(*args, **kwargs):
 
 def _generation_print_cache(root: Path, label: str) -> None:
     _ORIGINAL_PRINT_CACHE(root, label)
-    print(f"  generation heat: epoch={_generation_id(root)} | boost=prompt-scoped")
+
+    key = root.resolve()
+    epoch = _generation_id(key)
+    policy = adaptive._policy(key)
+    expert = official._EXPERT_CACHES.get(key)
+    snap = policy.snapshot(expert)
+
+    cache_snap = expert.snapshot() if expert is not None else {}
+    hot = int(snap.get("hot", 0))
+    warm = int(cache_snap.get("warm_items", cache_snap.get("fp8_items", 0)))
+    cold = int(cache_snap.get("cold_items", cache_snap.get("q4_items", 0)))
+    promoted = int(snap.get("promotions", 0))
+    demoted = int(snap.get("demotions", 0))
+
+    print(
+        f"  generation heat: epoch={epoch} | hot={hot} | warm={warm} | cold={cold} | "
+        f"fp8_resident={warm} | q4_resident={cold} | promoted={promoted} | demoted={demoted}"
+    )
+
+    top = snap.get("top", [])
+    if top:
+        top_text = ", ".join(
+            f"L{int(item['layer']):02d}/E{int(item['expert'])} "
+            f"score={float(item['score']):.2f} "
+            f"tier={item['tier']} "
+            f"uses={int(item['accesses'])}"
+            for item in top
+        )
+        print(f"  generation heat top: {top_text}")
 
 
 chat.generate_response = _generation_generate_response
