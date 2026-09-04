@@ -21,6 +21,7 @@ from . import qwen36_fp16_expert_cache as _fp16_expert_cache  # noqa: F401
 from . import qwen36_expert_batch_plan_v2 as _expert_batch_plan_v2  # noqa: F401
 from . import qwen36_expert_batch_plan_v3 as _expert_batch_plan_v3  # noqa: F401
 from . import qwen36_expert_q4_hierarchy_fixed as _expert_q4_hierarchy  # noqa: F401
+from . import qwen36_expert_q4_activate as _expert_q4_activate  # noqa: F401
 from . import qwen36_physical_memory_guard_v2 as _physical_memory_guard  # noqa: F401
 from . import qwen36_memory_policy_v2 as _memory_policy_v2  # noqa: F401
 
