@@ -224,6 +224,7 @@ def run_forward_token(
     final_norm_name: str,
     lm_head_name: str,
     device: str,
+    advance_state: bool = True,
 ) -> tuple[torch.Tensor, float, float]:
     """Run one token through the full 40-layer stack using persistent attention state."""
     start = perf_counter()
@@ -252,14 +253,45 @@ def run_forward_token(
     elapsed = perf_counter() - start
     peak_logit = float(torch.max(logits.float()).item())
 
-    state = attention_cache.active(root, device)
-    state.tokens_seen += 1
+    if advance_state:
+        state = attention_cache.active(root, device)
+        state.tokens_seen += 1
 
     del x
     if device == "cuda":
         del final_norm_runtime, lm_head_runtime
     gc.collect()
     return logits, elapsed, peak_logit
+
+
+def run_generated_token(
+    root: Path,
+    token_id: int,
+    final_norm: torch.Tensor,
+    lm_head: torch.Tensor,
+    final_norm_name: str,
+    lm_head_name: str,
+    device: str,
+    sampling_top_k: int,
+    temperature: float,
+) -> tuple[int, float, float]:
+    """Compatibility shim for runtime_optimizations' legacy hook."""
+    logits, elapsed, peak_logit = run_forward_token(
+        root,
+        token_id,
+        final_norm,
+        lm_head,
+        final_norm_name,
+        lm_head_name,
+        device,
+        advance_state=False,
+    )
+    state = attention_cache.active(root, device)
+    state.tokens_seen += 1
+    next_id = sample_next(logits, temperature, sampling_top_k)
+    del logits
+    gc.collect()
+    return next_id, elapsed, peak_logit
 
 
 def generate_response(
