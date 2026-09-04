@@ -28,6 +28,7 @@ PHYSICAL_RAM_RESERVE_BYTES = int(PHYSICAL_RAM_RESERVE_GB * 1024**3)
 
 _ORIGINAL_RAM_PUT = cached._PriorityTensorCache.put
 _ORIGINAL_Q4_RAM_INSERT = q4_hierarchy._ram_insert
+_ORIGINAL_PRINT_CACHE = getattr(q4_hierarchy.chat, "print_cache", None)
 
 
 def _physical_available_bytes() -> int:
@@ -138,8 +139,16 @@ def _print_memory_status(root: Path, label: str) -> None:
     )
 
 
+def _print_cache(root: Path, label: str) -> None:
+    if _ORIGINAL_PRINT_CACHE is not None:
+        _ORIGINAL_PRINT_CACHE(root, label)
+    _print_memory_status(root, label)
+
+
 cached._PriorityTensorCache.put = _guarded_ram_put
 q4_hierarchy._ram_insert = _guarded_q4_ram_insert
+if _ORIGINAL_PRINT_CACHE is not None:
+    q4_hierarchy.chat.print_cache = _print_cache
 
 print(
     "physical_ram_guard=enabled|"
