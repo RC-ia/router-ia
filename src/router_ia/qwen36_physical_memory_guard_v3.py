@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-"""Physical-RAM guard v3.
+"""Physical-RAM governor for the Qwen3.6 router.
 
-Do not confuse physical RAM available right now with the router's cache
-capacity. The cache budget is derived from installed physical RAM; current
-availability is used only as an emergency pressure signal.
-
-This module intentionally ignores pagefile capacity. Cold Q4 experts are
-spilled to the existing SSD backing tier when physical RAM approaches the
-reserve floor.
+The router does not use pagefile size as cache capacity. Cache budgets are
+bounded independently; current physical availability is only an emergency
+signal that causes cold Q4 experts to spill to the router's SSD backing.
 """
 
 import ctypes
@@ -23,11 +19,19 @@ PHYSICAL_RAM_RESERVE_GB = max(
     float(os.getenv("QWEN36_PHYSICAL_RAM_RESERVE_GB", "1.5")), 0.25
 )
 PHYSICAL_RAM_RESERVE_BYTES = int(PHYSICAL_RAM_RESERVE_GB * 1024**3)
-EMERGENCY_HEADROOM_GB = max(
-    float(os.getenv("QWEN36_PHYSICAL_RAM_EMERGENCY_HEADROOM_GB", "0.50")),
-    0.10,
+EMERGENCY_TRIGGER_GB = max(
+    float(os.getenv("QWEN36_PHYSICAL_RAM_EMERGENCY_TRIGGER_GB", "2.0")),
+    PHYSICAL_RAM_RESERVE_GB,
 )
-EMERGENCY_HEADROOM_BYTES = int(EMERGENCY_HEADROOM_GB * 1024**3)
+EMERGENCY_TRIGGER_BYTES = int(EMERGENCY_TRIGGER_GB * 1024**3)
+EMERGENCY_RECOVERY_GB = max(
+    float(os.getenv("QWEN36_PHYSICAL_RAM_EMERGENCY_RECOVERY_GB", "2.5")),
+    EMERGENCY_TRIGGER_GB + 0.10,
+)
+EMERGENCY_RECOVERY_BYTES = int(EMERGENCY_RECOVERY_GB * 1024**3)
+
+_ORIGINAL_Q4_RAM_INSERT = q4._ram_insert
+_ORIGINAL_RAM_PUT = cached._PriorityTensorCache.put
 
 
 def _memory_status() -> tuple[int, int]:
@@ -81,25 +85,21 @@ def _q4_ram_bytes() -> int:
 
 
 def _configured_q4_budget() -> int:
-    total, _ = _memory_status()
-    if total <= 0:
-        return int(q4.Q4_RAM_BUDGET_BYTES)
-    return min(
-        int(q4.Q4_RAM_BUDGET_BYTES),
-        max(total - PHYSICAL_RAM_RESERVE_BYTES - int(q4.GENERIC_RESIDENT_BYTES), 0),
-    )
+    # The configured Q4 cache is deliberately independent of current free RAM.
+    # Physical free RAM is handled by _emergency_spill().
+    return int(q4.Q4_RAM_BUDGET_BYTES)
 
 
 def _emergency_spill(cache, root: Path) -> None:
-    """Move cold Q4 entries to SSD until physical headroom is recovered."""
+    """Spill cold Q4 entries until physical RAM recovers above the trigger."""
     _, available = _memory_status()
-    if available <= 0:
+    if available <= 0 or available >= EMERGENCY_TRIGGER_BYTES:
         return
-    floor = PHYSICAL_RAM_RESERVE_BYTES
-    recovery = floor + EMERGENCY_HEADROOM_BYTES
-    while available < floor:
+
+    while available < EMERGENCY_RECOVERY_BYTES:
         victim = None
         with cache.lock:
+            # Global oldest-first traversal across layer banks.
             for layer in range(cache.layers):
                 bank = cache.q4_entries.get(layer)
                 if bank:
@@ -109,6 +109,7 @@ def _emergency_spill(cache, root: Path) -> None:
                     break
         if victim is None:
             return
+
         layer, expert_id, entry = victim
         written = q4._save_ssd(root, layer, expert_id, entry)
         with cache.lock:
@@ -117,8 +118,9 @@ def _emergency_spill(cache, root: Path) -> None:
             cache._q4_ram_evictions_to_ssd += 1
             cache.q4_drops += 1
             cache.q4_ram_evictions += 1
+
         _, available = _memory_status()
-        if available >= recovery:
+        if available >= EMERGENCY_RECOVERY_BYTES:
             return
 
 
@@ -126,29 +128,20 @@ def _guarded_q4_ram_insert(cache, root: Path, layer: int, expert_id: int, entry)
     old_budget = cache._q4_ram_budget
     try:
         cache._q4_ram_budget = _configured_q4_budget()
-        q4._ram_insert(cache, root, layer, expert_id, entry)
+        _ORIGINAL_Q4_RAM_INSERT(cache, root, layer, expert_id, entry)
     finally:
         cache._q4_ram_budget = old_budget
     _emergency_spill(cache, root)
 
 
-_ORIGINAL_RAM_PUT = cached._PriorityTensorCache.put
-
-
 def _guarded_ram_put(self, name, tensor):
     if self.name != "ram":
         return _ORIGINAL_RAM_PUT(self, name, tensor)
-    total, _ = _memory_status()
-    old_budget = self.max_bytes
-    try:
-        if total > 0:
-            self.max_bytes = min(
-                old_budget,
-                max(total - PHYSICAL_RAM_RESERVE_BYTES - _q4_ram_bytes(), 0),
-            )
-        return _ORIGINAL_RAM_PUT(self, name, tensor)
-    finally:
-        self.max_bytes = old_budget
+
+    # Keep the configured host-cache ceiling; do not shrink it to the current
+    # free-RAM number. The Q4 tier is separately managed and will spill on
+    # genuine physical-memory pressure.
+    return _ORIGINAL_RAM_PUT(self, name, tensor)
 
 
 def print_memory_status(root: Path, label: str = "status") -> None:
@@ -162,8 +155,10 @@ def print_memory_status(root: Path, label: str = "status") -> None:
         f"available={available / 1024**3:.2f} GiB | "
         f"q4={_q4_ram_bytes() / 1024**3:.2f} GiB | "
         f"generic={_generic_ram_bytes() / 1024**3:.2f} GiB | "
-        f"reserve={PHYSICAL_RAM_RESERVE_GB:.2f} GiB | "
-        "pagefile=not-counted"
+        f"q4-budget={_configured_q4_budget() / 1024**3:.2f} GiB | "
+        f"trigger={EMERGENCY_TRIGGER_GB:.2f} GiB | "
+        f"recovery={EMERGENCY_RECOVERY_GB:.2f} GiB | "
+        f"reserve={PHYSICAL_RAM_RESERVE_GB:.2f} GiB | pagefile=not-counted"
     )
 
 
@@ -172,8 +167,9 @@ cached._PriorityTensorCache.put = _guarded_ram_put
 
 print(
     "physical_ram_guard_v3=enabled|"
-    f"total-based-q4-budget={_configured_q4_budget() / 1024**3:.2f}GiB|"
+    f"q4-budget={_configured_q4_budget() / 1024**3:.2f}GiB|"
+    f"trigger={EMERGENCY_TRIGGER_GB:.2f}GiB|"
+    f"recovery={EMERGENCY_RECOVERY_GB:.2f}GiB|"
     f"reserve={PHYSICAL_RAM_RESERVE_GB:.2f}GiB|"
-    f"emergency-headroom={EMERGENCY_HEADROOM_GB:.2f}GiB|"
     "pagefile=not-counted|spill=Q4-SSD"
 )
