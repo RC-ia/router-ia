@@ -16,6 +16,7 @@ from threading import Lock
 import torch
 import torch.nn.functional as F
 
+from . import qwen36_adaptive_experts as adaptive
 from . import qwen36_cached_loop as cached
 from . import qwen36_chat_batch as chat
 from . import qwen36_dequant as dequant
@@ -172,6 +173,7 @@ def _plan_layer(
     ids = [int(x) for x in expert_ids]
     unique_ids = list(dict.fromkeys(ids))
     cache = _expert_cache(root)
+    policy = adaptive._policy(root)
     output: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
     fp8_found = []
     q4_found = []
@@ -186,6 +188,7 @@ def _plan_layer(
             if hit is not None:
                 output[expert_id] = hit
                 _stat("fp16_hits")
+                policy.record(layer, expert_id, "fp16")
                 continue
 
         with cache.lock:
@@ -195,6 +198,7 @@ def _plan_layer(
                 cache.fp8_hits += 1
                 cache.fp8_entries[int(layer)].move_to_end(expert_id)
                 fp8_found.append((expert_id, "fp8", fp8))
+                policy.record(layer, expert_id, "fp8")
                 continue
             q4 = cache.q4_entries.setdefault(int(layer), {}).get(expert_id)
             if q4 is not None:
@@ -202,8 +206,10 @@ def _plan_layer(
                 cache.q4_hits += 1
                 cache.q4_entries[int(layer)].move_to_end(expert_id)
                 q4_found.append((expert_id, "q4", q4))
+                policy.record(layer, expert_id, "q4")
                 continue
             cache.misses += 1
+        policy.record(layer, expert_id, "miss")
         missing.append(expert_id)
 
     output.update(_decode_fp8(fp8_found))
@@ -211,9 +217,24 @@ def _plan_layer(
     output.update(_decode_q4(q4_found))
     _stat("q4_hits", len(q4_found))
 
+    # Q4 hits are now visible to the adaptive policy again. Once an expert has
+    # proven itself hot through repeated Q4 reuse, promote its decoded FP16
+    # triplet back into the compact FP8 resident cache for subsequent tokens.
+    for expert_id, _tier, _entry in q4_found:
+        if policy.should_promote(layer, expert_id):
+            with cache.lock:
+                already_hot = expert_id in cache.fp8_entries.get(int(layer), {})
+            if not already_hot:
+                cache.put_fp16(int(layer), int(expert_id), output[expert_id])
+                policy.note_promotion(layer, expert_id)
+
     if missing:
         _stat("miss_experts", len(missing))
-        output.update(_load_missing_grouped(root, layer, layer_prefix, missing))
+        missing_output = _load_missing_grouped(root, layer, layer_prefix, missing)
+        output.update(missing_output)
+        # Fresh misses are tracked as cold accesses by the adaptive policy. They
+        # remain in FP8 through the normal insertion path and can build heat on
+        # subsequent routes without changing model math.
 
     if materialized is not None:
         for expert_id in unique_ids:
