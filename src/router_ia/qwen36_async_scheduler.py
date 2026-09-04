@@ -42,6 +42,8 @@ class _Stats:
     skipped_fp8: int = 0
     skipped_pending: int = 0
     errors: int = 0
+    current_layer_prefetch: int = 0
+    lookahead_prefetch: int = 0
     by_layer: dict[int, int] = field(default_factory=dict)
 
 
@@ -57,6 +59,7 @@ _STATES: dict[Path, _State] = {}
 _STATES_LOCK = Lock()
 _ORIGINAL_MOE = chat.batched_moe_step
 _ORIGINAL_TRIPLET = chat._expert_projection_triplet
+_ORIGINAL_WARM = chat._warm_expert_raw_cache
 _ORIGINAL_CACHE_STATS = chat.cache_stats
 _ORIGINAL_PRINT_CACHE = chat.print_cache
 
@@ -109,10 +112,13 @@ def _hot_candidates(root: Path, layer: int) -> list[int]:
     selected: list[int] = []
     with expert_cache.lock:
         fp8_bank = expert_cache.fp8_entries.get(int(layer), {})
+        pending = {expert for (pending_layer, expert) in _state(root).pending if pending_layer == int(layer)} if _state(root) else set()
         for score, expert_id in scored:
             if score < adaptive.PREFETCH_SCORE:
                 break
             if expert_id in fp8_bank:
+                continue
+            if expert_id in pending:
                 continue
             selected.append(expert_id)
             if len(selected) >= LOOKAHEAD_EXPERTS:
@@ -138,7 +144,7 @@ def _cleanup_done(state: _State) -> None:
             state.stats.errors += 1
 
 
-def _schedule(root: Path, layer: int, expert_id: int) -> None:
+def _schedule(root: Path, layer: int, expert_id: int, source: str) -> None:
     state = _state(root)
     if state is None or layer >= 40:
         return
@@ -169,6 +175,10 @@ def _schedule(root: Path, layer: int, expert_id: int) -> None:
     state.pending[key] = _Pending(future, event, int(layer), int(expert_id))
     state.stats.scheduled += 1
     state.stats.by_layer[int(layer)] = state.stats.by_layer.get(int(layer), 0) + 1
+    if source == "current":
+        state.stats.current_layer_prefetch += 1
+    else:
+        state.stats.lookahead_prefetch += 1
 
 
 def _lookahead(root: Path, current_layer: int) -> None:
@@ -176,7 +186,19 @@ def _lookahead(root: Path, current_layer: int) -> None:
     if next_layer >= 40:
         return
     for expert_id in _hot_candidates(root, next_layer):
-        _schedule(root, next_layer, expert_id)
+        _schedule(root, next_layer, expert_id, "lookahead")
+
+
+def _async_warm(root: Path, layer_prefix: str, expert_ids: list[int]) -> None:
+    """Stage current-route experts asynchronously; wait only on actual use."""
+    layer = _layer_from_prefix(layer_prefix)
+    if layer is None or not expert_ids:
+        return _ORIGINAL_WARM(root, layer_prefix, expert_ids)
+    if not ENABLED or not torch.cuda.is_available():
+        return _ORIGINAL_WARM(root, layer_prefix, expert_ids)
+
+    for expert_id in dict.fromkeys(int(v) for v in expert_ids):
+        _schedule(root, layer, expert_id, "current")
 
 
 def _wait(root: Path, layer: int, expert_id: int) -> None:
@@ -228,6 +250,8 @@ def _cache_stats(root: Path) -> dict[str, int | float]:
             "async_overlapped": state.stats.overlapped,
             "async_skipped_fp8": state.stats.skipped_fp8,
             "async_skipped_pending": state.stats.skipped_pending,
+            "async_current_prefetch": state.stats.current_layer_prefetch,
+            "async_lookahead_prefetch": state.stats.lookahead_prefetch,
             "async_errors": state.stats.errors,
             "async_pending": len(state.pending),
         }
@@ -247,6 +271,8 @@ def _print_cache(root: Path, label: str) -> None:
         f"  async experts: enabled=1 | scheduled={state.stats.scheduled} | "
         f"completed={state.stats.completed} | pending={len(state.pending)} | "
         f"waited={state.stats.waited} | overlapped={state.stats.overlapped} | "
+        f"current_prefetch={state.stats.current_layer_prefetch} | "
+        f"lookahead_prefetch={state.stats.lookahead_prefetch} | "
         f"skipped_fp8={state.stats.skipped_fp8} | "
         f"skipped_pending={state.stats.skipped_pending} | errors={state.stats.errors}"
     )
@@ -254,6 +280,7 @@ def _print_cache(root: Path, label: str) -> None:
 
 
 chat.batched_moe_step = _async_moe
+chat._warm_expert_raw_cache = _async_warm
 chat._expert_projection_triplet = _async_triplet
 chat.cache_stats = _cache_stats
 chat.print_cache = _print_cache
