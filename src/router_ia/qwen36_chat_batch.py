@@ -275,7 +275,11 @@ def run_generated_token(
     sampling_top_k: int,
     temperature: float,
 ) -> tuple[int, float, float]:
-    """Compatibility shim for runtime_optimizations' legacy hook."""
+    """Compatibility shim for runtime_optimizations' legacy hook.
+
+    State advancement is deliberately left to the legacy optimization wrapper,
+    which increments ``tokens_seen`` after this hook returns.
+    """
     logits, elapsed, peak_logit = run_forward_token(
         root,
         token_id,
@@ -286,8 +290,6 @@ def run_generated_token(
         device,
         advance_state=False,
     )
-    state = attention_cache.active(root, device)
-    state.tokens_seen += 1
     next_id = sample_next(logits, temperature, sampling_top_k)
     del logits
     gc.collect()
@@ -359,6 +361,7 @@ def generate_response(
                 delta_misses = int(after.get("misses", 0)) - int(before.get("misses", 0))
                 step_hit_rate = delta_hits / max(delta_hits + delta_misses, 1) * 100.0
                 generated.append(next_id)
+                current_id = next_id
                 text = tokenizer.decode([next_id], skip_special_tokens=True)
                 print(text, end="", flush=True)
                 attn = attention_cache.stats(root)
