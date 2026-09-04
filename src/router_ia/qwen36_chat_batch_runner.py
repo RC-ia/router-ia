@@ -1,18 +1,6 @@
 from __future__ import annotations
 
-"""Canonical entrypoint for the optimized Qwen3.6 stateful chat runner.
-
-The target chat module is imported first and only then patched. This avoids
-runpy's duplicate-module warning when using ``python -m`` and ensures the
-expert cache, adaptive expert policy, asynchronous lookahead, stateful
-attention hooks, expert-tier routing, adaptive Q4 retention, VRAM governor,
-prompt-scoped generation heat, shared adaptive Q4 RAM bank, GPU-only Q4
-materialization, higher-concurrency current-route prefetch, GPU FP16 expert
-materialization, batch-first expert planning, batch-planner hot-path
-refinements, memory residency policy, Q4 routed-expert hierarchy, physical
-RAM-only cache governor, and optional profiler patch the exact module instance
-executed by ``main()``.
-"""
+"""Canonical entrypoint for the optimized Qwen3.6 stateful chat runner."""
 
 import os
 
