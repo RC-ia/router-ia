@@ -46,4 +46,12 @@ def no_prefetch(root, layer_prefix, expert_ids):
 base.attention_type=attention_type
 chat._warm_expert_raw_cache=no_prefetch
 if WINDOWS_PREAD: cached._ShardStore._handle=handle
+
+# Q4 hierarchy owns expert storage. Import the batch loader last so its planner
+# replacement sees all normal hierarchy/activation patches already installed.
+try:
+    from . import qwen36_q4_batch_loader as _q4_batch_loader  # noqa: F401
+except Exception as exc:
+    print(f'q4_batch_loader=disabled|reason={type(exc).__name__}:{exc}')
+
 print(f'memory_loading_fix=enabled|windows_backend={"pread" if WINDOWS_PREAD else "mmap"}|attention=metadata-only|legacy_fp8_prefetch=disabled')
