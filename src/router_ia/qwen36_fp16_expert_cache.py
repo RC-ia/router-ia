@@ -2,12 +2,12 @@ from __future__ import annotations
 
 """GPU FP16 materialization cache for repeatedly used routed experts.
 
-The compressed FP8/Q4 tiers remain the backing store. This tiny cache only keeps
-already-dequantized FP16 triplets in the dedicated expert VRAM budget, avoiding
-repeated FP8->FP16 work for experts that are used again during the same
-continuous generation epoch.
+The compressed FP8/Q4 tiers remain the backing store. This cache keeps already
+-dequantized FP16 expert triplets in the *existing* dedicated expert VRAM
+-budget, partitioning that budget so total VRAM usage does not grow.
 """
 
+import os
 from collections import OrderedDict
 from pathlib import Path
 from threading import Lock
@@ -16,11 +16,35 @@ import torch
 
 from . import qwen36_expert_cache as expert_cache
 from . import qwen36_official_optimizations as official
+from . import qwen36_chat_batch as chat
 
-FP16_CACHE_BYTES = int(max(float(__import__("os").getenv("QWEN36_EXPERT_FP16_GB", "0.75")), 0.0) * 1024**3)
+
+def _configure_partition() -> tuple[int, int]:
+    total = int(max(official.EXPERT_VRAM_BUDGET_BYTES, 0))
+    requested = os.getenv("QWEN36_EXPERT_FP16_GB")
+    if requested is None:
+        fp16 = int(total * 0.75)
+    else:
+        try:
+            fp16 = int(max(float(requested), 0.0) * 1024**3)
+        except ValueError:
+            fp16 = int(total * 0.75)
+    fp16 = min(fp16, total)
+    compressed = max(total - fp16, 0)
+    # RoutedExpertCache is created lazily. Shrinking the existing expert pool
+    # here partitions the same VRAM budget instead of adding another budget.
+    official.EXPERT_VRAM_BUDGET_BYTES = compressed
+    return fp16, compressed
+
+
+FP16_CACHE_BYTES, FP8_CACHE_BYTES = _configure_partition()
 
 _CACHES: dict[Path, "FP16Cache"] = {}
 _LOCK = Lock()
+_ORIGINAL_GENERATE_RESPONSE = chat.generate_response
+_ORIGINAL_CACHE_STATS = chat.cache_stats
+_ORIGINAL_PRINT_CACHE = chat.print_cache
+_ORIGINAL_GET_OR_LOAD_BATCH = expert_cache.RoutedExpertCache.get_or_load_batch
 
 
 class FP16Cache:
@@ -86,11 +110,11 @@ class FP16Cache:
 def _cache(root: Path) -> FP16Cache:
     key = root.resolve()
     with _LOCK:
-        cache = _CACHES.get(key)
-        if cache is None:
-            cache = FP16Cache()
-            _CACHES[key] = cache
-        return cache
+        value = _CACHES.get(key)
+        if value is None:
+            value = FP16Cache()
+            _CACHES[key] = value
+        return value
 
 
 def _root_for_expert_cache(cache) -> Path | None:
@@ -103,35 +127,30 @@ def _root_for_expert_cache(cache) -> Path | None:
 def _get_or_load_batch(self, store, layer: int, expert_ids: list[int], layer_prefix: str):
     root = _root_for_expert_cache(self)
     if root is None:
-        # Preserve the original implementation when the cache is not owned by
-        # the official runtime.
         return _ORIGINAL_GET_OR_LOAD_BATCH(self, store, layer, expert_ids, layer_prefix)
 
     ids = [int(x) for x in expert_ids]
-    out: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+    output: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
     missing: list[int] = []
-    cache = _cache(root)
+    materialized = _cache(root)
 
     for expert_id in dict.fromkeys(ids):
-        hit = cache.get((int(layer), int(expert_id)))
+        hit = materialized.get((int(layer), int(expert_id)))
         if hit is not None:
-            out[int(expert_id)] = hit
+            output[int(expert_id)] = hit
         else:
             missing.append(int(expert_id))
 
     if missing:
         decoded = _ORIGINAL_GET_OR_LOAD_BATCH(self, store, int(layer), missing, layer_prefix)
         for expert_id, triplet in zip(missing, decoded):
-            # Store the already-dequantized FP16 tensors. Cloning is avoided so
-            # the cache owns exactly the tensors returned by the decoder.
             fp16 = tuple(t.to(device="cuda", dtype=torch.float16) for t in triplet)
-            out[int(expert_id)] = fp16
-            cache.put((int(layer), int(expert_id)), fp16)
+            output[int(expert_id)] = fp16
+            materialized.put((int(layer), int(expert_id)), fp16)
 
-    return [out[int(expert_id)] for expert_id in ids]
+    return [output[int(expert_id)] for expert_id in ids]
 
 
-_ORIGINAL_GET_OR_LOAD_BATCH = expert_cache.RoutedExpertCache.get_or_load_batch
 expert_cache.RoutedExpertCache.get_or_load_batch = _get_or_load_batch
 
 
@@ -143,14 +162,46 @@ def stats(root: Path):
     return _cache(root).snapshot()
 
 
-def print_stats(root: Path) -> None:
+def _generate_response(*args, **kwargs):
+    root = args[0] if args else kwargs.get("root")
+    if isinstance(root, Path) and torch.cuda.is_available():
+        reset(root)
+    return _ORIGINAL_GENERATE_RESPONSE(*args, **kwargs)
+
+
+def _cache_stats(root: Path) -> dict[str, int | float]:
+    result = dict(_ORIGINAL_CACHE_STATS(root))
+    snap = stats(root)
+    result.update({
+        "expert_fp16_cache_items": int(snap["items"]),
+        "expert_fp16_cache_bytes": int(snap["bytes"]),
+        "expert_fp16_cache_budget": int(snap["budget"]),
+        "expert_fp16_cache_hits": int(snap["hits"]),
+        "expert_fp16_cache_misses": int(snap["misses"]),
+        "expert_fp16_cache_hit_rate": float(snap["hit_rate"]),
+        "expert_fp16_cache_evictions": int(snap["evictions"]),
+        "expert_fp8_partition_budget": int(FP8_CACHE_BYTES),
+    })
+    return result
+
+
+def _print_cache(root: Path, label: str) -> None:
+    _ORIGINAL_PRINT_CACHE(root, label)
     snap = stats(root)
     print(
         f"  expert FP16 cache: {snap['bytes'] / 1024**2:.1f}/"
         f"{snap['budget'] / 1024**2:.1f} MiB | items={snap['items']} | "
         f"hits={snap['hits']} | misses={snap['misses']} | "
-        f"hit_rate={snap['hit_rate']:.1f}% | evictions={snap['evictions']}"
+        f"hit_rate={snap['hit_rate']:.1f}% | evictions={snap['evictions']} | "
+        f"FP8_budget={FP8_CACHE_BYTES / 1024**2:.1f} MiB"
     )
 
 
-print("expert_fp16_cache=enabled|gpu-only|budget=0.75GiB|backing=FP8/Q4")
+chat.generate_response = _generate_response
+chat.cache_stats = _cache_stats
+chat.print_cache = _print_cache
+
+print(
+    f"expert_fp16_cache=enabled|gpu-only|partition={FP16_CACHE_BYTES / 1024**3:.2f}GiB-FP16+"
+    f"{FP8_CACHE_BYTES / 1024**3:.2f}GiB-FP8|same-expert-budget"
+)
