@@ -52,4 +52,9 @@ def _snapshot(self, cache=None):
         }
 
 
+# Explicitly install both methods. The base implementation of snapshot()
+# acquired self.lock and then called score(), which acquires the same
+# non-reentrant Lock again. This version computes the score while the lock is
+# already held and therefore avoids the deadlock/recursion failure path.
+adaptive.AdaptiveExpertPolicy._score_locked = _score_locked
 adaptive.AdaptiveExpertPolicy.snapshot = _snapshot
