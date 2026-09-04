@@ -77,17 +77,18 @@ def attention_type(root: Path, layer: int) -> str:
 
 
 def linear_attention_step(root: Path, layer: int, x0: torch.Tensor, device: str) -> torch.Tensor:
-    """Run the validated Qwen3.6 linear-attention reference path."""
-    attn_projected, _, _ = linear_attention_step_hf(
-        root,
-        layer,
-        x0,
-        conv_state=None,
-        recurrent_state=None,
-        device=device,
+    """Compatibility wrapper for the validated stateful linear-attention step."""
+    recurrent_state = getattr(linear_attention_step, "_state", {}).get(layer)
+    conv_state = getattr(linear_attention_step, "_conv_state", {}).get(layer)
+    projected, conv_state_new, recurrent_state_new = linear_attention_step_hf(
+        root, layer, x0, conv_state, recurrent_state, device
     )
-    residual = x0.reshape(1, HIDDEN).float() + attn_projected
-    del attn_projected
+    if not hasattr(linear_attention_step, "_state"):
+        linear_attention_step._state = {}
+        linear_attention_step._conv_state = {}
+    linear_attention_step._state[layer] = recurrent_state_new
+    linear_attention_step._conv_state[layer] = conv_state_new
+    residual = x0.reshape(1, HIDDEN).float() + projected.float()
     return residual
 
 
@@ -96,12 +97,11 @@ def full_attention_step(root: Path, layer: int, x0: torch.Tensor, device: str) -
     prefix = layer_prefix(layer)
     input_norm = load_layer_weight(root, layer, "input_layernorm.weight", device)
     h = rmsnorm(x0, input_norm)
-    compute_dtype = torch.float16 if device == "cuda" else torch.float32
-    h_compute = h.to(dtype=compute_dtype)
 
     q_w = load_projection(root, prefix + "self_attn.q_proj", device)
     k_w = load_projection(root, prefix + "self_attn.k_proj", device)
     v_w = load_projection(root, prefix + "self_attn.v_proj", device)
+    h_compute = h.to(dtype=q_w.dtype)
 
     q_gate = F.linear(h_compute, q_w).reshape(1, FULL_NUM_HEADS, FULL_HEAD_DIM * 2)
     q, gate = torch.chunk(q_gate, 2, dim=-1)
@@ -120,9 +120,9 @@ def full_attention_step(root: Path, layer: int, x0: torch.Tensor, device: str) -
     attn_weights = torch.softmax(scores.float(), dim=-1)
     attn = torch.matmul(attn_weights.unsqueeze(-2), v).squeeze(-2)
     attn = attn * torch.sigmoid(gate.float())
-    attn_flat = attn.reshape(1, FULL_Q_DIM).to(dtype=compute_dtype)
 
     out_w = load_projection(root, prefix + "self_attn.o_proj", device)
+    attn_flat = attn.reshape(1, FULL_Q_DIM).to(dtype=out_w.dtype)
     attn_projected = F.linear(attn_flat, out_w).float()
     residual = x0.reshape(1, HIDDEN).float() + attn_projected
 
@@ -222,6 +222,8 @@ def main() -> None:
         raise SystemExit("CUDA unavailable")
 
     root = args.root.resolve()
+    linear_attention_step._state = {}
+    linear_attention_step._conv_state = {}
     print(f"device={args.device}")
     print(f"layers={DEFAULT_LAYERS}")
     print(f"top_k={args.top_k}")
