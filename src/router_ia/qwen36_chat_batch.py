@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Batch mini-chat smoke test for Qwen3.6 hierarchical RAM/VRAM caches."""
+"""Stateful Qwen3.6 chat generator using hierarchical RAM/VRAM caches."""
 
 import argparse
 import gc
@@ -12,6 +12,7 @@ from time import perf_counter
 import torch
 import torch.nn.functional as F
 
+from . import qwen36_attention_cache as attention_cache
 from . import qwen36_cached_loop as cached
 from . import qwen36_40layer_loop as base
 from .qwen36_mini_chat import load_final_norm, load_lm_head, load_tokenizer, sample_next
@@ -75,6 +76,20 @@ def print_cache(root: Path, label: str) -> None:
     )
 
 
+def print_attention(root: Path, label: str) -> None:
+    stats = attention_cache.stats(root)
+    print(
+        f"  attention {label}: "
+        f"tokens={stats['tokens_seen']} | "
+        f"full_kv_layers={stats['full_layers_cached']} | "
+        f"full_kv_tokens={stats['full_tokens']} | "
+        f"full_kv={stats['full_bytes'] / 1024**2:.1f} MiB | "
+        f"delta_state={stats['linear_bytes'] / 1024**2:.1f} MiB | "
+        f"conv_state={stats['linear_conv_bytes'] / 1024**2:.2f} MiB | "
+        f"total={stats['bytes'] / 1024**2:.1f} MiB"
+    )
+
+
 def _projection(root: Path, prefix: str, device: str) -> torch.Tensor:
     """Load a dequantized projection through the hierarchical cache."""
     return cached._cached_load_projection(root, prefix, device)
@@ -97,8 +112,6 @@ def _expert_projection_triplet(
 def _prefetch_one_expert_raw(root: Path, layer_prefix: str, expert_id: int) -> None:
     cache = __import__("router_ia.qwen36_expert_cache", fromlist=["RoutedExpertCache"])
     store = cached._store(root)
-    # Reuse the persistent expert cache's raw-prefetch path so the stream holds
-    # the original FP8 weights/scales instead of an unnecessary FP16 copy.
     expert_cache = cache._EXPERT_CACHES.get(root.resolve()) if hasattr(cache, "_EXPERT_CACHES") else None
     if expert_cache is None:
         return
@@ -110,7 +123,6 @@ def _warm_expert_raw_cache(root: Path, layer_prefix: str, expert_ids: list[int])
     if not expert_ids:
         return
     store = cached._store(root)
-    # Import the active fused cache instance without creating a second cache.
     from .qwen36_expert_cache import RoutedExpertCache
     from .qwen36_chat_batch_fused import _EXPERT_CACHES  # type: ignore
 
@@ -204,7 +216,7 @@ def batched_moe_step(
     return layer_out, expert_ids, weights, shared_gate_value, moe_input_norm
 
 
-def run_generated_token(
+def run_forward_token(
     root: Path,
     token_id: int,
     final_norm: torch.Tensor,
@@ -212,17 +224,12 @@ def run_generated_token(
     final_norm_name: str,
     lm_head_name: str,
     device: str,
-    sampling_top_k: int,
-    temperature: float,
-) -> tuple[int, float, float]:
+) -> tuple[torch.Tensor, float, float]:
+    """Run one token through the full 40-layer stack using persistent attention state."""
     start = perf_counter()
     x = base.load_embedding_row(root, token_id).reshape(1, base.HIDDEN).to(device).float()
     for layer in range(base.DEFAULT_LAYERS):
-        kind = base.attention_type(root, layer)
-        if kind == "linear_attention":
-            residual = base.linear_attention_step(root, layer, x, device)
-        else:
-            residual = base.full_attention_step(root, layer, x, device)
+        residual = attention_cache.step_attention(root, layer, x, device)
         x, *_ = batched_moe_step(root, layer, residual, top_k=8, device=device)
         del residual
 
@@ -239,59 +246,106 @@ def run_generated_token(
             logits = F.linear(x, lm_head_runtime)
     else:
         logits = F.linear(x, lm_head_runtime)
-    next_id = sample_next(logits, temperature, sampling_top_k)
 
     if device == "cuda":
         torch.cuda.synchronize()
     elapsed = perf_counter() - start
     peak_logit = float(torch.max(logits.float()).item())
-    del x, logits
+
+    state = attention_cache.active(root, device)
+    state.tokens_seen += 1
+
+    del x
     if device == "cuda":
         del final_norm_runtime, lm_head_runtime
     gc.collect()
-    return next_id, elapsed, peak_logit
+    return logits, elapsed, peak_logit
 
 
-def generate_response(root: Path, prompt: str, tokenizer, final_norm: torch.Tensor, lm_head: torch.Tensor, final_norm_name: str, lm_head_name: str, device: str, max_new_tokens: int, sampling_top_k: int, temperature: float) -> None:
+def generate_response(
+    root: Path,
+    prompt: str,
+    tokenizer,
+    final_norm: torch.Tensor,
+    lm_head: torch.Tensor,
+    final_norm_name: str,
+    lm_head_name: str,
+    device: str,
+    max_new_tokens: int,
+    sampling_top_k: int,
+    temperature: float,
+) -> None:
     prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
     if not prompt_ids:
         print("IA> [nenhum token produzido pelo tokenizer]")
         return
-    current_id = int(prompt_ids[-1])
+
+    state = attention_cache.state_for(root, device)
+    state.reset()
+    attention_cache.activate(root, state)
+
     eos_id = getattr(tokenizer, "eos_token_id", None)
     generated: list[int] = []
     print(f"\nVocê> {prompt}")
-    print(f"  prompt tokens={len(prompt_ids)} | seed_token={current_id}")
+    print(f"  prompt tokens={len(prompt_ids)} | prefill=stateful")
     print("IA> ", end="", flush=True)
     turn_start = perf_counter()
-    for step in range(1, max_new_tokens + 1):
-        before = cache_stats(root)
-        next_id, elapsed, peak = run_generated_token(root, current_id, final_norm, lm_head, final_norm_name, lm_head_name, device, sampling_top_k, temperature)
-        after = cache_stats(root)
-        delta_hits = int(after.get("hits", 0)) - int(before.get("hits", 0))
-        delta_misses = int(after.get("misses", 0)) - int(before.get("misses", 0))
-        step_hit_rate = delta_hits / max(delta_hits + delta_misses, 1) * 100.0
-        generated.append(next_id)
-        current_id = next_id
-        text = tokenizer.decode([next_id], skip_special_tokens=True)
-        print(text, end="", flush=True)
-        print(
-            f"\n  [step {step:02d}] token={next_id} | time={elapsed:.3f}s | "
-            f"step_hit_rate={step_hit_rate:.1f}% | global_hit_rate={after.get('hit_rate', 0.0):.2f}% | "
-            f"ram_hit={after.get('ram_hit_rate', 0.0):.2f}% | vram_hit={after.get('vram_hit_rate', 0.0):.2f}% | "
-            f"expert_vram_hit={after.get('vram_expert_hit_rate', 0.0):.2f}% | stream_hit={after.get('vram_stream_hit_rate', 0.0):.2f}% | "
-            f"hits+{delta_hits} misses+{delta_misses} | peak_logit={peak:.4f}",
-            flush=True,
-        )
-        if eos_id is not None and next_id == int(eos_id):
-            break
-    print()
-    print(f"  resposta: {len(generated)} tokens | wall={perf_counter() - turn_start:.3f}s")
-    print_cache(root, "after turn")
+
+    try:
+        prompt_logits: torch.Tensor | None = None
+        prompt_elapsed = 0.0
+        for prompt_id in prompt_ids:
+            if prompt_logits is not None:
+                del prompt_logits
+            prompt_logits, prompt_elapsed, _ = run_forward_token(
+                root, int(prompt_id), final_norm, lm_head, final_norm_name, lm_head_name, device
+            )
+
+        next_id = sample_next(prompt_logits, temperature, sampling_top_k)
+        del prompt_logits
+        print_attention(root, "after prefill")
+        print(f"  prefill_last_token_time={prompt_elapsed:.3f}s")
+
+        for step in range(1, max_new_tokens + 1):
+            before = cache_stats(root)
+            logits, elapsed, peak = run_forward_token(
+                root, next_id, final_norm, lm_head, final_norm_name, lm_head_name, device
+            )
+            after = cache_stats(root)
+            next_id = sample_next(logits, temperature, sampling_top_k)
+            delta_hits = int(after.get("hits", 0)) - int(before.get("hits", 0))
+            delta_misses = int(after.get("misses", 0)) - int(before.get("misses", 0))
+            step_hit_rate = delta_hits / max(delta_hits + delta_misses, 1) * 100.0
+            generated.append(next_id)
+            text = tokenizer.decode([next_id], skip_special_tokens=True)
+            print(text, end="", flush=True)
+            attn = attention_cache.stats(root)
+            print(
+                f"\n  [step {step:02d}] token={next_id} | time={elapsed:.3f}s | "
+                f"attn_tokens={attn['tokens_seen']} | kv_tokens={attn['full_tokens']} | "
+                f"attn_mem={attn['bytes'] / 1024**2:.1f}MiB | step_hit_rate={step_hit_rate:.1f}% | "
+                f"global_hit_rate={after.get('hit_rate', 0.0):.2f}% | "
+                f"ram_hit={after.get('ram_hit_rate', 0.0):.2f}% | vram_hit={after.get('vram_hit_rate', 0.0):.2f}% | "
+                f"expert_vram_hit={after.get('vram_expert_hit_rate', 0.0):.2f}% | "
+                f"stream_hit={after.get('vram_stream_hit_rate', 0.0):.2f}% | "
+                f"hits+{delta_hits} misses+{delta_misses} | peak_logit={peak:.4f}",
+                flush=True,
+            )
+            del logits
+            if eos_id is not None and next_id == int(eos_id):
+                break
+
+        print()
+        print(f"  resposta: {len(generated)} tokens | wall={perf_counter() - turn_start:.3f}s")
+        print_attention(root, "after turn")
+        print_cache(root, "after turn")
+    finally:
+        attention_cache.deactivate(root)
+        gc.collect()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Batch Qwen3.6 router mini-chat test")
+    parser = argparse.ArgumentParser(description="Stateful Qwen3.6 router mini-chat test")
     parser.add_argument("model_dir", type=Path)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
@@ -306,9 +360,9 @@ def main() -> None:
     tokenizer = load_tokenizer(root)
     final_norm_name, final_norm = load_final_norm(root)
     lm_head_name, lm_head, _lm_head_mode = load_lm_head(root)
-    print("op=batch-mini-chat")
-    print("mode=experimental-stateless-autoregressive")
-    print("warning=no DeltaNet recurrent state or full-attention KV cache yet")
+    print("op=batch-chat")
+    print("mode=stateful-autoregressive-prefill")
+    print("attention_state=persistent-deltanet-recurrence|full-attention-kv|linear-conv")
     print("cache=hierarchical-vram-ram-ssd")
     print("vram_policy=resident-60pct-hot-experts-20pct-stream-20pct")
     print("vram_dequantized_cache=fp16-temporary")
@@ -328,12 +382,14 @@ def main() -> None:
     print(f"lm_head={lm_head_name} shape={tuple(lm_head.shape)}")
     print(f"final_norm={final_norm_name} shape={tuple(final_norm.shape)}")
     print_cache(root, "initial")
+    print_attention(root, "initial")
     prompts = ["Olá", "Como você está?", "Explique o que é uma CPU", "Quanto é 2 + 2?"]
     for prompt in prompts:
         generate_response(root, prompt, tokenizer, final_norm, lm_head, final_norm_name, lm_head_name, device, args.max_new_tokens, args.sampling_top_k, args.temperature)
     print("\n===== SUMMARY =====")
     print("turns=4")
     print_cache(root, "final")
+    print_attention(root, "final")
 
 
 if __name__ == "__main__":
