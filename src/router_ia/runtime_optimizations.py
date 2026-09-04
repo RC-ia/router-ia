@@ -156,7 +156,9 @@ def _run_generated_token_stateful(
         next_id = int(sample_next(logits, temperature, sampling_top_k))
         elapsed = perf_counter() - turn_start
         peak = float(logits.max().item())
-        del hidden, logits
+        # Do not delete hidden here: the finally block owns its cleanup and
+        # needs the local binding to remain valid while unwinding.
+        del logits
         if device == "cuda":
             del final_norm_runtime, lm_head_runtime
         return next_id, elapsed, peak
