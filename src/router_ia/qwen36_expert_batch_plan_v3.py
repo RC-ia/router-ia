@@ -82,9 +82,8 @@ def _load_missing_grouped_direct(
 
     cache = planner._expert_cache(root)
     with cache.lock:
-        for expert_id, entry in compact.items():
-            cache._insert_fp8_locked(int(layer), int(expert_id), entry)
-            cache.loads += 1
+        cache._insert_fp8_batch_locked(int(layer), compact)
+        cache.loads += len(compact)
 
     return planner._decode_fp8(
         [(expert_id, "fp8", compact[expert_id]) for expert_id in ids]
@@ -166,5 +165,6 @@ planner._plan_layer = _plan_layer_no_sync_promotion
 
 print(
     "expert_batch_plan_v3=enabled|raw-expert-cache=bypass|"
-    "q4-promotion=synchronous-disabled|inherits=v2-batched-gemm"
+    "q4-promotion=synchronous-disabled|batch-q4-victim-filter=enabled|"
+    "inherits=v2-batched-gemm"
 )
