@@ -1,97 +1,128 @@
 from __future__ import annotations
 
-"""Adaptive Q4 RAM bank for routed experts.
+"""Shared adaptive Q4 RAM bank for routed experts.
 
-The generic RAM tensor cache stays independent. Evicted routed experts are
-retained as Q4 host entries up to a dedicated byte budget, ordered globally by
-current-generation heat. Under pressure, the lowest-value Q4 experts are
-removed first.
+The bank consumes only host RAM left unused by the generic tensor cache. Its
+entries mirror RoutedExpertCache.q4_entries, so Q4 hits continue through the
+existing expert decoder. The lowest generation-heat experts are removed first
+when the shared host budget tightens.
 """
 
-import os
 from collections import OrderedDict
 from pathlib import Path
 from threading import Lock
 
 from . import qwen36_adaptive_experts as adaptive
+from . import qwen36_cached_loop as cached
 from . import qwen36_expert_cache as expert_cache_module
 from . import qwen36_official_optimizations as official
 from .qwen36_expert_cache import RoutedExpertCache
 
-RAM_Q4_GB = max(float(os.getenv("QWEN36_EXPERT_RAM_Q4_GB", "5.0")), 0.25)
-RAM_Q4_BUDGET_BYTES = int(RAM_Q4_GB * 1024**3)
-RAM_Q4_MIN_SCORE = float(os.getenv("QWEN36_EXPERT_RAM_Q4_MIN_SCORE", "0.0"))
-
-_BANKS: dict[Path, "AdaptiveExpertRAMBank"] = {}
+_BANKS: dict[Path, "ExpertRAMBank"] = {}
 _BANKS_LOCK = Lock()
 
 
-class AdaptiveExpertRAMBank:
-    def __init__(self, budget_bytes: int) -> None:
-        self.budget_bytes = max(int(budget_bytes), 0)
-        self.entries: OrderedDict[tuple[int, int], tuple] = OrderedDict()
+class ExpertRAMBank:
+    def __init__(self, root: Path) -> None:
+        self.root = root.resolve()
+        self.items: OrderedDict[tuple[int, int], None] = OrderedDict()
         self.sizes: dict[tuple[int, int], int] = {}
         self.bytes_used = 0
         self.insertions = 0
-        self.hits = 0
-        self.misses = 0
         self.evictions = 0
         self.lock = Lock()
 
-    def _remove_locked(self, key: tuple[int, int]) -> None:
-        self.entries.pop(key, None)
-        self.bytes_used -= self.sizes.pop(key, 0)
+    @property
+    def total_budget_bytes(self) -> int:
+        return int(cached.CACHE_BUDGET_BYTES)
+
+    def _generic_ram_bytes(self) -> int:
+        return int(cached._store(self.root).ram_cache.snapshot()["bytes"])
+
+    def _available_bytes_locked(self) -> int:
+        return max(self.total_budget_bytes - self._generic_ram_bytes(), 0)
 
     def _score(self, key: tuple[int, int]) -> float:
-        layer, expert = key
-        return adaptive.score_for_eviction(layer, expert)
+        policy = adaptive._POLICIES.get(self.root)
+        if policy is None:
+            return 0.0
+        return float(policy.score(key[0], key[1]))
 
-    def put(self, layer: int, expert_id: int, entry) -> bool:
-        key = (int(layer), int(expert_id))
-        size = RoutedExpertCache._q4_size(entry)
-        if self.budget_bytes <= 0 or size > self.budget_bytes:
-            return False
+    def _remove_locked(self, key: tuple[int, int]) -> None:
+        self.items.pop(key, None)
+        self.bytes_used -= self.sizes.pop(key, 0)
+        expert = official._EXPERT_CACHES.get(self.root)
+        if expert is None:
+            return
+        layer, expert_id = key
+        q4 = expert.q4_entries.get(layer)
+        if q4 is not None and expert_id in q4:
+            q4.pop(expert_id, None)
+            expert._erase(layer, expert_id, "q4")
+            expert.q4_drops += 1
+            expert.q4_ram_evictions += 1
+
+    def trim(self) -> None:
         with self.lock:
-            if key in self.entries:
-                self._remove_locked(key)
-            while self.bytes_used + size > self.budget_bytes and self.entries:
-                victim = min(self.entries, key=self._score)
+            available = self._available_bytes_locked()
+            while self.bytes_used > available and self.items:
+                victim = min(self.items, key=self._score)
                 self._remove_locked(victim)
                 self.evictions += 1
-            if self.bytes_used + size > self.budget_bytes:
+
+    def add(self, layer: int, expert_id: int, entry) -> bool:
+        key = (int(layer), int(expert_id))
+        size = RoutedExpertCache._q4_size(entry)
+        with self.lock:
+            available = self._available_bytes_locked()
+            if key in self.items:
+                self._remove_locked(key)
+            while self.bytes_used + size > available and self.items:
+                victim = min(self.items, key=self._score)
+                self._remove_locked(victim)
+                self.evictions += 1
+                available = self._available_bytes_locked()
+            if size > available:
                 return False
-            self.entries[key] = entry
+            self.items[key] = None
             self.sizes[key] = size
             self.bytes_used += size
             self.insertions += 1
             return True
 
-    def clear(self) -> None:
-        with self.lock:
-            self.entries.clear()
-            self.sizes.clear()
-            self.bytes_used = 0
-
     def snapshot(self) -> dict[str, int | float]:
         with self.lock:
             return {
-                "items": len(self.entries),
+                "items": len(self.items),
                 "bytes": self.bytes_used,
-                "budget_bytes": self.budget_bytes,
-                "hits": self.hits,
-                "misses": self.misses,
-                "hit_rate": self.hits / max(self.hits + self.misses, 1) * 100.0,
+                "budget_bytes": self.total_budget_bytes,
+                "generic_ram_bytes": self._generic_ram_bytes(),
+                "available_bytes": self._available_bytes_locked(),
                 "insertions": self.insertions,
                 "evictions": self.evictions,
             }
 
+    def clear(self) -> None:
+        with self.lock:
+            expert = official._EXPERT_CACHES.get(self.root)
+            if expert is not None:
+                for layer, expert_id in list(self.items):
+                    q4 = expert.q4_entries.get(layer)
+                    if q4 is not None and expert_id in q4:
+                        q4.pop(expert_id, None)
+                        expert._erase(layer, expert_id, "q4")
+                expert.q4_drops += len(self.items)
+            self.items.clear()
+            self.sizes.clear()
+            self.bytes_used = 0
 
-def _bank(root: Path) -> AdaptiveExpertRAMBank:
+
+def _bank(root: Path) -> ExpertRAMBank:
     key = root.resolve()
     with _BANKS_LOCK:
         bank = _BANKS.get(key)
         if bank is None:
-            bank = AdaptiveExpertRAMBank(RAM_Q4_BUDGET_BYTES)
+            bank = ExpertRAMBank(key)
             _BANKS[key] = bank
         return bank
 
@@ -109,11 +140,11 @@ adaptive.score_for_eviction = _score_for_eviction
 _ORIGINAL_INSERT = RoutedExpertCache._insert_fp8_locked
 
 
-def _insert_with_ram(self: RoutedExpertCache, layer: int, expert_id: int, entry) -> None:
+def _insert_with_shared_ram(self: RoutedExpertCache, layer: int, expert_id: int, entry) -> None:
     layer = int(layer)
     expert_id = int(expert_id)
-    policy = None
     root_for_cache: Path | None = None
+    policy = None
     for root, cache in official._EXPERT_CACHES.items():
         if cache is self:
             root_for_cache = root
@@ -137,12 +168,11 @@ def _insert_with_ram(self: RoutedExpertCache, layer: int, expert_id: int, entry)
     while len(bank) > self.fp8_slots:
         victim_id, victim = bank.popitem(last=False)
         self._erase(layer, victim_id, "fp8")
-        score = policy.score(layer, victim_id) if policy is not None else 0.0
         retained = False
-        if root_for_cache is not None and score >= RAM_Q4_MIN_SCORE:
+        if root_for_cache is not None:
             cold_gpu = expert_cache_module._q4_quantize_entry_from_fp8(victim)
             cold = expert_cache_module._move_q4_to_cpu(cold_gpu)
-            retained = _bank(root_for_cache).put(layer, victim_id, cold)
+            retained = _bank(root_for_cache).add(layer, victim_id, cold)
             if retained:
                 q4 = self.q4_entries.setdefault(layer, OrderedDict())
                 old_q4 = q4.pop(victim_id, None)
@@ -161,7 +191,7 @@ def _insert_with_ram(self: RoutedExpertCache, layer: int, expert_id: int, entry)
                 policy.note_demotion(layer, int(victim))
 
 
-RoutedExpertCache._insert_fp8_locked = _insert_with_ram
+RoutedExpertCache._insert_fp8_locked = _insert_with_shared_ram
 
 
 def stats(root: Path) -> dict[str, int | float]:
@@ -172,17 +202,19 @@ def clear(root: Path) -> None:
     _bank(root).clear()
 
 
+def maintain(root: Path) -> None:
+    _bank(root).trim()
+
+
 def print_stats(root: Path) -> None:
     snap = stats(root)
     print(
-        f"  adaptive expert RAM Q4: "
-        f"{snap['bytes'] / 1024**2:.1f}/{snap['budget_bytes'] / 1024**2:.1f} MiB | "
-        f"items={snap['items']} | hits={snap['hits']} | misses={snap['misses']} | "
-        f"hit_rate={snap['hit_rate']:.2f}% | evictions={snap['evictions']}"
+        f"  adaptive expert RAM Q4: {snap['bytes'] / 1024**2:.1f}/"
+        f"{snap['budget_bytes'] / 1024**2:.1f} MiB total-RAM | "
+        f"generic={snap['generic_ram_bytes'] / 1024**2:.1f} MiB | "
+        f"free={snap['available_bytes'] / 1024**2:.1f} MiB | items={snap['items']} | "
+        f"evictions={snap['evictions']}"
     )
 
 
-print(
-    f"adaptive_expert_ram=global-Q4|budget={RAM_Q4_GB:.2f}GiB|"
-    f"min_score={RAM_Q4_MIN_SCORE:.2f}|evict=lowest-heat"
-)
+print("adaptive_expert_ram=shared-RAM-Q4|evict=lowest-heat|budget=remaining-host-cache")
