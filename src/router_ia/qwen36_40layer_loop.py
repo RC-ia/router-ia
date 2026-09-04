@@ -20,6 +20,7 @@ import torch
 import torch.nn.functional as F
 
 from .qwen36_gated_norm_probe import gated_rmsnorm
+from .qwen36_linear_attention_hf import linear_attention_step as linear_attention_step_hf
 from .qwen36_op_probe import (
     HEAD_DIM,
     dequantize_fp8_blockwise,
@@ -76,57 +77,17 @@ def attention_type(root: Path, layer: int) -> str:
 
 
 def linear_attention_step(root: Path, layer: int, x0: torch.Tensor, device: str) -> torch.Tensor:
-    prefix = layer_prefix(layer)
-    input_norm = load_layer_weight(root, layer, "input_layernorm.weight", device)
-    h = rmsnorm(x0, input_norm)
-    compute_dtype = torch.float16 if device == "cuda" else torch.float32
-    h_compute = h.to(dtype=compute_dtype)
-
-    qkv_w = load_projection(root, prefix + "linear_attn.in_proj_qkv", device)
-    mixed = F.linear(h_compute, qkv_w).reshape(1, LINEAR_KEY_DIM * 2 + LINEAR_VALUE_DIM)
-
-    conv_w = load_layer_weight(root, layer, "linear_attn.conv1d.weight", device).float()
-    mixed = F.silu(mixed * conv_w[:, 0, -1].reshape(1, -1))
-    q, k, v = torch.split(mixed, [LINEAR_KEY_DIM, LINEAR_KEY_DIM, LINEAR_VALUE_DIM], dim=-1)
-    q = q.reshape(1, LINEAR_NUM_K_HEADS, 128).repeat_interleave(2, dim=1)
-    k = k.reshape(1, LINEAR_NUM_K_HEADS, 128).repeat_interleave(2, dim=1)
-    v = v.reshape(1, LINEAR_NUM_V_HEADS, 128)
-
-    a_w = load_projection(root, prefix + "linear_attn.in_proj_a", device)
-    b_w = load_projection(root, prefix + "linear_attn.in_proj_b", device)
-    a_log = load_layer_weight(root, layer, "linear_attn.A_log", device).float().reshape(1, LINEAR_NUM_V_HEADS)
-    dt_bias = load_layer_weight(root, layer, "linear_attn.dt_bias", device).float().reshape(1, LINEAR_NUM_V_HEADS)
-    a_raw = F.linear(h_compute, a_w).reshape(1, LINEAR_NUM_V_HEADS).float()
-    b_raw = F.linear(h_compute, b_w).reshape(1, LINEAR_NUM_V_HEADS).float()
-    beta = torch.sigmoid(b_raw)
-    g = -torch.exp(a_log) * F.softplus(a_raw + dt_bias)
-    decay = torch.exp(g)
-
-    qn = F.normalize(q.float(), dim=-1, eps=EPS) * (128 ** -0.5)
-    kn = F.normalize(k.float(), dim=-1, eps=EPS)
-    state = torch.zeros(1, LINEAR_NUM_V_HEADS, 128, 128, device=device, dtype=torch.float32)
-    state = state * decay.unsqueeze(-1).unsqueeze(-1)
-    retrieved = torch.einsum("bhkd,bhk->bhd", state, kn)
-    delta = (v.float() - retrieved) * beta.unsqueeze(-1)
-    state = state + kn.unsqueeze(-1) * delta.unsqueeze(-2)
-    attn = torch.einsum("bhkd,bhk->bhd", state, qn)
-
-    z_w = load_projection(root, prefix + "linear_attn.in_proj_z", device)
-    z = F.linear(h_compute, z_w).reshape(1, LINEAR_NUM_V_HEADS, 128)
-    norm_w = load_layer_weight(root, layer, "linear_attn.norm.weight", device)
-    gated, _, _ = gated_rmsnorm(attn, z, norm_w)
-
-    out_w = load_projection(root, prefix + "linear_attn.out_proj", device)
-    gated_compute = gated.reshape(1, LINEAR_VALUE_DIM).to(dtype=compute_dtype)
-    attn_projected = F.linear(gated_compute, out_w).float()
+    """Run the validated Qwen3.6 linear-attention reference path."""
+    attn_projected, _, _ = linear_attention_step_hf(
+        root,
+        layer,
+        x0,
+        conv_state=None,
+        recurrent_state=None,
+        device=device,
+    )
     residual = x0.reshape(1, HIDDEN).float() + attn_projected
-
-    del input_norm, h, h_compute, qkv_w, mixed, conv_w, q, k, v
-    del a_w, b_w, a_log, dt_bias, a_raw, b_raw, beta, g, decay, qn, kn
-    del state, retrieved, delta, attn, z_w, z, norm_w, gated, out_w, gated_compute, attn_projected
-    gc.collect()
-    if device == "cuda":
-        torch.cuda.empty_cache()
+    del attn_projected
     return residual
 
 
