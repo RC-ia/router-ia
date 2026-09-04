@@ -5,8 +5,8 @@ from __future__ import annotations
 The target chat module is imported first and only then patched. This avoids
 runpy's duplicate-module warning when using ``python -m`` and ensures the
 expert cache, adaptive expert policy, asynchronous lookahead, stateful
-attention hooks, expert-tier routing, and optional profiler patch the exact
-module instance executed by ``main()``.
+attention hooks, expert-tier routing, adaptive Q4 retention, and optional
+profiler patch the exact module instance executed by ``main()``.
 """
 
 import os
@@ -17,6 +17,7 @@ from . import qwen36_official_optimizations as _official_optimizations  # noqa: 
 from . import qwen36_adaptive_experts as _adaptive_experts  # noqa: F401
 from . import qwen36_adaptive_experts_fix as _adaptive_experts_fix  # noqa: F401
 from . import qwen36_expert_tier_policy as _expert_tier_policy  # noqa: F401
+from . import qwen36_adaptive_q4_policy as _adaptive_q4_policy  # noqa: F401
 from . import qwen36_async_scheduler as _async_scheduler  # noqa: F401
 
 if os.getenv("QWEN36_PROFILE", "0").strip().lower() in {"1", "true", "yes", "on"}:
