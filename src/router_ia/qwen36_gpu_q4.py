@@ -15,6 +15,8 @@ import torch
 
 from . import qwen36_expert_cache as expert_cache
 
+_ORIGINAL_Q4_DEQUANTIZE_MATRIX = expert_cache._q4_dequantize_matrix
+
 
 def _cuda_device() -> torch.device:
     if not torch.cuda.is_available():
@@ -32,7 +34,7 @@ def _to_cuda_raw(tensor: torch.Tensor) -> torch.Tensor:
 def _gpu_q4_dequantize_matrix(matrix: Any, device: str = "cuda") -> torch.Tensor:
     if str(device) != "cuda":
         # Preserve the reference CPU mode for non-CUDA diagnostics.
-        return expert_cache._q4_dequantize_matrix(matrix, device=device)
+        return _ORIGINAL_Q4_DEQUANTIZE_MATRIX(matrix, device=device)
 
     packed, scale, shape = matrix
     packed_gpu = _to_cuda_raw(packed)
