@@ -103,7 +103,7 @@ def gated_delta_chunk_initial(
 
 
 def _hf_l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Match HF's exact x * rsqrt(sum(x*x) + eps) ordering."""
+    """Match HF/FLA's x * rsqrt(sum(x*x) + eps) ordering."""
     inv_norm = torch.rsqrt((x * x).sum(dim=-1, keepdim=True) + eps)
     return x * inv_norm
 
@@ -113,18 +113,20 @@ def gated_delta_recurrent(query: torch.Tensor, key: torch.Tensor, value: torch.T
     batch, seq_len, _, k_dim = query.shape
     v_heads, v_dim = value.shape[2], value.shape[3]
     initial_dtype = query.dtype
+
+    # HF normalizes q/k in their incoming [B,S,H,D] dtype before the
+    # transpose+FP32 conversion. This ordering matters for BF16 inputs.
+    query = _hf_l2norm(query)
+    key = _hf_l2norm(key)
+
     q = query.transpose(1, 2).contiguous().float()
     k = key.transpose(1, 2).contiguous().float()
     v = value.transpose(1, 2).contiguous().float()
     g = g.transpose(1, 2).contiguous().float()
     beta = beta.transpose(1, 2).contiguous().float()
 
-    q = _hf_l2norm(q)
-    k = _hf_l2norm(k)
     q = q * (k_dim ** -0.5)
 
-    # Transformers keeps recurrent state in value.dtype. The official fallback
-    # uses initial_state.to(value), not an unconditional FP32 state.
     if state is None:
         recurrent = torch.zeros((batch, v_heads, k_dim, v_dim), device=value.device, dtype=value.dtype)
     else:
