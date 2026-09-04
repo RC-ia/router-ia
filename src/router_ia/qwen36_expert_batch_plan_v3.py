@@ -10,12 +10,13 @@ latency:
 
 from pathlib import Path
 
+import torch
+
 from . import qwen36_adaptive_experts as adaptive
 from . import qwen36_cached_loop as cached
 from . import qwen36_expert_batch_plan_v2 as planner
 
 
-_ORIGINAL_PLAN_LAYER = planner._plan_layer
 _ORIGINAL_LOAD_MISSING = planner._load_missing_grouped
 
 
@@ -49,33 +50,27 @@ def _load_missing_grouped_direct(
             weights_cpu[name].append(store._load_ssd(prefix + ".weight"))
             scales_cpu[name].append(store._load_ssd(prefix + ".weight_scale_inv"))
 
-    import torch
+    # Stay out of the GPU path entirely for non-FP8 checkpoints. The previous
+    # implementation allocated H2D batches first and only then discovered that
+    # it had to fall back to v2, which wasted VRAM and performed unnecessary work.
+    if any(
+        weight.dtype != torch.float8_e4m3fn
+        for name in names
+        for weight in weights_cpu[name]
+    ):
+        return _ORIGINAL_LOAD_MISSING(root, layer, layer_prefix, ids)
 
     gpu = {}
-    all_fp8 = True
     for name in names:
         wb = torch.stack(weights_cpu[name], dim=0)
         sb = torch.stack(scales_cpu[name], dim=0)
-        if wb.dtype == torch.float8_e4m3fn:
-            gpu[name] = (
-                wb.to(device="cuda", non_blocking=True),
-                sb.to(device="cuda", non_blocking=True),
-            )
-            planner._stat("weight_batches")
-            planner._stat("scale_batches")
-        else:
-            all_fp8 = False
-            gpu[name] = (
-                wb.to(device="cuda", dtype=torch.float16, non_blocking=True),
-                sb,
-            )
-            planner._stat("weight_batches")
-
+        gpu[name] = (
+            wb.to(device="cuda", non_blocking=True),
+            sb.to(device="cuda", non_blocking=True),
+        )
+        planner._stat("weight_batches")
+        planner._stat("scale_batches")
         planner._stat("cpu_projection_loads", len(ids))
-
-    if not all_fp8:
-        # Preserve v2's conservative fallback for non-FP8 checkpoints.
-        return _ORIGINAL_LOAD_MISSING(root, layer, layer_prefix, ids)
 
     compact = {}
     for local, expert_id in enumerate(ids):
