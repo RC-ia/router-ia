@@ -49,6 +49,7 @@ class _Stats:
 _STATS: _Stats | None = None
 
 _ORIGINAL_RUN_FORWARD = chat.run_forward_token
+_ORIGINAL_GENERATE_RESPONSE = chat.generate_response
 _ORIGINAL_SAMPLE_NEXT = chat.sample_next
 _ORIGINAL_ATTENTION = attention_cache.step_attention
 _ORIGINAL_RMSNORM = base.rmsnorm
@@ -240,11 +241,31 @@ def _profile_run_forward(root, token_id, final_norm, lm_head, final_norm_name, l
     global _STATS
     if not ENABLED:
         return _ORIGINAL_RUN_FORWARD(root, token_id, final_norm, lm_head, final_norm_name, lm_head_name, device, advance_state)
+    if _STATS is None:
+        _STATS = _Stats()
+        local = True
+        t0 = perf_counter()
+    else:
+        local = False
+    result = _ORIGINAL_RUN_FORWARD(root, token_id, final_norm, lm_head, final_norm_name, lm_head_name, device, advance_state)
+    if local:
+        if device == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _STATS.total_ms = (perf_counter() - t0) * 1000.0
+        _report(_STATS)
+        _STATS = None
+    return result
+
+
+def _profile_generate_response(*args, **kwargs):
+    global _STATS
+    if not ENABLED:
+        return _ORIGINAL_GENERATE_RESPONSE(*args, **kwargs)
     _STATS = _Stats()
     t0 = perf_counter()
     try:
-        result = _ORIGINAL_RUN_FORWARD(root, token_id, final_norm, lm_head, final_norm_name, lm_head_name, device, advance_state)
-        if device == "cuda" and torch.cuda.is_available():
+        result = _ORIGINAL_GENERATE_RESPONSE(*args, **kwargs)
+        if torch.cuda.is_available():
             torch.cuda.synchronize()
         _STATS.total_ms = (perf_counter() - t0) * 1000.0
         _report(_STATS)
@@ -267,6 +288,7 @@ if ENABLED:
     F.linear = _profile_linear  # type: ignore[assignment]
     chat.sample_next = _profile_sample
     chat.run_forward_token = _profile_run_forward
+    chat.generate_response = _profile_generate_response
 
     print(
         f"stage_profiler=enabled | top_layers={TOP_LAYERS} | "
