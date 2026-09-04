@@ -23,6 +23,7 @@ from . import qwen36_expert_batch_plan_v3 as _expert_batch_plan_v3  # noqa: F401
 from . import qwen36_expert_q4_hierarchy_fixed as _expert_q4_hierarchy  # noqa: F401
 from . import qwen36_expert_q4_activate as _expert_q4_activate  # noqa: F401
 from . import qwen36_physical_memory_guard_v3 as _physical_memory_guard  # noqa: F401
+from . import qwen36_memory_loading_fix as _memory_loading_fix  # noqa: F401
 from . import qwen36_memory_policy_v2 as _memory_policy_v2  # noqa: F401
 
 if os.getenv("QWEN36_PROFILE", "0").strip().lower() in {"1", "true", "yes", "on"}:
