@@ -41,6 +41,12 @@ def unwrap(fn):
     return fn, depth
 
 
+def layout(x):
+    if x is None:
+        return "none"
+    return f"shape={tuple(x.shape)} stride={x.stride()} contiguous={x.is_contiguous()} offset={x.storage_offset()}"
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("root", type=Path)
@@ -129,6 +135,14 @@ def main() -> int:
                         report(key, ref_cap[key], cand_cap[key])
                     else:
                         print(f"    {key:<22} unavailable")
+
+                print("  recurrent layouts")
+                for key in ("query", "key", "value", "g", "beta", "initial_state", "core", "state"):
+                    ref_x = ref_cap.get(key)
+                    cand_x = cand_cap.get(key)
+                    if ref_x is not None and cand_x is not None:
+                        print(f"    {key:<22} ref={layout(ref_x)}")
+                        print(f"    {'':<22} cand={layout(cand_x)}")
 
                 if pos == 1:
                     print("  raw fallback vs candidate/reference")
