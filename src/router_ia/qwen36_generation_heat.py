@@ -3,9 +3,10 @@ from __future__ import annotations
 """Generation-scoped expert heat for continuous Qwen3.6 generation.
 
 Each prompt starts a fresh generation epoch. Expert usage from the previous
-prompt is invalidated and its dedicated FP8/Q4 expert storage is released.
+prompt is invalidated and its generation-local expert storage is released.
 Within the active generation, repeated expert use raises the adaptive score,
-so the current token loop progressively keeps the hottest experts in VRAM.
+so the current token loop progressively keeps the hottest experts in VRAM
+while lower-heat experts can live in the shared Q4 RAM bank.
 """
 
 from collections import OrderedDict
@@ -13,6 +14,7 @@ from pathlib import Path
 from threading import Lock
 
 from . import qwen36_adaptive_experts as adaptive
+from . import qwen36_adaptive_expert_ram as expert_ram
 from . import qwen36_chat_batch as chat
 from . import qwen36_official_optimizations as official
 
@@ -39,6 +41,8 @@ def reset_generation(root: Path) -> int:
             expert.q4_ram_bytes.clear()
             expert.bytes_used = 0
             expert.q4_bytes_used = 0
+
+    expert_ram.clear(key)
 
     try:
         store = official.cached._store(root)
@@ -80,8 +84,9 @@ def _generation_print_cache(root: Path, label: str) -> None:
     policy = adaptive._policy(key)
     expert = official._EXPERT_CACHES.get(key)
     snap = policy.snapshot(expert)
-
     cache_snap = expert.snapshot() if expert is not None else {}
+    ram_snap = expert_ram.stats(key)
+
     hot = int(snap.get("hot", 0))
     warm = int(cache_snap.get("warm_items", cache_snap.get("fp8_items", 0)))
     cold = int(cache_snap.get("cold_items", cache_snap.get("q4_items", 0)))
@@ -91,6 +96,13 @@ def _generation_print_cache(root: Path, label: str) -> None:
     print(
         f"  generation heat: epoch={epoch} | hot={hot} | warm={warm} | cold={cold} | "
         f"fp8_resident={warm} | q4_resident={cold} | promoted={promoted} | demoted={demoted}"
+    )
+    print(
+        f"  adaptive expert RAM Q4: {ram_snap['bytes'] / 1024**2:.1f}/"
+        f"{ram_snap['budget_bytes'] / 1024**2:.1f} MiB total-RAM | "
+        f"generic={ram_snap['generic_ram_bytes'] / 1024**2:.1f} MiB | "
+        f"free={ram_snap['available_bytes'] / 1024**2:.1f} MiB | "
+        f"items={ram_snap['items']} | evictions={ram_snap['evictions']}"
     )
 
     top = snap.get("top", [])
