@@ -16,8 +16,8 @@ from .qwen36_op_probe import load_embedding_row, rmsnorm
 
 
 def stats(ref, got):
-    r = ref.float()
-    g = got.float()
+    r = ref.detach().float()
+    g = got.detach().float()
     d = (r - g).abs()
     denom = r.norm().clamp_min(1e-12)
     cos = torch.nn.functional.cosine_similarity(r.reshape(1, -1), g.reshape(1, -1)).item()
@@ -31,6 +31,14 @@ def report(name, ref, got):
 
 def clone(x):
     return None if x is None else x.detach().clone()
+
+
+def unwrap(fn):
+    depth = 0
+    while hasattr(fn, "__wrapped__") and depth < 16:
+        fn = fn.__wrapped__
+        depth += 1
+    return fn, depth
 
 
 def main() -> int:
@@ -62,6 +70,7 @@ def main() -> int:
 
     original_ref_recurrent = qwen.torch_recurrent_gated_delta_rule
     original_candidate_recurrent = candidate.gated_delta_recurrent
+    raw_ref_recurrent, raw_depth = unwrap(original_ref_recurrent)
     ref_cap = {}
     cand_cap = {}
 
@@ -93,6 +102,7 @@ def main() -> int:
     candidate.gated_delta_recurrent = cand_wrap
 
     print(f"op=linear-attention-error-probe layer={args.layer} tokens={args.tokens} device={args.device} materialized={loaded}/{total}")
+    print(f"reference_recurrent={original_ref_recurrent.__module__}.{getattr(original_ref_recurrent, '__name__', type(original_ref_recurrent).__name__)} raw_depth={raw_depth} raw_recurrent={raw_ref_recurrent.__module__}.{getattr(raw_ref_recurrent, '__name__', type(raw_ref_recurrent).__name__)}")
 
     try:
         candidate_conv = None
@@ -119,6 +129,35 @@ def main() -> int:
                         report(key, ref_cap[key], cand_cap[key])
                     else:
                         print(f"    {key:<22} unavailable")
+
+                if pos == 1:
+                    print("  raw fallback vs candidate/reference")
+                    try:
+                        raw_kwargs = {
+                            "g": ref_cap["g"],
+                            "beta": ref_cap["beta"],
+                            "initial_state": ref_cap["initial_state"],
+                            "output_final_state": True,
+                            "use_qk_l2norm_in_kernel": True,
+                        }
+                        raw_core, raw_state = raw_ref_recurrent(
+                            ref_cap["query"],
+                            ref_cap["key"],
+                            ref_cap["value"],
+                            **raw_kwargs,
+                        )
+                        report("raw_core-vs-ref", ref_cap["core"], raw_core)
+                        report("raw_state-vs-ref", ref_cap["state"], raw_state)
+                        report("raw_core-vs-cand", cand_cap["core"], raw_core)
+                        report("raw_state-vs-cand", cand_cap["state"], raw_state)
+                        print(
+                            f"    ref_state_stride={ref_cap['state'].stride()} cand_state_stride={cand_cap['state'].stride()} raw_state_stride={raw_state.stride()}"
+                        )
+                        print(
+                            f"    ref_state_contig={ref_cap['state'].is_contiguous()} cand_state_contig={cand_cap['state'].is_contiguous()} raw_state_contig={raw_state.is_contiguous()}"
+                        )
+                    except Exception as exc:
+                        print(f"    raw_fallback ERROR {type(exc).__name__}: {exc}")
             else:
                 print("  recurrent boundary     not used (chunk path)")
 
