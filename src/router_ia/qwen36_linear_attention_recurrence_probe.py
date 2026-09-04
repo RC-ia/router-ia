@@ -32,21 +32,23 @@ def clone(x):
 
 
 def hf_literal(query, key, value, g, beta, state):
-    """Literal operation order from HF torch_recurrent_gated_delta_rule."""
+    """Literal operation order from current HF torch_recurrent_gated_delta_rule."""
     initial_dtype = query.dtype
     batch_size, sequence_length, _, k_head_dim = key.shape
     num_v_heads, v_head_dim = value.shape[-2:]
     recurrent_state_shape = (batch_size, num_v_heads, k_head_dim, v_head_dim)
 
+    # Current HF/Qwen3.5 ordering: L2-normalize q/k in incoming dtype first,
+    # then transpose and convert all tensors to FP32.
+    query = query * torch.rsqrt((query * query).sum(dim=-1, keepdim=True) + 1e-6)
+    key = key * torch.rsqrt((key * key).sum(dim=-1, keepdim=True) + 1e-6)
     query, key, value, beta, decay = [
         x.transpose(1, 2).to(torch.float32, memory_format=torch.contiguous_format)
         for x in (query, key, value, beta, g)
     ]
-    query = query * torch.rsqrt((query * query).sum(dim=-1, keepdim=True) + 1e-6)
-    key = key * torch.rsqrt((key * key).sum(dim=-1, keepdim=True) + 1e-6)
     query = query * (k_head_dim ** -0.5)
 
-    recurrent = torch.zeros(recurrent_state_shape, device=value.device, dtype=value.dtype) if state is None else state
+    recurrent = torch.zeros(recurrent_state_shape, device=value.device, dtype=value.dtype) if state is None else state.to(value)
 
     q_t = query[:, :, 0]
     k_t = key[:, :, 0]
@@ -71,7 +73,7 @@ def hf_literal(query, key, value, g, beta, state):
         "v_t": v_t,
         "decay_t": decay_t,
         "beta_t": beta_t,
-        "decayed_state": (state if state is not None else torch.zeros(recurrent_state_shape, device=value.device, dtype=value.dtype)) * decay_t,
+        "decayed_state": (state if state is not None else torch.zeros(recurrent_state_shape, device=value.device, dtype=value.dtype)).to(value) * decay_t,
         "kv_mem": kv_mem,
         "delta": delta,
         "update": update,
