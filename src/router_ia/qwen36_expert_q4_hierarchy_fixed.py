@@ -211,9 +211,6 @@ def _get_or_load(cache: Any, store: Any, root: Path, layer: int, expert_id: int,
             ram_entry = entry
         else:
             ram_entry = None
-        if ram_entry is not None:
-            # Metadata access only. Perform H2D after releasing the lock.
-            pass
 
     if ram_entry is not None:
         cuda_entry = _vram_insert(cache, root, layer, expert_id, ram_entry)
@@ -272,7 +269,7 @@ def _plan_layer_q4(root: Path, layer: int, layer_prefix: str, expert_ids: list[i
     entries = {}
     tiers = {}
     for expert_id in unique:
-        entry, tier = _get_or_load(cache, store, layer, expert_id, layer_prefix)
+        entry, tier = _get_or_load(cache, store, root, layer, expert_id, layer_prefix)
         entries[expert_id] = entry
         tiers[expert_id] = tier
         policy.record(layer, expert_id, "q4")
@@ -340,26 +337,19 @@ def _clear(self: Any) -> None:
     _ORIGINAL_CLEAR(self)
 
 
-
-def _cache_factory(root: Path):
-    return _ensure(_ORIGINAL_EXPERT_CACHE(root))
-
-
-expert_cache.RoutedExpertCache.get_or_load_batch = _hierarchy_get_or_load_batch
-expert_cache.RoutedExpertCache.get_or_load = _hierarchy_get_or_load
 expert_cache.RoutedExpertCache.prefetch_expert_raw = _hierarchy_prefetch
 expert_cache.RoutedExpertCache.snapshot = _snapshot
 expert_cache.RoutedExpertCache.clear = _clear
-planner_v2._plan_layer = _plan_layer_q4
-planner_v3._expert_cache = _cache_factory
-planner_v3._plan_layer = _plan_layer_q4
-official._expert_cache = _cache_factory
+chat._expert_projection_triplet = _hierarchy_get_or_load
+chat._warm_expert_raw_cache = lambda root, layer_prefix, expert_ids: None
+chat.cache_stats = lambda root: dict(_snapshot(_ORIGINAL_EXPERT_CACHE(root)))
 chat.print_cache = _print_cache
+planner_v2._plan_layer = _plan_layer_q4
+planner_v3._plan_layer = _plan_layer_q4
 
 print(
-    "expert_q4_hierarchy=enabled|representation=Q4|"
-    f"vram={Q4_VRAM_BUDGET_BYTES / 1024**3:.2f}GiB|"
-    f"ram={Q4_RAM_GB:.2f}GiB|ram_slots_per_layer={Q4_RAM_SLOTS_PER_LAYER}|"
-    f"generic_resident={cached.RESIDENT_VRAM_GB:.2f}GiB|"
-    f"generic_stream={cached.STREAM_GB:.2f}GiB|ssd=temporary"
+    "expert_q4_hierarchy=enabled|"
+    f"representation=Q4|vram={Q4_VRAM_GB:.2f}GiB|ram={Q4_RAM_GB:.2f}GiB|"
+    f"ram_slots_per_layer={Q4_RAM_SLOTS_PER_LAYER}|generic_resident={GENERIC_RESIDENT_GB:.2f}GiB|"
+    "generic_stream=0.75GiB|ssd=temporary|stable=planner-v2-decode"
 )
