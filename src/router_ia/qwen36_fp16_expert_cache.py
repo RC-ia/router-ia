@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-"""GPU FP16 materialization cache for repeatedly used routed experts.
+"""Optional GPU FP16 materialization cache for routed experts.
 
-The compressed FP8/Q4 tiers remain the backing store. This cache keeps already
--dequantized FP16 expert triplets in the *existing* dedicated expert VRAM
--budget, partitioning that budget so total VRAM usage does not grow.
+Disabled by default because the normal 1 GiB expert pool is intentionally
+kept intact. Enable explicitly with ``QWEN36_EXPERT_FP16_GB`` when testing
+FP16 materialization as an alternative cache layout.
 """
 
 import os
@@ -23,16 +23,14 @@ def _configure_partition() -> tuple[int, int]:
     total = int(max(official.EXPERT_VRAM_BUDGET_BYTES, 0))
     requested = os.getenv("QWEN36_EXPERT_FP16_GB")
     if requested is None:
-        fp16 = int(total * 0.75)
-    else:
-        try:
-            fp16 = int(max(float(requested), 0.0) * 1024**3)
-        except ValueError:
-            fp16 = int(total * 0.75)
+        # Keep the production/default compressed expert budget untouched.
+        return 0, total
+    try:
+        fp16 = int(max(float(requested), 0.0) * 1024**3)
+    except ValueError:
+        fp16 = 0
     fp16 = min(fp16, total)
     compressed = max(total - fp16, 0)
-    # RoutedExpertCache is created lazily. Shrinking the existing expert pool
-    # here partitions the same VRAM budget instead of adding another budget.
     official.EXPERT_VRAM_BUDGET_BYTES = compressed
     return fp16, compressed
 
@@ -125,6 +123,9 @@ def _root_for_expert_cache(cache) -> Path | None:
 
 
 def _get_or_load_batch(self, store, layer: int, expert_ids: list[int], layer_prefix: str):
+    if FP16_CACHE_BYTES <= 0:
+        return _ORIGINAL_GET_OR_LOAD_BATCH(self, store, layer, expert_ids, layer_prefix)
+
     root = _root_for_expert_cache(self)
     if root is None:
         return _ORIGINAL_GET_OR_LOAD_BATCH(self, store, layer, expert_ids, layer_prefix)
@@ -142,7 +143,7 @@ def _get_or_load_batch(self, store, layer: int, expert_ids: list[int], layer_pre
             missing.append(int(expert_id))
 
     if missing:
-        decoded = _ORIGINAL_GET_OR_LOAD_BATCH(self, store, int(layer), missing, layer_prefix)
+        decoded = _ORIGINAL_GET_OR_LOAD_BATCH(self, store, layer, missing, layer_prefix)
         for expert_id, triplet in zip(missing, decoded):
             fp16 = tuple(t.to(device="cuda", dtype=torch.float16) for t in triplet)
             output[int(expert_id)] = fp16
@@ -201,7 +202,10 @@ chat.generate_response = _generate_response
 chat.cache_stats = _cache_stats
 chat.print_cache = _print_cache
 
-print(
-    f"expert_fp16_cache=enabled|gpu-only|partition={FP16_CACHE_BYTES / 1024**3:.2f}GiB-FP16+"
-    f"{FP8_CACHE_BYTES / 1024**3:.2f}GiB-FP8|same-expert-budget"
-)
+if FP16_CACHE_BYTES > 0:
+    print(
+        f"expert_fp16_cache=enabled|gpu-only|partition={FP16_CACHE_BYTES / 1024**3:.2f}GiB-FP16+"
+        f"{FP8_CACHE_BYTES / 1024**3:.2f}GiB-FP8|same-expert-budget"
+    )
+else:
+    print("expert_fp16_cache=disabled|default|expert-budget-unchanged")
