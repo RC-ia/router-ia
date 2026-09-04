@@ -127,25 +127,42 @@ def _run_generated_token_stateful(
     sampling_top_k: int,
     temperature: float,
 ) -> tuple[int, float, float]:
+    """Consume one already-generated token and return the next sampled token."""
     state = _state(root, device)
     attention_state.activate(root, state)
+    turn_start = perf_counter()
+    hidden: torch.Tensor | None = None
     try:
-        # The original token runner executes the stateful attention path because
-        # base.linear_attention_step/full_attention_step are patched below.
-        result = _ORIGINAL_CHAT_RUN_GENERATED_TOKEN(
-            root,
-            token_id,
-            final_norm,
-            lm_head,
-            final_norm_name,
-            lm_head_name,
-            device,
-            sampling_top_k,
-            temperature,
-        )
-        state.tokens_seen += 1
-        return result
+        hidden = _run_token_hidden(root, int(token_id), device)
+        if device == "cuda":
+            final_norm_runtime = cached.cached_runtime_tensor(
+                root, final_norm_name, device, dtype=torch.float32
+            )
+            lm_head_runtime = cached.cached_runtime_tensor(
+                root, lm_head_name, device, dtype=torch.float16
+            )
+        else:
+            final_norm_runtime = final_norm
+            lm_head_runtime = lm_head
+
+        hidden = base.rmsnorm(hidden, final_norm_runtime)
+        if device == "cuda":
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                logits = F.linear(hidden.to(lm_head_runtime.dtype), lm_head_runtime)
+            torch.cuda.synchronize()
+        else:
+            logits = F.linear(hidden, lm_head_runtime)
+
+        next_id = int(sample_next(logits, temperature, sampling_top_k))
+        elapsed = perf_counter() - turn_start
+        peak = float(logits.max().item())
+        del hidden, logits
+        if device == "cuda":
+            del final_norm_runtime, lm_head_runtime
+        return next_id, elapsed, peak
     finally:
+        if hidden is not None:
+            del hidden
         attention_state.deactivate(root)
 
 
@@ -259,9 +276,6 @@ def _generate_response_stateful(
 _configure_fused_cache_budget()
 
 base.attention_type = _cached_attention_type
-
-_ORIGINAL_CHAT_RUN_GENERATED_TOKEN = chat.run_generated_token
 base.linear_attention_step = _without_allocator_flush(_stateful_attention_step)
 base.full_attention_step = _without_allocator_flush(_stateful_attention_step)
-chat.run_generated_token = _without_allocator_flush(_run_generated_token_stateful)
 chat.generate_response = _generate_response_stateful
