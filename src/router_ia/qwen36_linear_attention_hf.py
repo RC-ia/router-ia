@@ -84,12 +84,7 @@ def gated_delta_chunk_initial(
     g: torch.Tensor,
     beta: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Use Transformers' exact chunk implementation for the first token.
-
-    Qwen3.6 starts its linear-attention cache through the chunk kernel. Even for
-    a single token, its reduction order can differ from the scalar recurrent
-    loop enough to change the cached FP32 state at ~1e-3 scale.
-    """
+    """Use Transformers' exact chunk implementation for the first token."""
     from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as hf
 
     output, final_state = hf.torch_chunk_gated_delta_rule(
@@ -107,6 +102,12 @@ def gated_delta_chunk_initial(
     return output, final_state.detach()
 
 
+def _hf_l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Match HF's exact x * rsqrt(sum(x*x) + eps) ordering."""
+    inv_norm = torch.rsqrt((x * x).sum(dim=-1, keepdim=True) + eps)
+    return x * inv_norm
+
+
 def gated_delta_recurrent(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, state: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
     """HF-style recurrent gated-delta update using FP32 internal state/math."""
     batch, seq_len, num_heads, k_dim = query.shape
@@ -118,8 +119,8 @@ def gated_delta_recurrent(query: torch.Tensor, key: torch.Tensor, value: torch.T
     g = g.transpose(1, 2).contiguous().float()
     beta = beta.transpose(1, 2).contiguous().float()
 
-    q = q / torch.sqrt((q * q).sum(dim=-1, keepdim=True) + 1e-6)
-    k = k / torch.sqrt((k * k).sum(dim=-1, keepdim=True) + 1e-6)
+    q = _hf_l2norm(q)
+    k = _hf_l2norm(k)
     q = q * (k_dim ** -0.5)
 
     if state is None:
@@ -132,7 +133,7 @@ def gated_delta_recurrent(query: torch.Tensor, key: torch.Tensor, value: torch.T
         q_t = q[:, :, i]
         k_t = k[:, :, i]
         v_t = v[:, :, i]
-        decay_t = g[:, :, i].exp().unsqueeze(-1).unsqueeze(-1)
+        decay_t = g[:, :, i].exp()[..., None, None]
         beta_t = beta[:, :, i].unsqueeze(-1)
         recurrent = recurrent * decay_t
         kv_mem = (recurrent * k_t.unsqueeze(-1)).sum(dim=-2)
