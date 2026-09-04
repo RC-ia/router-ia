@@ -294,46 +294,56 @@ def generate_response(
     try:
         prompt_logits: torch.Tensor | None = None
         prompt_elapsed = 0.0
+        prefill_start = perf_counter()
         for prompt_id in prompt_ids:
             if prompt_logits is not None:
                 del prompt_logits
             prompt_logits, prompt_elapsed, _ = run_forward_token(
                 root, int(prompt_id), final_norm, lm_head, final_norm_name, lm_head_name, device
             )
+        prefill_elapsed = perf_counter() - prefill_start
 
         next_id = sample_next(prompt_logits, temperature, sampling_top_k)
         del prompt_logits
-        print_attention(root, "after prefill")
-        print(f"  prefill_last_token_time={prompt_elapsed:.3f}s")
+        generated.append(next_id)
+        first_text = tokenizer.decode([next_id], skip_special_tokens=True)
+        print(first_text, end="", flush=True)
+        print(
+            f"\n  [step 01] token={next_id} | source=prefill | prefill_time={prefill_elapsed:.3f}s | "
+            f"attn_tokens={attention_cache.stats(root)['tokens_seen']} | "
+            f"kv_tokens={attention_cache.stats(root)['full_tokens']}",
+            flush=True,
+        )
 
-        for step in range(1, max_new_tokens + 1):
-            before = cache_stats(root)
-            logits, elapsed, peak = run_forward_token(
-                root, next_id, final_norm, lm_head, final_norm_name, lm_head_name, device
-            )
-            after = cache_stats(root)
-            next_id = sample_next(logits, temperature, sampling_top_k)
-            delta_hits = int(after.get("hits", 0)) - int(before.get("hits", 0))
-            delta_misses = int(after.get("misses", 0)) - int(before.get("misses", 0))
-            step_hit_rate = delta_hits / max(delta_hits + delta_misses, 1) * 100.0
-            generated.append(next_id)
-            text = tokenizer.decode([next_id], skip_special_tokens=True)
-            print(text, end="", flush=True)
-            attn = attention_cache.stats(root)
-            print(
-                f"\n  [step {step:02d}] token={next_id} | time={elapsed:.3f}s | "
-                f"attn_tokens={attn['tokens_seen']} | kv_tokens={attn['full_tokens']} | "
-                f"attn_mem={attn['bytes'] / 1024**2:.1f}MiB | step_hit_rate={step_hit_rate:.1f}% | "
-                f"global_hit_rate={after.get('hit_rate', 0.0):.2f}% | "
-                f"ram_hit={after.get('ram_hit_rate', 0.0):.2f}% | vram_hit={after.get('vram_hit_rate', 0.0):.2f}% | "
-                f"expert_vram_hit={after.get('vram_expert_hit_rate', 0.0):.2f}% | "
-                f"stream_hit={after.get('vram_stream_hit_rate', 0.0):.2f}% | "
-                f"hits+{delta_hits} misses+{delta_misses} | peak_logit={peak:.4f}",
-                flush=True,
-            )
-            del logits
-            if eos_id is not None and next_id == int(eos_id):
-                break
+        if eos_id is None or next_id != int(eos_id):
+            for step in range(2, max_new_tokens + 1):
+                before = cache_stats(root)
+                logits, elapsed, peak = run_forward_token(
+                    root, next_id, final_norm, lm_head, final_norm_name, lm_head_name, device
+                )
+                after = cache_stats(root)
+                next_id = sample_next(logits, temperature, sampling_top_k)
+                delta_hits = int(after.get("hits", 0)) - int(before.get("hits", 0))
+                delta_misses = int(after.get("misses", 0)) - int(before.get("misses", 0))
+                step_hit_rate = delta_hits / max(delta_hits + delta_misses, 1) * 100.0
+                generated.append(next_id)
+                text = tokenizer.decode([next_id], skip_special_tokens=True)
+                print(text, end="", flush=True)
+                attn = attention_cache.stats(root)
+                print(
+                    f"\n  [step {step:02d}] token={next_id} | time={elapsed:.3f}s | "
+                    f"attn_tokens={attn['tokens_seen']} | kv_tokens={attn['full_tokens']} | "
+                    f"attn_mem={attn['bytes'] / 1024**2:.1f}MiB | step_hit_rate={step_hit_rate:.1f}% | "
+                    f"global_hit_rate={after.get('hit_rate', 0.0):.2f}% | "
+                    f"ram_hit={after.get('ram_hit_rate', 0.0):.2f}% | vram_hit={after.get('vram_hit_rate', 0.0):.2f}% | "
+                    f"expert_vram_hit={after.get('vram_expert_hit_rate', 0.0):.2f}% | "
+                    f"stream_hit={after.get('vram_stream_hit_rate', 0.0):.2f}% | "
+                    f"hits+{delta_hits} misses+{delta_misses} | peak_logit={peak:.4f}",
+                    flush=True,
+                )
+                del logits
+                if eos_id is not None and next_id == int(eos_id):
+                    break
 
         print()
         print(f"  resposta: {len(generated)} tokens | wall={perf_counter() - turn_start:.3f}s")
