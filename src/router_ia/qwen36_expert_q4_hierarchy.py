@@ -24,6 +24,7 @@ from . import qwen36_expert_batch_plan_v3 as planner
 from . import qwen36_expert_cache as expert_cache
 from . import qwen36_official_optimizations as official
 from . import qwen36_cached_loop as cached
+from . import qwen36_chat_batch as chat
 
 MODEL_LAYERS = expert_cache.MODEL_LAYERS
 EXPERTS_PER_LAYER = expert_cache.EXPERTS_PER_LAYER
@@ -47,6 +48,7 @@ _ORIGINAL_EXPERT_CACHE = planner._expert_cache
 _ORIGINAL_PREFETCH = getattr(expert_cache.RoutedExpertCache, "prefetch_expert_raw")
 _ORIGINAL_SNAPSHOT = expert_cache.RoutedExpertCache.snapshot
 _ORIGINAL_CLEAR = expert_cache.RoutedExpertCache.clear
+_ORIGINAL_PRINT_CACHE = official._print_cache
 
 
 def _configure_shared_vram_budget() -> None:
@@ -59,8 +61,6 @@ def _configure_shared_vram_budget() -> None:
     cached.RESIDENT_VRAM_GB = resident / 1024**3
     cached.STREAM_BUDGET_BYTES = stream
     cached.STREAM_GB = stream / 1024**3
-    # Keep the effective Q4 budget consistent with the actual partition if an
-    # environment override was larger than what the 3 GiB cache can provide.
     globals()["Q4_VRAM_BUDGET_BYTES"] = q4
 
 
@@ -122,8 +122,6 @@ def _ensure(cache: Any) -> Any:
     cache._q4_ram_evictions_to_ssd = 0
 
     cache.q4_slots = max(int(getattr(cache, "q4_slots", 0)), Q4_RAM_SLOTS_PER_LAYER)
-    # Snapshot consumers interpret budget_bytes as the dedicated GPU expert
-    # budget. The actual byte accounting is kept separately for the RAM tier.
     cache.budget_bytes = Q4_VRAM_BUDGET_BYTES
     return cache
 
@@ -143,8 +141,11 @@ def _ram_insert(cache: Any, root: Path, layer: int, expert_id: int, entry: _Cold
         victim_layer = layer
         if len(bank) <= cache.q4_slots:
             victim_layer = next(
-                (candidate_layer for candidate_layer in range(cache.layers)
-                 if cache.q4_entries.setdefault(candidate_layer, OrderedDict())),
+                (
+                    candidate_layer
+                    for candidate_layer in range(cache.layers)
+                    if cache.q4_entries.setdefault(candidate_layer, OrderedDict())
+                ),
                 layer,
             )
         victim_bank = cache.q4_entries[victim_layer]
@@ -225,48 +226,53 @@ def _source_to_q4(store: Any, root: Path, layer: int, expert_id: int, layer_pref
 
 
 def _get_or_load_one(cache: Any, store: Any, root: Path, layer: int, expert_id: int, layer_prefix: str):
-    layer = int(layer)
-    expert_id = int(expert_id)
-    key = (layer, expert_id)
+    # The scheduler may call prefetch from worker threads while the forward path
+    # is also touching the same cache. Keep the whole state transition atomic;
+    # this favors correctness over overlapping the relatively rare first-load
+    # quantization.
+    with cache.lock:
+        layer = int(layer)
+        expert_id = int(expert_id)
+        key = (layer, expert_id)
 
-    vram = cache._q4_vram_entries.get(key)
-    if vram is not None:
-        cache._q4_vram_entries.move_to_end(key)
-        cache.hits += 1
-        cache.fp8_hits += 1
-        cache._q4_vram_hits += 1
-        return vram, "vram"
+        vram = cache._q4_vram_entries.get(key)
+        if vram is not None:
+            cache._q4_vram_entries.move_to_end(key)
+            cache.hits += 1
+            cache.fp8_hits += 1
+            cache._q4_vram_hits += 1
+            return vram, "vram"
 
-    ram = cache.q4_entries.setdefault(layer, OrderedDict()).get(expert_id)
-    if ram is not None:
-        cache.q4_entries[layer].move_to_end(expert_id)
-        cache.hits += 1
-        cache.q4_hits += 1
-        cache._q4_ram_hits += 1
-        cuda_entry = _vram_insert(cache, root, layer, expert_id, ram)
-        return cuda_entry, "ram"
+        ram = cache.q4_entries.setdefault(layer, OrderedDict()).get(expert_id)
+        if ram is not None:
+            cache.q4_entries[layer].move_to_end(expert_id)
+            cache.hits += 1
+            cache.q4_hits += 1
+            cache._q4_ram_hits += 1
+            cuda_entry = _vram_insert(cache, root, layer, expert_id, ram)
+            return cuda_entry, "ram"
 
-    ssd_entry = _load_ssd(root, layer, expert_id)
-    if ssd_entry is not None:
-        cache.hits += 1
-        cache.q4_hits += 1
-        cache._q4_ssd_hits += 1
-        cache._q4_ssd_reads += 1
-        try:
-            cache._q4_ssd_bytes_read += _ssd_path(root, layer, expert_id).stat().st_size
-        except OSError:
-            pass
-        _ram_insert(cache, root, layer, expert_id, ssd_entry)
-        cuda_entry = _vram_insert(cache, root, layer, expert_id, ssd_entry)
-        return cuda_entry, "ssd"
+        ssd_entry = _load_ssd(root, layer, expert_id)
+        if ssd_entry is not None:
+            cache.hits += 1
+            cache.q4_hits += 1
+            cache._q4_ssd_hits += 1
+            cache._q4_ssd_reads += 1
+            try:
+                cache._q4_ssd_bytes_read += _ssd_path(root, layer, expert_id).stat().st_size
+            except OSError:
+                pass
+            _ram_insert(cache, root, layer, expert_id, ssd_entry)
+            cuda_entry = _vram_insert(cache, root, layer, expert_id, ssd_entry)
+            return cuda_entry, "ssd"
 
-    cache.misses += 1
-    q4 = _source_to_q4(store, root, layer, expert_id, layer_prefix)
-    _ram_insert(cache, root, layer, expert_id, q4)
-    cuda_entry = _vram_insert(cache, root, layer, expert_id, q4)
-    cache.loads += 1
-    cache.fp8_to_q4 += 1
-    return cuda_entry, "source"
+        cache.misses += 1
+        q4 = _source_to_q4(store, root, layer, expert_id, layer_prefix)
+        _ram_insert(cache, root, layer, expert_id, q4)
+        cuda_entry = _vram_insert(cache, root, layer, expert_id, q4)
+        cache.loads += 1
+        cache.fp8_to_q4 += 1
+        return cuda_entry, "source"
 
 
 def _hierarchy_get_or_load_batch(self: Any, store: Any, layer: int, expert_ids: list[int], layer_prefix: str):
@@ -349,10 +355,28 @@ def _snapshot(self: Any) -> dict[str, int | float]:
     return snap
 
 
+def _print_cache(root: Path, label: str) -> None:
+    _ORIGINAL_PRINT_CACHE(root, label)
+    cache = official._EXPERT_CACHES.get(root.resolve())
+    if cache is None:
+        return
+    snap = _ensure(cache)
+    print(
+        f"  q4 hierarchy: vram={snap._q4_vram_bytes / 1024**2:.1f}/"
+        f"{snap._q4_vram_budget / 1024**2:.1f} MiB | "
+        f"ram={snap.q4_bytes_used / 1024**2:.1f}/{snap._q4_ram_budget / 1024**2:.1f} MiB | "
+        f"vram_items={len(snap._q4_vram_entries)} | "
+        f"ram_items={sum(len(bank) for bank in snap.q4_entries.values())} | "
+        f"ssd_hits={snap._q4_ssd_hits} | ssd_writes={snap._q4_ssd_writes} | "
+        f"ssd_reads={snap._q4_ssd_reads} | vram_evictions={snap._q4_vram_evictions}"
+    )
+
+
 def _clear(self: Any) -> None:
     cache = _ensure(self)
-    cache._q4_vram_entries.clear()
-    cache._q4_vram_bytes = 0
+    with cache.lock:
+        cache._q4_vram_entries.clear()
+        cache._q4_vram_bytes = 0
     _ORIGINAL_CLEAR(self)
 
 
@@ -368,6 +392,7 @@ expert_cache.RoutedExpertCache.clear = _clear
 planner._expert_cache = _patched_expert_cache
 official._expert_cache = _patched_expert_cache
 planner._plan_layer = _plan_layer_q4
+chat.print_cache = _print_cache
 
 print(
     "expert_q4_hierarchy=enabled|representation=Q4|"
