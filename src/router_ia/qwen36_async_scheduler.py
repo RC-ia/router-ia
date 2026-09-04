@@ -17,6 +17,7 @@ from threading import Lock
 import torch
 
 from . import qwen36_adaptive_experts as adaptive
+from . import qwen36_cached_loop as cached_loop
 from . import qwen36_chat_batch as chat
 from . import qwen36_official_optimizations as official
 
@@ -131,7 +132,7 @@ def _hot_candidates(root: Path, layer: int) -> list[int]:
 
 def _do_prefetch(root: Path, layer: int, layer_prefix: str, expert_id: int, state: _State) -> None:
     cache = official._expert_cache(root)
-    store = __import__("router_ia.qwen36_cached_loop", fromlist=["_store"])._store(root)
+    store = cached_loop._store(root)
     with torch.cuda.stream(state.stream):
         cache.prefetch_expert_raw(store, layer_prefix, int(expert_id))
 
