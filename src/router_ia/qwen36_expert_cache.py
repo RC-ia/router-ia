@@ -292,6 +292,102 @@ class RoutedExpertCache:
             else:
                 self.evictions += 1
 
+    def _insert_fp8_batch_locked(
+        self,
+        layer: int,
+        entries: dict[int, WarmEntry],
+    ) -> None:
+        """Insert a routed batch while materializing only Q4 victims that survive.
+
+        A top-k route can replace most of an 8-slot FP8 bank at once. The old
+        per-entry insertion path converted every evicted expert to Q4 and then
+        immediately discarded most of those conversions because the cold tier
+        has only three slots. Batch insertion computes the final cold residency
+        first, so only Q4 entries that can actually survive are materialized.
+        """
+        if not entries:
+            return
+
+        layer = int(layer)
+        bank = self.fp8_entries.setdefault(layer, OrderedDict())
+        ids = list(dict.fromkeys(int(x) for x in entries))
+
+        existing = [expert_id for expert_id in ids if expert_id in bank]
+        for expert_id in existing:
+            self._erase(layer, expert_id, "fp8")
+            bank.pop(expert_id, None)
+
+        overflow = max(len(bank) + len(ids) - self.fp8_slots, 0)
+        victims: list[tuple[int, WarmEntry]] = []
+        for _ in range(overflow):
+            victim_id, victim = bank.popitem(last=False)
+            self._erase(layer, victim_id, "fp8")
+            victims.append((victim_id, victim))
+
+        q4 = self.q4_entries.setdefault(layer, OrderedDict())
+        if victims and self.q4_slots > 0:
+            final_q4_order = list(q4.keys())
+            for victim_id, _victim in victims:
+                if victim_id in final_q4_order:
+                    final_q4_order.remove(victim_id)
+                final_q4_order.append(victim_id)
+                if len(final_q4_order) > self.q4_slots:
+                    final_q4_order.pop(0)
+            surviving_victims = set(final_q4_order).intersection(victim_id for victim_id, _ in victims)
+        else:
+            surviving_victims = set()
+
+        if victims:
+            # Victims can already have a stale Q4 copy while resident in FP8.
+            # Remove those copies before installing the final surviving cold set.
+            for victim_id, _victim in victims:
+                old_q4 = q4.pop(victim_id, None)
+                if old_q4 is not None:
+                    self._erase(layer, victim_id, "q4")
+
+        if self.q4_slots > 0:
+            for victim_id, victim in victims:
+                if victim_id not in surviving_victims:
+                    continue
+                cold_gpu = _q4_quantize_entry_from_fp8(victim)
+                cold = _move_q4_to_cpu(cold_gpu)
+                q4[victim_id] = cold
+                self._record(layer, victim_id, "q4", self._q4_size(cold))
+                self.fp8_to_q4 += 1
+                while len(q4) > self.q4_slots:
+                    dropped_id, _ = q4.popitem(last=False)
+                    self._erase(layer, dropped_id, "q4")
+                    self.q4_drops += 1
+                    self.q4_ram_evictions += 1
+        elif victims:
+            self.evictions += len(victims)
+
+        for expert_id in ids:
+            bank[expert_id] = entries[expert_id]
+            self._record(layer, expert_id, "fp8", self._fp8_size(entries[expert_id]))
+            bank.move_to_end(expert_id)
+
+        while len(bank) > self.fp8_slots:
+            # This is only defensive: the routed top-k batch is expected to
+            # fit the FP8 bank, but preserve the old correctness invariant if a
+            # caller supplies a larger batch.
+            victim_id, victim = bank.popitem(last=False)
+            self._erase(layer, victim_id, "fp8")
+            if self.q4_slots > 0:
+                cold_gpu = _q4_quantize_entry_from_fp8(victim)
+                cold = _move_q4_to_cpu(cold_gpu)
+                q4[victim_id] = cold
+                self._record(layer, victim_id, "q4", self._q4_size(cold))
+                self.fp8_to_q4 += 1
+            else:
+                self.evictions += 1
+
+            while len(q4) > self.q4_slots:
+                dropped_id, _ = q4.popitem(last=False)
+                self._erase(layer, dropped_id, "q4")
+                self.q4_drops += 1
+                self.q4_ram_evictions += 1
+
     def put_fp16(self, layer: int, expert_id: int, entry: FP16Entry) -> None:
         if any(t.device.type != "cuda" for t in entry):
             entry = tuple(t.to(device="cuda", dtype=torch.float16) for t in entry)  # type: ignore[assignment]
