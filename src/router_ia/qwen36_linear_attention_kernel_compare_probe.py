@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Compare HF decorated GDN, HF fallback (__wrapped__), literal math and candidate."""
+"""Compare HF recurrent paths and sweep state dtype conversion."""
 
 import argparse
 import gc
@@ -15,6 +15,14 @@ from .qwen36_linear_attention_recurrence_probe import hf_literal, report, clone
 from .qwen36_linear_attention_stateful_probe import _make_reference_cache, _patch_official_conv
 from .qwen36_layer_fidelity_probe import _build_meta_model, _find_layers, _load_config, _materialize_layer, _module_input_dtype
 from .qwen36_op_probe import load_embedding_row, rmsnorm
+
+
+def run_path(fn, cap, state):
+    return fn(
+        cap["query"], cap["key"], cap["value"],
+        g=cap["g"], beta=cap["beta"], initial_state=state,
+        output_final_state=True, use_qk_l2norm_in_kernel=True,
+    )
 
 
 def main() -> int:
@@ -91,33 +99,43 @@ def main() -> int:
 
                 if "decorated_out" not in cap:
                     print(f"\nTOKEN {pos}: chunk path")
+                    print(f"  candidate state dtype: {cand_state.dtype}")
                     continue
 
-                initial = cap["initial"]
-                if initial is not None:
-                    initial = initial.clone()
+                initial = cap["initial"].clone() if cap["initial"] is not None else None
+                print(f"\nTOKEN {pos}")
+                print(f"  input value dtype={cap['value'].dtype} initial dtype={initial.dtype if initial is not None else None}")
+                print(f"  candidate state dtype={cand_state.dtype}")
 
-                fb_out, fb_state = fallback(
-                    cap["query"], cap["key"], cap["value"],
-                    g=cap["g"], beta=cap["beta"], initial_state=initial,
-                    output_final_state=True, use_qk_l2norm_in_kernel=True,
-                )
+                fb_out, fb_state = run_path(fallback, cap, initial)
                 lit_out, lit_state, _ = hf_literal(
                     cap["query"], cap["key"], cap["value"],
                     cap["g"], cap["beta"], cap["initial"],
                 )
 
-                print(f"\nTOKEN {pos}")
                 report("decorated_vs_fallback_out", cap["decorated_out"], fb_out)
                 report("decorated_vs_literal_out", cap["decorated_out"], lit_out)
                 report("fallback_vs_literal_out", fb_out, lit_out)
                 report("candidate_vs_fallback_out", cap["candidate_out"], fb_out)
-                report("candidate_vs_decorated_out", cap["candidate_out"], cap["decorated_out"])
                 report("decorated_vs_fallback_state", cap["decorated_state"], fb_state)
                 report("decorated_vs_literal_state", cap["decorated_state"], lit_state)
                 report("fallback_vs_literal_state", fb_state, lit_state)
                 report("candidate_vs_fallback_state", cap["candidate_state"], fb_state)
-                report("candidate_vs_decorated_state", cap["candidate_state"], cap["decorated_state"])
+
+                if pos == 1 and initial is not None:
+                    print("  STATE DTYPE SWEEP (same captured token-1 inputs)")
+                    candidates = {
+                        "initial_as_is": initial,
+                        "initial_to_value": initial.to(cap["value"]),
+                        "initial_to_bf16": initial.to(dtype=torch.bfloat16),
+                        "initial_to_fp32": initial.to(dtype=torch.float32),
+                        "initial_clone": initial.clone(),
+                    }
+                    for name, st_in in candidates.items():
+                        o, s = run_path(fallback, cap, st_in)
+                        report(f"{name}_vs_decorated_out", cap["decorated_out"], o)
+                        report(f"{name}_vs_decorated_state", cap["decorated_state"], s)
+
                 report("model_vs_candidate_final", reference.reshape_as(cand_out), cand_out)
     finally:
         qwen.torch_recurrent_gated_delta_rule = decorated
