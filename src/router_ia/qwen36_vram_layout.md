@@ -1,1 +1,0 @@
-The runtime now models four independent GPU regions: compute reserve, resident cache, routed-expert cache, and transfer/stream window. The transfer window is the first tier sacrificed under compute pressure, and allocator-wide empty_cache calls remain disabled in the token hot path.
