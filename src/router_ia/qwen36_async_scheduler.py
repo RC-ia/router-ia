@@ -95,7 +95,8 @@ def _layer_from_prefix(layer_prefix: str) -> int | None:
 def _hot_candidates(root: Path, layer: int) -> list[int]:
     policy = adaptive._POLICIES.get(root.resolve())
     expert_cache = official._EXPERT_CACHES.get(root.resolve())
-    if policy is None or expert_cache is None:
+    state = _state(root)
+    if policy is None or expert_cache is None or state is None:
         return []
 
     with policy.lock:
@@ -112,13 +113,15 @@ def _hot_candidates(root: Path, layer: int) -> list[int]:
     selected: list[int] = []
     with expert_cache.lock:
         fp8_bank = expert_cache.fp8_entries.get(int(layer), {})
-        pending = {expert for (pending_layer, expert) in _state(root).pending if pending_layer == int(layer)} if _state(root) else set()
+        pending = {
+            expert
+            for (pending_layer, expert) in state.pending
+            if pending_layer == int(layer)
+        }
         for score, expert_id in scored:
             if score < adaptive.PREFETCH_SCORE:
                 break
-            if expert_id in fp8_bank:
-                continue
-            if expert_id in pending:
+            if expert_id in fp8_bank or expert_id in pending:
                 continue
             selected.append(expert_id)
             if len(selected) >= LOOKAHEAD_EXPERTS:
@@ -134,7 +137,16 @@ def _do_prefetch(root: Path, layer: int, layer_prefix: str, expert_id: int, stat
 
 
 def _cleanup_done(state: _State) -> None:
-    done_keys = [key for key, pending in state.pending.items() if pending.future.done()]
+    done_keys: list[tuple[int, int]] = []
+    for key, pending in state.pending.items():
+        if not pending.future.done():
+            continue
+        if pending.event is not None and not pending.event.query():
+            # The Python worker is finished, but the CUDA stream may still be
+            # copying/staging the tensors. Keep the dependency alive.
+            continue
+        done_keys.append(key)
+
     for key in done_keys:
         pending = state.pending.pop(key)
         try:
@@ -217,9 +229,12 @@ def _wait(root: Path, layer: int, expert_id: int) -> None:
         pending.future.result()
         if pending.event is not None:
             torch.cuda.current_stream().wait_event(pending.event)
-    finally:
         state.pending.pop(key, None)
         state.stats.completed += 1
+    except Exception:
+        state.stats.errors += 1
+        state.pending.pop(key, None)
+        raise
 
 
 def _async_moe(root, layer, residual, top_k, device):
