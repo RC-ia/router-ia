@@ -5,6 +5,7 @@ from __future__ import annotations
 from . import qwen36_async_scheduler as async_scheduler
 from . import qwen36_expert_batch_plan_v2 as planner_v2
 from . import qwen36_expert_q4_hierarchy_fixed as hierarchy
+from . import qwen36_q4_dequant_batch  # noqa: F401 - installs hot-path patch
 from . import qwen36_chat_batch as chat
 
 planner_v2._plan_layer = hierarchy._plan_layer_q4
