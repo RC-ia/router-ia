@@ -7,6 +7,18 @@ VRAM pool plus a pinned host-RAM pool and one non-blocking CUDA stream.
 
 ## Build
 
+For the complete Windows build plus CUDA smoke test, run this from the
+workspace parent (`D:\router`):
+
+```bat
+python router-ia\native_memory\build_and_smoke.py
+```
+
+The helper discovers the x64 MSVC environment with Visual Studio's developer
+scripts, then uses CMake/Ninja when available. If CMake cannot initialize the
+CUDA toolset or the configure/build fails, it automatically compiles the
+translation unit directly with `nvcc` and the same MSVC environment.
+
 From the repository root, with CMake and the CUDA toolkit installed:
 
 ```bash
