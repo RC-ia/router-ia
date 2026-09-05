@@ -11,8 +11,9 @@ This simulates a model larger than VRAM:
 - requests generate hits and misses;
 - misses evict an existing VRAM block to a RAM staging slot and load the
   requested block into that VRAM slot;
-- transfers are submitted asynchronously and synchronized once per batch;
-- payloads are checked after every batch so a fast run cannot hide corruption.
+- transfers are submitted asynchronously and synchronized at scheduler
+  barriers;
+- newly loaded/evicted payloads are checked so corruption is not hidden.
 
 The benchmark compares several access patterns and stream counts and reports
 request latency, hit rate, transfer volume, and effective H2D/D2H throughput.
@@ -47,8 +48,8 @@ STREAM_VARIANTS = (1, 2, 4, 8)
 
 
 def make_payload(size: int, block_id: int, version: int = 0) -> bytes:
-    # Deterministic pseudo-weight blob. Different blocks and reload versions
-    # remain distinguishable without relying on random state.
+    # Deterministic pseudo-weight blob. Different blocks/versions remain
+    # distinguishable without relying on random state.
     a = (block_id * 17 + version * 7 + 29) & 0xFF
     b = (block_id * 131 + version * 19 + 11) & 0xFF
     out = bytearray(size)
@@ -108,8 +109,8 @@ def run_case(streams: int, pattern: str) -> dict[str, float | int | str]:
     trace = build_trace(pattern)
     buffers: list[ctypes.Array[ctypes.c_char]] = []
 
-    # CPU-side backing store: represents blocks that are not currently
-    # resident in VRAM. RAM slots are only transfer staging buffers.
+    # CPU-side backing store: represents blocks outside VRAM. RAM slots are
+    # staging buffers, not the authoritative storage for all 32 blocks.
     backing = {
         block_id: make_payload(PAYLOAD_BYTES, block_id)
         for block_id in range(LOGICAL_BLOCKS)
@@ -124,6 +125,10 @@ def run_case(streams: int, pattern: str) -> dict[str, float | int | str]:
     requests = 0
     hits = 0
     misses = 0
+    h2d_calls = 0
+    d2h_calls = 0
+    verified_bytes = 0
+
     start = time.perf_counter()
 
     with NativeMemory(
@@ -133,12 +138,12 @@ def run_case(streams: int, pattern: str) -> dict[str, float | int | str]:
         ram_slots=RAM_SLOTS,
         streams=streams,
     ) as mem:
-        # Fill the initial working set. This is cold-start traffic and is
-        # intentionally included in the benchmark.
+        # Initial working set.
         for slot in range(VRAM_SLOTS):
             block_id = slot
             stage_bytes(mem, buffers, slot, backing[block_id])
             mem.h2d_async(slot, slot, PAYLOAD_BYTES)
+            h2d_calls += 1
             resident[slot] = block_id
             location[block_id] = slot
             lru.append(slot)
@@ -147,9 +152,6 @@ def run_case(streams: int, pattern: str) -> dict[str, float | int | str]:
         for batch_start in range(0, len(trace), BATCH_SIZE):
             batch = trace[batch_start : batch_start + BATCH_SIZE]
 
-            # Do not issue two loads to the same physical slot in one batch.
-            # We first identify the unique logical blocks requested by the
-            # simulated router.
             batch_unique: list[int] = []
             seen: set[int] = set()
             for block_id in batch:
@@ -177,24 +179,27 @@ def run_case(streams: int, pattern: str) -> dict[str, float | int | str]:
 
                 misses += 1
 
-                # Prefer a free VRAM slot; otherwise evict the LRU slot that
-                # is not already selected in this batch.
-                free = next((s for s in range(VRAM_SLOTS) if s not in resident), None)
+                # Prefer a genuinely free physical slot not already reserved
+                # for another load in this batch.
+                free = next(
+                    (
+                        s for s in range(VRAM_SLOTS)
+                        if s not in resident and s not in used_slots
+                    ),
+                    None,
+                )
+
                 if free is not None:
                     slot = free
                 else:
                     candidates = [s for s in lru if s not in used_slots]
                     if not candidates:
-                        # This can happen when a batch requests more unique
-                        # blocks than there are free physical slots.
-                        candidates = list(lru)
+                        raise RuntimeError(
+                            "batch scheduler ran out of distinct VRAM slots"
+                        )
                     slot = candidates[0]
                     old_block = resident[slot]
-
-                    # RAM slot == physical slot gives each VRAM slot a stable
-                    # staging location and keeps the ABI simple.
                     pending_evictions.append((slot, old_block))
-
                     del location[old_block]
                     del resident[slot]
                     try:
@@ -205,29 +210,31 @@ def run_case(streams: int, pattern: str) -> dict[str, float | int | str]:
                 pending_loads.append((slot, block_id))
                 used_slots.add(slot)
 
-            # Evictions must complete before their RAM staging slots are reused
-            # for incoming loads. There is no native event API yet, so this is
-            # the correctness barrier for the simulated router scheduler.
+            # Evict first, because the corresponding RAM staging slot is reused
+            # immediately for the incoming logical block.
             for slot, _old_block in pending_evictions:
                 mem.d2h_async(slot, slot, PAYLOAD_BYTES)
+                d2h_calls += 1
             if pending_evictions:
                 mem.sync()
 
                 for slot, old_block in pending_evictions:
                     evicted = read_ram(mem, slot, PAYLOAD_BYTES)
-                    expected_old = backing[old_block]
-                    if evicted != expected_old:
+                    if evicted != backing[old_block]:
                         raise AssertionError(
                             f"eviction corruption: slot={slot}, block={old_block}"
                         )
                     backing[old_block] = evicted
+                    verified_bytes += PAYLOAD_BYTES
 
-            # Load missing blocks.
+            # Load all misses after the eviction barrier.
             for slot, block_id in pending_loads:
                 stage_bytes(mem, buffers, slot, backing[block_id])
                 mem.h2d_async(slot, slot, PAYLOAD_BYTES)
+                h2d_calls += 1
 
-            mem.sync()
+            if pending_loads:
+                mem.sync()
 
             for slot, block_id in pending_loads:
                 resident[slot] = block_id
@@ -238,10 +245,11 @@ def run_case(streams: int, pattern: str) -> dict[str, float | int | str]:
                     pass
                 lru.append(slot)
 
-            # Verify every newly loaded block by round-tripping it through its
-            # staging RAM slot. This is intentionally strict rather than fast.
+            # Integrity check for each newly loaded block. This adds D2H traffic
+            # intentionally; the output reports it separately from request cost.
             for slot, block_id in pending_loads:
                 mem.d2h_async(slot, slot, PAYLOAD_BYTES)
+                d2h_calls += 1
             if pending_loads:
                 mem.sync()
                 for slot, block_id in pending_loads:
@@ -250,30 +258,16 @@ def run_case(streams: int, pattern: str) -> dict[str, float | int | str]:
                         raise AssertionError(
                             f"load corruption: slot={slot}, block={block_id}"
                         )
+                    verified_bytes += PAYLOAD_BYTES
+
+        # Capture native counters while the handle is still alive.
+        native_stats = mem.stats()
 
     elapsed = time.perf_counter() - start
-    stats = mem.stats() if False else None
 
-    # NativeMemory has already been destroyed. Reconstruct transfer volume from
-    # the counters we know were issued in this benchmark.
-    with NativeMemory(
-        vram_slot_bytes=SLOT_BYTES,
-        vram_slots=1,
-        ram_slot_bytes=SLOT_BYTES,
-        ram_slots=1,
-        streams=1,
-    ) as counter_probe:
-        stats = counter_probe.stats()
-
-    # Recompute traffic from the trace accounting. We report request-level
-    # traffic rather than relying on the destroyed native handle.
-    # Initial fill: 8 H2D. Every miss: 1 D2H eviction + 1 H2D load.
-    # Every miss is also round-tripped once for integrity (1 D2H).
-    miss_count = misses
-    h2d_calls = VRAM_SLOTS + miss_count
-    d2h_calls = miss_count * 2
-    h2d_bytes = h2d_calls * PAYLOAD_BYTES
-    d2h_bytes = d2h_calls * PAYLOAD_BYTES
+    h2d_bytes = native_stats["bytes_h2d"]
+    d2h_bytes = native_stats["bytes_d2h"]
+    total_bytes = h2d_bytes + d2h_bytes
 
     return {
         "streams": streams,
@@ -286,9 +280,12 @@ def run_case(streams: int, pattern: str) -> dict[str, float | int | str]:
         "requests_per_s": requests / elapsed if elapsed else float("inf"),
         "h2d_gbps": h2d_bytes / elapsed / 1e9 if elapsed else float("inf"),
         "d2h_gbps": d2h_bytes / elapsed / 1e9 if elapsed else float("inf"),
-        "total_gbps": (h2d_bytes + d2h_bytes) / elapsed / 1e9 if elapsed else float("inf"),
+        "total_gbps": total_bytes / elapsed / 1e9 if elapsed else float("inf"),
         "h2d_calls": h2d_calls,
         "d2h_calls": d2h_calls,
+        "native_h2d_calls": native_stats["h2d_calls"],
+        "native_d2h_calls": native_stats["d2h_calls"],
+        "verified_mib": verified_bytes / 1024 / 1024,
     }
 
 
@@ -342,7 +339,7 @@ def main() -> None:
             f"total={float(best['total_gbps']):.3f} GB/s"
         )
 
-    print("\n[integridade] Todas as cargas/evictions foram verificadas por round-trip.")
+    print("\n[integridade] Evictions e loads foram verificados por round-trip.")
     print("BENCHMARK = PASS")
 
 
