@@ -45,10 +45,71 @@ def _candidate_paths() -> list[Path]:
     return candidates
 
 
+def _prepare_windows_dll_search_path() -> list[Path]:
+    """Register CUDA/MSVC runtime directories so ctypes can load dependencies.
+
+    Windows 10/11 restricts DLL dependency lookup for libraries loaded by
+    ctypes. The native library links against the CUDA runtime (cudart), so
+    adding CUDA's bin directory here makes the loader independent from the
+    shell's PATH configuration.
+    """
+    if os.name != "nt":
+        return []
+
+    roots: list[Path] = []
+
+    cuda_path = os.getenv("CUDA_PATH")
+    if cuda_path:
+        roots.append(Path(cuda_path))
+
+    # Common NVIDIA CUDA Toolkit installation locations. Keep this fallback
+    # version-agnostic so it also works after a toolkit upgrade.
+    program_files = os.getenv("ProgramFiles", r"C:\\Program Files")
+    cuda_root = Path(program_files) / "NVIDIA GPU Computing Toolkit" / "CUDA"
+    if cuda_root.is_dir():
+        for version_dir in sorted(cuda_root.glob("v*"), reverse=True):
+            roots.append(version_dir)
+
+    dll_dirs: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        bin_dir = root / "bin"
+        if bin_dir.is_dir():
+            resolved = bin_dir.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                try:
+                    os.add_dll_directory(str(resolved))
+                except (AttributeError, FileNotFoundError, OSError):
+                    # Older Python/Windows combinations may not expose
+                    # add_dll_directory. PATH fallback below still applies.
+                    pass
+                dll_dirs.append(resolved)
+
+    # The CUDA DLL may also be discoverable through the current environment.
+    # Add the directories to PATH as a compatibility fallback.
+    if dll_dirs:
+        current_path = os.environ.get("PATH", "")
+        additions = os.pathsep.join(str(p) for p in dll_dirs if str(p) not in current_path)
+        if additions:
+            os.environ["PATH"] = additions + (os.pathsep + current_path if current_path else "")
+
+    return dll_dirs
+
+
 def _load_library() -> ctypes.CDLL:
+    _prepare_windows_dll_search_path()
     for path in _candidate_paths():
         if path.is_file():
-            return ctypes.CDLL(str(path))
+            try:
+                return ctypes.CDLL(str(path))
+            except OSError as exc:
+                raise NativeMemoryError(
+                    f"Native CUDA memory library exists but could not be loaded: {path}\n"
+                    f"Windows dependency/loader error: {exc}\n"
+                    "Check that the CUDA Toolkit runtime (cudart) matching the build "
+                    "is installed and that the Visual C++ runtime is available."
+                ) from exc
     raise NativeMemoryError(
         "Native CUDA memory library not found. Build native_memory with CMake "
         "or set ROUTER_IA_NATIVE_MEMORY_LIB."
