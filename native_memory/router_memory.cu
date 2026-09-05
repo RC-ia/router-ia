@@ -24,28 +24,38 @@ struct RouterMemory {
     size_t ram_slot_bytes = 0;
     std::vector<void*> vram_slots;
     std::vector<void*> ram_slots;
-    cudaStream_t stream = nullptr;
+    std::vector<cudaStream_t> streams;
     RouterMemStats stats{};
     std::mutex mutex;
 };
 
 static bool ok(cudaError_t e) { return e == cudaSuccess; }
 
-ROUTER_EXPORT RouterMemory* router_mem_create(
+static cudaStream_t stream_for_slot(RouterMemory* m, uint32_t slot) {
+    return m->streams[static_cast<size_t>(slot) % m->streams.size()];
+}
+
+ROUTER_EXPORT RouterMemory* router_mem_create_ex(
     uint64_t vram_slot_bytes,
     uint32_t vram_slots,
     uint64_t ram_slot_bytes,
-    uint32_t ram_slots) {
-    if (vram_slot_bytes == 0 || ram_slot_bytes == 0 || vram_slots == 0 || ram_slots == 0)
+    uint32_t ram_slots,
+    uint32_t stream_count) {
+    if (vram_slot_bytes == 0 || ram_slot_bytes == 0 ||
+        vram_slots == 0 || ram_slots == 0 || stream_count == 0)
         return nullptr;
 
     auto* m = new RouterMemory();
     m->vram_slot_bytes = static_cast<size_t>(vram_slot_bytes);
     m->ram_slot_bytes = static_cast<size_t>(ram_slot_bytes);
 
-    if (!ok(cudaStreamCreateWithFlags(&m->stream, cudaStreamNonBlocking))) {
-        delete m;
-        return nullptr;
+    m->streams.resize(stream_count, nullptr);
+    for (auto& stream : m->streams) {
+        if (!ok(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking))) {
+            for (cudaStream_t s : m->streams) if (s) cudaStreamDestroy(s);
+            delete m;
+            return nullptr;
+        }
     }
 
     m->vram_slots.resize(vram_slots, nullptr);
@@ -54,7 +64,7 @@ ROUTER_EXPORT RouterMemory* router_mem_create(
     for (auto& p : m->vram_slots) {
         if (!ok(cudaMalloc(&p, m->vram_slot_bytes))) {
             for (void* q : m->vram_slots) if (q) cudaFree(q);
-            cudaStreamDestroy(m->stream);
+            for (cudaStream_t s : m->streams) if (s) cudaStreamDestroy(s);
             delete m;
             return nullptr;
         }
@@ -64,7 +74,7 @@ ROUTER_EXPORT RouterMemory* router_mem_create(
         if (!ok(cudaHostAlloc(&p, m->ram_slot_bytes, cudaHostAllocPortable))) {
             for (void* q : m->ram_slots) if (q) cudaFreeHost(q);
             for (void* q : m->vram_slots) if (q) cudaFree(q);
-            cudaStreamDestroy(m->stream);
+            for (cudaStream_t s : m->streams) if (s) cudaStreamDestroy(s);
             delete m;
             return nullptr;
         }
@@ -73,12 +83,23 @@ ROUTER_EXPORT RouterMemory* router_mem_create(
     return m;
 }
 
+ROUTER_EXPORT RouterMemory* router_mem_create(
+    uint64_t vram_slot_bytes,
+    uint32_t vram_slots,
+    uint64_t ram_slot_bytes,
+    uint32_t ram_slots) {
+    return router_mem_create_ex(
+        vram_slot_bytes, vram_slots, ram_slot_bytes, ram_slots, 1);
+}
+
 ROUTER_EXPORT void router_mem_destroy(RouterMemory* m) {
     if (!m) return;
-    cudaStreamSynchronize(m->stream);
+    for (cudaStream_t stream : m->streams) {
+        if (stream) cudaStreamSynchronize(stream);
+    }
     for (void* p : m->vram_slots) if (p) cudaFree(p);
     for (void* p : m->ram_slots) if (p) cudaFreeHost(p);
-    if (m->stream) cudaStreamDestroy(m->stream);
+    for (cudaStream_t stream : m->streams) if (stream) cudaStreamDestroy(stream);
     delete m;
 }
 
@@ -98,6 +119,10 @@ ROUTER_EXPORT uint32_t router_mem_vram_slots(RouterMemory* m) {
 
 ROUTER_EXPORT uint32_t router_mem_ram_slots(RouterMemory* m) {
     return m ? static_cast<uint32_t>(m->ram_slots.size()) : 0;
+}
+
+ROUTER_EXPORT uint32_t router_mem_streams(RouterMemory* m) {
+    return m ? static_cast<uint32_t>(m->streams.size()) : 0;
 }
 
 ROUTER_EXPORT uint64_t router_mem_vram_slot_bytes(RouterMemory* m) {
@@ -132,7 +157,7 @@ ROUTER_EXPORT int router_mem_h2d_async(
         m->ram_slots[ram_slot],
         static_cast<size_t>(bytes),
         cudaMemcpyHostToDevice,
-        m->stream);
+        stream_for_slot(m, vram_slot));
     if (!ok(e)) return 0;
     ++m->stats.h2d_calls;
     m->stats.bytes_h2d += bytes;
@@ -152,7 +177,7 @@ ROUTER_EXPORT int router_mem_d2h_async(
         m->vram_slots[vram_slot],
         static_cast<size_t>(bytes),
         cudaMemcpyDeviceToHost,
-        m->stream);
+        stream_for_slot(m, vram_slot));
     if (!ok(e)) return 0;
     ++m->stats.d2h_calls;
     m->stats.bytes_d2h += bytes;
@@ -161,15 +186,17 @@ ROUTER_EXPORT int router_mem_d2h_async(
 
 ROUTER_EXPORT int router_mem_sync(RouterMemory* m) {
     if (!m) return 0;
-    cudaError_t e = cudaStreamSynchronize(m->stream);
-    if (!ok(e)) return 0;
+    for (cudaStream_t stream : m->streams) {
+        if (!ok(cudaStreamSynchronize(stream))) return 0;
+    }
     ++m->stats.sync_calls;
     return 1;
 }
 
 ROUTER_EXPORT int router_mem_zero_vram(RouterMemory* m, uint32_t slot, uint64_t bytes) {
     if (!m || slot >= m->vram_slots.size() || bytes > m->vram_slot_bytes) return 0;
-    return ok(cudaMemsetAsync(m->vram_slots[slot], 0, static_cast<size_t>(bytes), m->stream)) ? 1 : 0;
+    return ok(cudaMemsetAsync(
+        m->vram_slots[slot], 0, static_cast<size_t>(bytes), stream_for_slot(m, slot))) ? 1 : 0;
 }
 
 ROUTER_EXPORT int router_mem_copy_host_slot(
