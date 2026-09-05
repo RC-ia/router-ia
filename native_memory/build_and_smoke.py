@@ -60,40 +60,57 @@ def _vs_installation() -> Path | None:
 
 
 def _msvc_environment(env: dict[str, str]) -> dict[str, str]:
-    """Load x64 MSVC variables using the most direct batch file available."""
+    """Load x64 MSVC variables using vcvars64.bat, with VsDevCmd as fallback."""
     if shutil.which("cl.exe"):
         print("native_memory_build=msvc:cl-found-in-PATH")
         return env
 
     installation = _vs_installation()
-    candidates: list[Path] = []
+    # tuple(batch, arguments): vcvars64 takes no architecture argument;
+    # VsDevCmd accepts -arch=x64. Passing "amd64" to vcvars64.bat can fail.
+    candidates: list[tuple[Path, list[str]]] = []
     if installation is not None:
-        # Prefer vcvars64.bat: it is narrower and does not depend on optional
-        # VS workload components beyond the MSVC build tools themselves.
-        candidates.append(installation / "VC" / "Auxiliary" / "Build" / "vcvars64.bat")
-        candidates.append(installation / "Common7" / "Tools" / "VsDevCmd.bat")
+        candidates.append(
+            (installation / "VC" / "Auxiliary" / "Build" / "vcvars64.bat", [])
+        )
+        candidates.append(
+            (installation / "Common7" / "Tools" / "VsDevCmd.bat", ["-arch=x64", "-host_arch=x64"])
+        )
 
     candidates.extend(
         [
-            Path(r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"),
-            Path(r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"),
-            Path(r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat"),
-            Path(r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat"),
+            (
+                Path(r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"),
+                [],
+            ),
+            (
+                Path(r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"),
+                [],
+            ),
+            (
+                Path(r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat"),
+                ["-arch=x64", "-host_arch=x64"],
+            ),
+            (
+                Path(r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat"),
+                ["-arch=x64", "-host_arch=x64"],
+            ),
         ]
     )
 
     # Deduplicate while preserving preference order.
-    unique: list[Path] = []
+    unique: list[tuple[Path, list[str]]] = []
     seen: set[str] = set()
-    for path in candidates:
+    for path, args in candidates:
         key = str(path).lower()
         if path.is_file() and key not in seen:
             seen.add(key)
-            unique.append(path)
+            unique.append((path, args))
 
     last_error: Exception | None = None
-    for batch in unique:
-        command = f'call "{batch}" amd64 && set'
+    for batch, batch_args in unique:
+        quoted_args = " ".join(batch_args)
+        command = f'call "{batch}"{(" " + quoted_args) if quoted_args else ""} && set'
         try:
             result = subprocess.run(
                 ["cmd.exe", "/d", "/s", "/c", command],
@@ -118,6 +135,8 @@ def _msvc_environment(env: dict[str, str]) -> dict[str, str]:
         if cl is not None:
             print(f"native_memory_build=msvc:{cl}|env={batch}")
             return merged
+
+        last_error = RuntimeError(f"{batch} ran successfully but cl.exe was not exposed in PATH")
 
     detail = f" Last error: {last_error}" if last_error else ""
     raise SystemExit(
