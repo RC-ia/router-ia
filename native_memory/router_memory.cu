@@ -23,6 +23,12 @@ struct MemoryBlock {
     uint32_t vram_slot = INVALID_SLOT;
     uint64_t bytes = 0;
     uint32_t pin_count = 0;
+    // Proposal #1: async-acquire state. A block whose H2D is still in flight
+    // has `loading_vram_slot != INVALID_SLOT` and its `vram_slot` stays
+    // INVALID until the transfer is synchronized. `loading_stream` is the
+    // stream that owns the in-flight `cudaMemcpyAsync`.
+    uint32_t loading_vram_slot = INVALID_SLOT;
+    cudaStream_t loading_stream = nullptr;
 };
 
 struct RouterMemoryManager {
@@ -62,9 +68,16 @@ static void lru_touch(RouterMemoryManager* m, uint32_t slot) {
     m->lru_slots.push_back(slot);
 }
 
+static bool slot_is_loading(const RouterMemoryManager* m, uint32_t vram_slot) {
+    for (const auto& kv : m->blocks) {
+        if (kv.second.loading_vram_slot == vram_slot) return true;
+    }
+    return false;
+}
+
 static int32_t find_free_vram(RouterMemoryManager* m) {
     for (uint32_t i = 0; i < m->vram_owner.size(); ++i) {
-        if (m->vram_owner[i] < 0) return static_cast<int32_t>(i);
+        if (m->vram_owner[i] < 0 && !slot_is_loading(m, i)) return static_cast<int32_t>(i);
     }
     return -1;
 }
@@ -281,6 +294,12 @@ ROUTER_EXPORT int router_mm_unregister_block(RouterMemoryManager* m, uint32_t bl
     std::lock_guard<std::mutex> guard(m->mutex);
     auto it = m->blocks.find(block_id);
     if (it == m->blocks.end() || it->second.pin_count != 0) return 0;
+    // If the block has an in-flight H2D (async acquire), synchronize first so
+    // freeing the RAM slot cannot race the transfer reading from it.
+    if (it->second.loading_vram_slot != INVALID_SLOT) {
+        if (!ok(cudaStreamSynchronize(it->second.loading_stream))) return 0;
+        ++m->stats.sync_calls;
+    }
     if (it->second.vram_slot != INVALID_SLOT && !evict_slot_locked(m, it->second.vram_slot)) return 0;
     if (it->second.ram_slot < m->ram_used.size()) m->ram_used[it->second.ram_slot] = false;
     m->blocks.erase(it);
@@ -309,6 +328,20 @@ ROUTER_EXPORT int router_mm_acquire(RouterMemoryManager* m, uint32_t block_id, u
     MemoryBlock& block = it->second;
     if (bytes != block.bytes || !valid_bytes(m, block.bytes)) return 0;
 
+    // If an async acquire already has this block in flight, wait for it and
+    // return the now-resident slot instead of issuing a duplicate transfer.
+    if (block.loading_vram_slot != INVALID_SLOT) {
+        if (!ok(cudaStreamSynchronize(block.loading_stream))) return 0;
+        ++m->stats.sync_calls;
+        block.vram_slot = block.loading_vram_slot;
+        m->vram_owner[block.vram_slot] = static_cast<int32_t>(block_id);
+        block.loading_vram_slot = INVALID_SLOT;
+        block.loading_stream = nullptr;
+        lru_touch(m, static_cast<uint32_t>(block.vram_slot));
+        *out_vram_slot = block.vram_slot;
+        return 1;
+    }
+
     if (block.vram_slot != INVALID_SLOT) {
         ++m->cache_hits;
         lru_touch(m, block.vram_slot);
@@ -324,6 +357,7 @@ ROUTER_EXPORT int router_mm_acquire(RouterMemoryManager* m, uint32_t block_id, u
         for (uint32_t candidate : m->lru_slots) {
             const int32_t owner = m->vram_owner[candidate];
             if (owner < 0) continue;
+            if (slot_is_loading(m, candidate)) continue;
             auto owner_it = m->blocks.find(static_cast<uint32_t>(owner));
             if (owner_it != m->blocks.end() && owner_it->second.pin_count == 0) {
                 slot = static_cast<int32_t>(candidate);
@@ -404,4 +438,115 @@ ROUTER_EXPORT RouterMemoryManagerStats router_mm_stats(RouterMemoryManager* m) {
     out.cache_misses = m->cache_misses;
     out.evictions = m->evictions;
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// Proposal #1: asynchronous acquire, added alongside the legacy synchronous
+// acquire. The legacy path (router_mm_acquire) is intentionally untouched.
+//
+// Semantics:
+//  - If the block is already resident (vram_slot valid and not loading), the
+//    slot is returned immediately (a cache hit, counted once).
+//  - If the block is already loading, we do NOT issue a second H2D; the
+//    pending transfer already targets a reserved slot, which is returned.
+//  - Otherwise we reserve a free (or LRU-evictable, unlocked, non-loading)
+//    slot, kick off cudaMemcpyAsync on the block's managing stream, and
+//    return WITHOUT synchronizing. The block stays in the loading state.
+//  - router_mm_wait_acquire(block_id) synchronizes the owning stream and
+//    promotes the block to resident.
+// ---------------------------------------------------------------------------
+
+ROUTER_EXPORT int router_mm_acquire_async(RouterMemoryManager* m, uint32_t block_id, uint64_t bytes, uint32_t* out_vram_slot) {
+    if (!m || !out_vram_slot) return 0;
+    std::lock_guard<std::mutex> guard(m->mutex);
+
+    auto it = m->blocks.find(block_id);
+    if (it == m->blocks.end()) return 0;
+    MemoryBlock& block = it->second;
+    if (bytes != block.bytes || !valid_bytes(m, block.bytes)) return 0;
+
+    // Already resident and not loading: plain cache hit.
+    if (block.vram_slot != INVALID_SLOT) {
+        ++m->cache_hits;
+        lru_touch(m, block.vram_slot);
+        *out_vram_slot = block.vram_slot;
+        return 1;
+    }
+
+    // Already loading: reuse the reserved slot, do not double-transfer.
+    if (block.loading_vram_slot != INVALID_SLOT) {
+        *out_vram_slot = block.loading_vram_slot;
+        return 1;
+    }
+
+    ++m->cache_misses;
+
+    int32_t slot = find_free_vram(m);
+    if (slot < 0) {
+        slot = -1;
+        for (uint32_t candidate : m->lru_slots) {
+            const int32_t owner = m->vram_owner[candidate];
+            if (owner < 0) continue;
+            if (slot_is_loading(m, candidate)) continue;
+            auto owner_it = m->blocks.find(static_cast<uint32_t>(owner));
+            if (owner_it != m->blocks.end() && owner_it->second.pin_count == 0) {
+                slot = static_cast<int32_t>(candidate);
+                break;
+            }
+        }
+        if (slot < 0) return 0;
+        if (!evict_slot_locked(m, static_cast<uint32_t>(slot))) return 0;
+    }
+
+    cudaStream_t stream = stream_for_slot(m, static_cast<uint32_t>(slot));
+    if (!ok(cudaMemcpyAsync(
+            m->vram_slots[slot],
+            m->ram_slots[block.ram_slot],
+            static_cast<size_t>(block.bytes),
+            cudaMemcpyHostToDevice,
+            stream))) return 0;
+
+    // Record the transfer, but DO NOT synchronize. The block stays loading
+    // until router_mm_wait_acquire is called.
+    ++m->stats.h2d_calls;
+    m->stats.bytes_h2d += block.bytes;
+
+    block.loading_vram_slot = static_cast<uint32_t>(slot);
+    block.loading_stream = stream;
+    *out_vram_slot = static_cast<uint32_t>(slot);
+    return 1;
+}
+
+ROUTER_EXPORT int router_mm_is_loading(RouterMemoryManager* m, uint32_t block_id) {
+    if (!m) return 0;
+    std::lock_guard<std::mutex> guard(m->mutex);
+    auto it = m->blocks.find(block_id);
+    if (it == m->blocks.end()) return 0;
+    return it->second.loading_vram_slot != INVALID_SLOT ? 1 : 0;
+}
+
+ROUTER_EXPORT int router_mm_wait_acquire(RouterMemoryManager* m, uint32_t block_id) {
+    if (!m) return 0;
+    std::lock_guard<std::mutex> guard(m->mutex);
+    auto it = m->blocks.find(block_id);
+    if (it == m->blocks.end()) return 0;
+    MemoryBlock& block = it->second;
+
+    // No in-flight transfer: nothing to wait for. If already resident, it is
+    // a no-op success.
+    if (block.loading_vram_slot == INVALID_SLOT) {
+        return block.vram_slot != INVALID_SLOT ? 1 : 0;
+    }
+
+    if (!ok(cudaStreamSynchronize(block.loading_stream))) return 0;
+
+    ++m->stats.sync_calls;
+
+    // Promote loading -> resident under the reserved slot.
+    block.vram_slot = block.loading_vram_slot;
+    m->vram_owner[block.vram_slot] = static_cast<int32_t>(block_id);
+    block.loading_vram_slot = INVALID_SLOT;
+    block.loading_stream = nullptr;
+    lru_touch(m, static_cast<uint32_t>(block.vram_slot));
+    return 1;
 }

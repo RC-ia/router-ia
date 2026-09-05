@@ -75,6 +75,20 @@ ROUTER_IA_API int router_mm_unpin(RouterMemoryManager* m, uint32_t block_id);
 ROUTER_IA_API int router_mm_evict(RouterMemoryManager* m, uint32_t block_id);
 ROUTER_IA_API RouterMemoryManagerStats router_mm_stats(RouterMemoryManager* m);
 
+// Asynchronous acquire path (Proposal #1 — added alongside the legacy
+// synchronous acquire, which is left untouched).
+//
+// router_mm_acquire_async issues the H2D transfer on the block's managing
+// stream and returns immediately WITHOUT synchronizing. The block transitions
+// to the "loading" state. Callers must call router_mm_wait_acquire() before
+// reading the VRAM pointer, but MAY issue several acquire_async calls (e.g.
+// for the next layer's experts) while still computing on already-ready blocks.
+// Eviction never reuses a slot whose owning block is loading until that
+// transfer has been synchronized.
+ROUTER_IA_API int router_mm_acquire_async(RouterMemoryManager* m, uint32_t block_id, uint64_t bytes, uint32_t* out_vram_slot);
+ROUTER_IA_API int router_mm_wait_acquire(RouterMemoryManager* m, uint32_t block_id);
+ROUTER_IA_API int router_mm_is_loading(RouterMemoryManager* m, uint32_t block_id);
+
 #ifdef __cplusplus
 }
 #endif

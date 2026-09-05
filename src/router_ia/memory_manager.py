@@ -65,6 +65,17 @@ class MemoryManager:
         lib.router_mm_stats.argtypes = [ctypes.c_void_p]
         lib.router_mm_stats.restype = RouterMemoryManagerStats
 
+        # Proposal #1: asynchronous acquire API, added alongside the legacy
+        # synchronous acquire. The legacy path is left untouched.
+        lib.router_mm_acquire_async.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint32),
+        ]
+        lib.router_mm_acquire_async.restype = ctypes.c_int
+        lib.router_mm_wait_acquire.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        lib.router_mm_wait_acquire.restype = ctypes.c_int
+        lib.router_mm_is_loading.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        lib.router_mm_is_loading.restype = ctypes.c_int
+
     def __enter__(self) -> "MemoryManager":
         return self
 
@@ -129,6 +140,29 @@ class MemoryManager:
     def evict(self, block_id: int) -> None:
         if not self._memory.lib.router_mm_evict(self._ptr(), int(block_id)):
             raise NativeMemoryError(f"failed to evict block {block_id}")
+
+    def acquire_async(self, block_id: int, bytes: int) -> int:
+        """Issue the block's H2D transfer and return immediately (Proposal #1).
+
+        The returned slot is reserved but NOT yet safe to read. Call
+        :meth:`wait_acquire` before using the VRAM pointer. Several
+        ``acquire_async`` calls may be dispatched back-to-back so the
+        transfers overlap with computation on already-resident blocks.
+        """
+        out = ctypes.c_uint32()
+        if not self._memory.lib.router_mm_acquire_async(
+            self._ptr(), int(block_id), int(bytes), ctypes.byref(out)
+        ):
+            raise NativeMemoryError(f"failed to acquire block {block_id} (async)")
+        return int(out.value)
+
+    def is_loading(self, block_id: int) -> bool:
+        return bool(self._memory.lib.router_mm_is_loading(self._ptr(), int(block_id)))
+
+    def wait_acquire(self, block_id: int) -> None:
+        """Synchronize an in-flight async acquire and promote it to resident."""
+        if not self._memory.lib.router_mm_wait_acquire(self._ptr(), int(block_id)):
+            raise NativeMemoryError(f"failed to wait for block {block_id}")
 
     def stats(self) -> dict[str, int]:
         s = self._memory.lib.router_mm_stats(self._ptr())
