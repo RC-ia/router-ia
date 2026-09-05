@@ -4,7 +4,8 @@ from __future__ import annotations
 
 CMake is still used when Ninja is available. On Visual Studio installations
 without the CUDA MSBuild integration (CUDA*.props/targets), fall back to a
-standalone nvcc build so the prototype does not require that integration.
+standalone nvcc build. The standalone path initializes the MSVC developer
+environment automatically so nvcc can find cl.exe, INCLUDE and LIB.
 """
 
 import os
@@ -32,6 +33,92 @@ def _find(name: str, extra: list[Path]) -> str | None:
 def _run(cmd: list[str], env: dict[str, str]) -> None:
     print("+", " ".join(cmd), flush=True)
     subprocess.run(cmd, check=True, env=env)
+
+
+def _vs_installation() -> Path | None:
+    vswhere = _find(
+        "vswhere",
+        [Path(r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe")],
+    )
+    if vswhere is None:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                vswhere,
+                "-latest",
+                "-products",
+                "*",
+                "-requires",
+                "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                "-property",
+                "installationPath",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    value = result.stdout.strip().splitlines()
+    return Path(value[-1]).resolve() if value else None
+
+
+def _load_msvc_environment(env: dict[str, str]) -> dict[str, str]:
+    """Load the x64 MSVC developer environment into a child-process env."""
+    if shutil.which("cl.exe"):
+        print("native_memory_build=msvc:cl-found-in-PATH")
+        return env
+
+    candidates: list[Path] = []
+    installation = _vs_installation()
+    if installation is not None:
+        candidates.extend(
+            [
+                installation / "Common7" / "Tools" / "VsDevCmd.bat",
+                installation / "VC" / "Auxiliary" / "Build" / "vcvars64.bat",
+            ]
+        )
+    candidates.extend(
+        [
+            Path(r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat"),
+            Path(r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat"),
+        ]
+    )
+    devcmd = next((path for path in candidates if path.is_file()), None)
+    if devcmd is None:
+        raise SystemExit(
+            "MSVC cl.exe not found. Install Visual Studio Build Tools with "
+            "Desktop development with C++ / MSVC C++ x64/x86 build tools."
+        )
+
+    command = f'call "{devcmd}" -arch=x64 -host_arch=x64 && set'
+    try:
+        result = subprocess.run(
+            ["cmd.exe", "/d", "/s", "/c", command],
+            check=True,
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise SystemExit(f"Failed to initialize MSVC environment via {devcmd}: {exc}") from exc
+
+    merged = dict(env)
+    for line in result.stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key:
+            merged[key] = value
+
+    cl = shutil.which("cl.exe", path=merged.get("PATH"))
+    if cl is None:
+        raise SystemExit(
+            f"MSVC developer environment loaded from {devcmd}, but cl.exe is still not visible."
+        )
+    print(f"native_memory_build=msvc:{cl}")
+    return merged
 
 
 cmake = _find(
@@ -77,9 +164,11 @@ else:
     else:
         print("native_memory_build=generator:nvcc-direct|reason=cmake-not-found")
 
-    # Build a DLL directly. CUDA 12.4 can invoke the installed MSVC host
-    # compiler; -allow-unsupported-compiler avoids nvcc rejecting newer VS
-    # minor releases even though the generated code is still ordinary CUDA.
+    # nvcc uses cl.exe as its Windows host compiler. Initialize the x64 MSVC
+    # environment first instead of assuming the caller opened a VS Developer
+    # Command Prompt.
+    env = _load_msvc_environment(env)
+
     output_dir = BUILD / "Release"
     output_dir.mkdir(parents=True, exist_ok=True)
     dll = output_dir / "router_ia_native_memory.dll"
