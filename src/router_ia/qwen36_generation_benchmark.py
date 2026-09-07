@@ -12,17 +12,18 @@ from . import qwen36_chat_batch as chat
 from . import qwen36_mini_chat as mini
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Benchmark Qwen3.6 generation speed")
-    parser.add_argument("model_dir", type=Path)
-    parser.add_argument("--prompt", default="Olá, explique em uma frase o que é uma CPU.")
-    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
-    parser.add_argument("--max-new-tokens", type=int, default=8)
-    parser.add_argument("--sampling-top-k", type=int, default=20)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--indexed", action="store_true", help="Use the compact expert-location index")
-    args = parser.parse_args()
+def _indexed_stats(root: Path) -> tuple[int, int]:
+    store = chat.cached._stores.get(root.resolve())
+    if store is None:
+        return 0, 0
+    index = getattr(store, "compact_expert_index", None)
+    if index is None:
+        return 0, 0
+    return int(index.lookup_count), int(index.miss_count)
 
+
+@torch.inference_mode()
+def run_benchmark(args: argparse.Namespace) -> None:
     root = args.model_dir.resolve()
     device = args.device.lower()
     if device == "cuda" and not torch.cuda.is_available():
@@ -45,17 +46,19 @@ def main() -> None:
     state.reset()
     chat.attention_cache.activate(root, state)
 
-    print("op=generation-benchmark")
-    print(f"mode={'indexed' if args.indexed else 'baseline'}")
-    print(f"device={device}")
-    print(f"prompt_tokens={len(prompt_ids)}")
-    print(f"max_new_tokens={args.max_new_tokens}")
-    print(f"prompt={args.prompt}")
+    print("op=generation-benchmark", flush=True)
+    print(f"mode={'indexed' if args.indexed else 'baseline'}", flush=True)
+    print(f"device={device}", flush=True)
+    print(f"prompt_tokens={len(prompt_ids)}", flush=True)
+    print(f"max_new_tokens={args.max_new_tokens}", flush=True)
+    print(f"prompt={args.prompt}", flush=True)
 
     # Prefill: measure separately because it is not equivalent to decode speed.
     t0 = time.perf_counter()
     logits = None
-    for token_id in prompt_ids:
+    for i, token_id in enumerate(prompt_ids, 1):
+        if i == 1 or i == len(prompt_ids) or i % max(args.progress_every, 1) == 0:
+            print(f"prefill_progress={i}/{len(prompt_ids)}", flush=True)
         logits, _, _ = chat.run_forward_token(
             root,
             int(token_id),
@@ -74,7 +77,7 @@ def main() -> None:
     # Decode benchmark: each iteration consumes the previously sampled token.
     decode_times: list[float] = []
     generated = []
-    for _ in range(max(args.max_new_tokens - 1, 0)):
+    for step in range(1, max(args.max_new_tokens, 1)):
         start = time.perf_counter()
         next_id, elapsed, _ = chat.run_generated_token(
             root,
@@ -90,12 +93,19 @@ def main() -> None:
         wall = time.perf_counter() - start
         decode_times.append(max(elapsed, wall))
         generated.append(int(next_id))
+        if step == 1 or step % max(args.progress_every, 1) == 0 or step == args.max_new_tokens - 1:
+            print(
+                f"decode_progress={step}/{max(args.max_new_tokens - 1, 1)} "
+                f"last_ms={decode_times[-1] * 1000.0:.3f}",
+                flush=True,
+            )
 
     decode_total = sum(decode_times)
     decode_tokens = len(decode_times)
     decode_tps = decode_tokens / decode_total if decode_total > 0 else 0.0
     attn = chat.attention_cache.stats(root)
     cache = chat.cache_stats(root)
+    index_lookups, index_misses = _indexed_stats(root)
 
     print(f"prefill_seconds={prefill_time:.6f}")
     print(f"prefill_tok_s={len(prompt_ids) / prefill_time:.4f}")
@@ -114,7 +124,23 @@ def main() -> None:
     print(f"ram_bytes={cache.get('ram_bytes', 0)}")
     print(f"vram_bytes={cache.get('vram_bytes', 0)}")
     print(f"attention_bytes={attn.get('bytes', 0)}")
+    print(f"indexed_lookups={index_lookups}")
+    print(f"indexed_misses={index_misses}")
     print(f"generated={tokenizer.decode(generated, skip_special_tokens=True)!r}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Benchmark Qwen3.6 generation speed")
+    parser.add_argument("model_dir", type=Path)
+    parser.add_argument("--prompt", default="Olá, explique em uma frase o que é uma CPU.")
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    parser.add_argument("--max-new-tokens", type=int, default=8)
+    parser.add_argument("--sampling-top-k", type=int, default=20)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--indexed", action="store_true", help="Use the compact expert-location index")
+    parser.add_argument("--progress-every", type=int, default=1, help="Print progress every N tokens")
+    args = parser.parse_args()
+    run_benchmark(args)
 
 
 if __name__ == "__main__":
