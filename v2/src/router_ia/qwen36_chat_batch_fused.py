@@ -89,9 +89,20 @@ class ExpertTransitionPredictor:
                 "observations": self._observations,
             }
 
-_ROUTING_PREDICTOR = ExpertTransitionPredictor(top_n=4, min_observations=1)
+_ROUTING_PREDICTOR = ExpertTransitionPredictor(
+    top_n=max(int(os.getenv("QWEN36_ROUTER_PREDICT_TOP_N", "2")), 1),
+    min_observations=max(int(os.getenv("QWEN36_ROUTING_MIN_OBSERVATIONS", "2")), 1),
+)
 _LAST_ROUTE_PREDICTIONS: dict[int, list[int]] = {}
-_LAST_INPUT_TOKEN: int | None = None
+_CPU_POOL = ThreadPoolExecutor(
+    max_workers=max(int(os.getenv("QWEN36_CPU_EXPERT_POOL_WORKERS", "2")), 1),
+    thread_name_prefix="ram-experts",
+)
+_PREFETCH_POOL = ThreadPoolExecutor(
+    max_workers=max(int(os.getenv("QWEN36_ROUTER_PREFETCH_WORKERS", "2")), 1),
+    thread_name_prefix="expert-prefetch",
+)
+_COLLECT_LAYER_STATS = os.getenv("QWEN36_LAYER_STATS", "0") == "1"
 
 
 def _expert_cache(root: Path) -> RoutedExpertCache:
@@ -195,9 +206,15 @@ def _batched_moe_step_gpu(root: Path, layer: int, residual: torch.Tensor, top_k:
     predicted_next = _ROUTING_PREDICTOR.predict_next(layer, expert_ids)
     predicted_next = [expert for expert in predicted_next if expert not in expert_ids]
     _LAST_ROUTE_PREDICTIONS[int(layer)] = predicted_next
+    prefetch_cache = _expert_cache(root)
+    prefetch_store = cached._store(root)
     for predicted_expert in predicted_next:
-        _expert_cache(root).prefetch_expert_to_ram(
-            cached._store(root), layer, int(predicted_expert), prefix
+        _PREFETCH_POOL.submit(
+            prefetch_cache.prefetch_expert_to_ram,
+            prefetch_store,
+            layer,
+            int(predicted_expert),
+            prefix,
         )
 
     fp8_entries = [entry for tier, entry in tiered if tier == "fp8"]
@@ -210,8 +227,7 @@ def _batched_moe_step_gpu(root: Path, layer: int, residual: torch.Tensor, top_k:
         workers_raw = int(os.getenv("QWEN36_CPU_EXPERT_WORKERS", "2"))
         workers = min(max(workers_raw, 1), len(q4_entries))
         # Start RAM-resident experts first so CPU execution overlaps the GPU path.
-        cpu_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ram-experts")
-        cpu_future = cpu_pool.submit(
+        cpu_future = _CPU_POOL.submit(
             cpu_expert.run_q4_expert_batch_cpu, q4_entries, moe_in, workers=workers
         )
 
@@ -233,8 +249,18 @@ def _batched_moe_step_gpu(root: Path, layer: int, residual: torch.Tensor, top_k:
             expert_out = _route_projection_batched(down_w, hidden, len(fp8_entries))
 
     cpu_result = cpu_future.result() if cpu_future is not None else None
-    if cpu_pool is not None:
-        cpu_pool.shutdown(wait=True)
+    if cpu_result is not None:
+        promote_cache = _expert_cache(root)
+        promote_store = cached._store(root)
+        for route_pos, (tier, _) in enumerate(tiered):
+            if tier == "q4":
+                _PREFETCH_POOL.submit(
+                    promote_cache.promote_q4_to_vram,
+                    promote_store,
+                    layer,
+                    int(expert_ids[route_pos]),
+                    prefix,
+                )
 
     fp8_local = 0
     q4_local = 0
@@ -259,8 +285,12 @@ def _batched_moe_step_gpu(root: Path, layer: int, residual: torch.Tensor, top_k:
 
     moe_out = routed_sum.float() + shared_out.float()
     layer_out = residual + moe_out
-    shared_gate_value = float(shared_gate.float().item())
-    moe_input_norm = float(torch.linalg.vector_norm(moe_in).item())
+    if _COLLECT_LAYER_STATS:
+        shared_gate_value = float(shared_gate.float().item())
+        moe_input_norm = float(torch.linalg.vector_norm(moe_in).item())
+    else:
+        shared_gate_value = 0.0
+        moe_input_norm = 0.0
 
     if cpu_result is not None:
         s = cpu_result[1]
@@ -313,6 +343,7 @@ def _cache_stats_with_experts(root: Path) -> dict[str, int | float]:
         "expert_cache_host_ram_bytes": int(expert["host_ram_bytes"]),
         "expert_cache_host_ram_budget": int(expert["host_ram_budget"]),
         "expert_cache_host_ram_utilization": float(expert["host_ram_utilization"]),
+        "expert_cache_q4_promotions": int(expert["q4_promotions"]),
         "expert_cache_total_slots": int(expert["total_slots"]),
         "expert_cache_hits": int(expert["hits"]),
         "expert_cache_misses": int(expert["misses"]),
@@ -358,7 +389,8 @@ def _print_cache_with_experts(root: Path, label: str) -> None:
     print(
         f"    tiers: FP8=VRAM:{expert['warm_items']} | Q4=RAM:{expert['cold_items']} | "
         f"hits FP8={expert['fp8_hits']} Q4={expert['q4_hits']} | "
-        f"GPU compressions FP8>Q4={expert['fp8_to_q4']} | Q4 RAM evictions={expert['q4_ram_evictions']}"
+        f"GPU compressions FP8>Q4={expert['fp8_to_q4']} | Q4 RAM evictions={expert['q4_ram_evictions']} | "
+        f"Q4->VRAM promotions={expert['q4_promotions']}"
     )
     print(
         f"  ram_expert_cpu: experts={_CPU_RUNTIME['experts']} | "
@@ -399,10 +431,12 @@ def main() -> None:
     print(f"ram_expert_cpu_workers={os.getenv('QWEN36_CPU_EXPERT_WORKERS', '2')}")
     print("expert_cache_compute_batch=single-gemm-gate-up-plus-batched-down")
     print("expert_cache_kernel_fused_dequant=not-yet")
-    print("routing_predictor=enabled")
-    print("routing_predictor_policy=bigram-with-unigram-fallback")
-    print("routing_predictor_top_n=4")
-    print("routing_predictor_prefetch=next-token-all-layers")
+    print("routing_predictor=expert-transition")
+    print("routing_predictor_policy=previous-route-to-next-expert")
+    print(f"routing_predictor_top_n={_ROUTING_PREDICTOR.top_n}")
+    print("routing_predictor_prefetch=async-RAM-first")
+    print("q4_to_vram_promotion=async-after-actual-use")
+    print(f"layer_stats={'enabled' if _COLLECT_LAYER_STATS else 'disabled'}")
     print(f"expert_cache_total_slots={cache.total_slots}")
     print(f"expert_cache_slots_per_layer={cache.slots_per_layer}")
     print(f"expert_cache_fp8_slots_per_layer={cache.fp8_slots}")

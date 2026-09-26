@@ -204,7 +204,7 @@ def run_forward_token(root: Path, token_id: int, final_norm: torch.Tensor, lm_he
 
 
 def run_generated_token(root: Path, token_id: int, final_norm: torch.Tensor, lm_head: torch.Tensor, final_norm_name: str, lm_head_name: str, device: str, sampling_top_k: int, temperature: float):
-    logits, elapsed, peak_logit = run_forward_token(root, token_id, final_norm, lm_head, final_norm_name, lm_head_name, device, advance_state=False)
+    logits, elapsed, peak_logit = run_forward_token(root, token_id, final_norm, lm_head, final_norm_name, lm_head_name, device, advance_state=True)
     next_id = sample_next(logits, temperature, sampling_top_k)
     return next_id, elapsed, peak_logit
 

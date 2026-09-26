@@ -131,6 +131,8 @@ class RoutedExpertCache:
         self.predicted_ram_hits = 0
         self.predicted_ram_promotions = 0
         self.predicted_ram_drops = 0
+        self.q4_promotions = 0
+        self.q4_promotion_pending: set[tuple[int, int]] = set()
         self.entry_bytes: dict[tuple[int, int, str], int] = {}
         self.q4_ram_bytes: dict[tuple[int, int], int] = {}
         self.bytes_used = 0
@@ -270,6 +272,49 @@ class RoutedExpertCache:
                 self._erase_predicted_ram(layer, victim_id)
                 self.predicted_ram_drops += 1
         return True
+    def promote_q4_to_vram(self, store, layer: int, expert_id: int, layer_prefix: str) -> bool:
+        """Promote an actually-used Q4 RAM expert to FP8 VRAM in the background."""
+        layer = int(layer)
+        expert_id = int(expert_id)
+        key = (layer, expert_id)
+        with self.lock:
+            fp8_bank = self.fp8_entries.setdefault(layer, OrderedDict())
+            q4_bank = self.q4_entries.setdefault(layer, OrderedDict())
+            if expert_id in fp8_bank or expert_id not in q4_bank or key in self.q4_promotion_pending:
+                return False
+            self.q4_promotion_pending.add(key)
+
+        try:
+            prefix = f"{layer_prefix}mlp.experts.{expert_id}"
+            raw_weights = []
+            raw_scales = []
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                weight = store.load(prefix + "." + name + ".weight", device="cpu")
+                scale = store.load(prefix + "." + name + ".weight_scale_inv", device="cpu")
+                if weight.dtype != torch.float8_e4m3fn:
+                    return False
+                raw_weights.append(weight.to(device="cuda", non_blocking=True))
+                raw_scales.append(scale.to(device="cuda", non_blocking=True))
+            compact: WarmEntry = (
+                (raw_weights[0], raw_scales[0]),
+                (raw_weights[1], raw_scales[1]),
+                (raw_weights[2], raw_scales[2]),
+            )
+            with self.lock:
+                fp8_bank = self.fp8_entries.setdefault(layer, OrderedDict())
+                q4_bank = self.q4_entries.setdefault(layer, OrderedDict())
+                if expert_id in fp8_bank or expert_id not in q4_bank:
+                    return False
+                old_q4 = q4_bank.pop(expert_id, None)
+                if old_q4 is not None:
+                    self._erase(layer, expert_id, "q4")
+                self._insert_fp8_locked(layer, expert_id, compact)
+                self.q4_promotions += 1
+                return True
+        finally:
+            with self.lock:
+                self.q4_promotion_pending.discard(key)
+
     def _lookup_batch_locked(self, layer: int, expert_ids: list[int]):
         found: list[tuple[str | None, WarmEntry | ColdEntry | None]] = []
         for expert_id in expert_ids:
@@ -616,6 +661,7 @@ class RoutedExpertCache:
                 "predicted_ram_hits": self.predicted_ram_hits,
                 "predicted_ram_promotions": self.predicted_ram_promotions,
                 "predicted_ram_drops": self.predicted_ram_drops,
+                "q4_promotions": self.q4_promotions,
                 "stream_prefetch_hits": self.stream_prefetch_hits,
                 "stream_prefetch_misses": self.stream_prefetch_misses,
                 "shared_items": q4_items,
@@ -634,5 +680,6 @@ class RoutedExpertCache:
             self.q4_ram_bytes.clear()
             self.predicted_ram_bytes.clear()
             self.predicted_ram_bytes_used = 0
+            self.q4_promotion_pending.clear()
             self.bytes_used = 0
             self.q4_bytes_used = 0
