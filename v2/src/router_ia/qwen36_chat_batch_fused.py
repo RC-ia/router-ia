@@ -2,8 +2,11 @@ from __future__ import annotations
 
 """Qwen3.6 chat runner with persistent compressed expert GPU cache."""
 
+import atexit
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import json
 import os
 from pathlib import Path
 from threading import Lock
@@ -25,7 +28,14 @@ _ORIGINAL_PRINT_CACHE = None
 _ORIGINAL_BATCHED_MOE_STEP = None
 _ORIGINAL_RUN_GENERATED_TOKEN = None
 _ORIGINAL_RUN_FORWARD_TOKEN = None
+_ORIGINAL_GENERATE_RESPONSE = None
 _INSTALLED_CHAT_MODULES: set[int] = set()
+_ROUTER_STATE_VERSION = 1
+_ROUTER_STATE_CONTEXT_LIMIT = max(int(os.getenv("QWEN36_ROUTER_STATE_CONTEXT_LIMIT", "16")), 1)
+_ROUTER_STATE_PATH: Path | None = None
+_ROUTER_STATE_ROOT: Path | None = None
+_ROUTER_STATE_LOADED = False
+_ROUTER_STATE_SAVES = 0
 
 
 class ExpertCrossLayerPredictor:
@@ -100,6 +110,72 @@ class ExpertCrossLayerPredictor:
                 1 for expert in predicted if int(expert) in actual_set
             )
 
+    def _serialize_locked(self) -> dict:
+        transitions = []
+        for (target_layer, source_layer, source_expert), counter in self._transitions.items():
+            if not counter:
+                continue
+            compact = counter.most_common(_ROUTER_STATE_CONTEXT_LIMIT)
+            transitions.append({
+                "target_layer": int(target_layer),
+                "source_layer": int(source_layer),
+                "source_expert": int(source_expert),
+                "counts": {str(int(expert)): int(count) for expert, count in compact},
+            })
+        return {
+            "version": _ROUTER_STATE_VERSION,
+            "model_signature": _router_model_signature(_ROUTER_STATE_ROOT),
+            "observations": int(self._observations),
+            "transitions": transitions,
+        }
+
+    def save(self, path: Path) -> None:
+        global _ROUTER_STATE_PATH, _ROUTER_STATE_SAVES
+        path = path.resolve()
+        with self._lock:
+            payload = self._serialize_locked()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        os.replace(tmp, path)
+        _ROUTER_STATE_PATH = path
+        _ROUTER_STATE_SAVES += 1
+
+    def load(self, path: Path, model_signature: str) -> bool:
+        global _ROUTER_STATE_PATH, _ROUTER_STATE_ROOT, _ROUTER_STATE_LOADED
+        path = path.resolve()
+        if not path.is_file():
+            _ROUTER_STATE_PATH = path
+            _ROUTER_STATE_LOADED = False
+            return False
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if int(payload.get("version", -1)) != _ROUTER_STATE_VERSION:
+                return False
+            if payload.get("model_signature") != model_signature:
+                return False
+            transitions = defaultdict(Counter)
+            for item in payload.get("transitions", []):
+                key = (
+                    int(item["target_layer"]),
+                    int(item["source_layer"]),
+                    int(item["source_expert"]),
+                )
+                counter = Counter()
+                for expert, count in dict(item.get("counts", {})).items():
+                    counter[int(expert)] = int(count)
+                if counter:
+                    transitions[key] = counter
+            with self._lock:
+                self._transitions = transitions
+                self._observations = int(payload.get("observations", 0))
+            _ROUTER_STATE_PATH = path
+            _ROUTER_STATE_ROOT = _ROUTER_STATE_ROOT or None
+            _ROUTER_STATE_LOADED = True
+            return True
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            return False
+
     def snapshot(self) -> dict[str, int | float]:
         with self._lock:
             precision = (
@@ -116,6 +192,9 @@ class ExpertCrossLayerPredictor:
                 "min_observations": self.min_observations,
                 "transition_contexts": len(self._transitions),
                 "observations": self._observations,
+                "state_loaded": _ROUTER_STATE_LOADED,
+                "state_saves": _ROUTER_STATE_SAVES,
+                "state_path": str(_ROUTER_STATE_PATH) if _ROUTER_STATE_PATH else "",
             }
 
 _ROUTING_PREDICTOR = ExpertCrossLayerPredictor(
@@ -150,7 +229,54 @@ _CPU_RUNTIME = {
 }
 
 
+def _router_model_signature(root: Path | None) -> str:
+    if root is None:
+        return "unknown"
+    index = root / "model.safetensors.index.json"
+    try:
+        data = index.read_bytes()
+    except OSError:
+        data = str(root.resolve()).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
+def _router_state_path(root: Path) -> Path:
+    configured = os.getenv("QWEN36_ROUTER_STATE")
+    if configured:
+        return Path(configured).expanduser()
+    signature = _router_model_signature(root)
+    return Path.cwd() / f".router_ia_expert_router_{signature}.json"
+
+
+def _ensure_router_state(root: Path) -> None:
+    global _ROUTER_STATE_ROOT, _ROUTER_STATE_PATH
+    key = root.resolve()
+    if _ROUTER_STATE_ROOT == key:
+        return
+    _ROUTER_STATE_ROOT = key
+    path = _router_state_path(key)
+    _ROUTER_STATE_PATH = path
+    _ROUTING_PREDICTOR.load(path, _router_model_signature(key))
+
+
+def _persist_router_state(root: Path) -> None:
+    _ensure_router_state(root)
+    if _ROUTER_STATE_PATH is not None:
+        _ROUTING_PREDICTOR.save(_ROUTER_STATE_PATH)
+
+
+@atexit.register
+def _save_router_state_at_exit() -> None:
+    if _ROUTER_STATE_ROOT is None:
+        return
+    try:
+        _persist_router_state(_ROUTER_STATE_ROOT)
+    except Exception:
+        pass
+
+
 def _expert_cache(root: Path) -> RoutedExpertCache:
+    _ensure_router_state(root)
     key = root.resolve()
     cache = _EXPERT_CACHES.get(key)
     if cache is None:
@@ -507,6 +633,9 @@ def _cache_stats_with_experts(root: Path) -> dict[str, int | float]:
         "routing_predictor_precision": float(predictor["expert_precision"]),
         "routing_predictor_transition_contexts": int(predictor["transition_contexts"]),
         "routing_predictor_observations": int(predictor["observations"]),
+        "routing_predictor_state_loaded": bool(predictor["state_loaded"]),
+        "routing_predictor_state_saves": int(predictor["state_saves"]),
+        "routing_predictor_state_path": str(predictor["state_path"]),
     })
     return stats
 
@@ -545,8 +674,22 @@ def _print_cache_with_experts(root: Path, label: str) -> None:
         f"  routing_predictor: predictions={predictor['predictions']} | "
         f"predicted={predictor['predicted_experts']} | matched={predictor['matched_experts']} | "
         f"precision={predictor['expert_precision']:.2f}% | transitions={predictor['transition_contexts']} | "
-        f"observations={predictor['observations']}"
+        f"observations={predictor['observations']} | "
+        f"persistent={'loaded' if predictor['state_loaded'] else 'new'} | "
+        f"saves={predictor['state_saves']}"
     )
+
+
+def _generate_response_with_persistent_router(*args, **kwargs):
+    root = args[0] if args else kwargs.get("root")
+    try:
+        return _ORIGINAL_GENERATE_RESPONSE(*args, **kwargs)
+    finally:
+        if root is not None:
+            try:
+                _persist_router_state(Path(root))
+            except Exception:
+                pass
 
 
 def install(target_chat_module) -> None:
@@ -559,6 +702,7 @@ def install(target_chat_module) -> None:
     global _ORIGINAL_EXPERT_TRIPLET, _ORIGINAL_CACHE_STATS
     global _ORIGINAL_PRINT_CACHE, _ORIGINAL_BATCHED_MOE_STEP
     global _ORIGINAL_RUN_GENERATED_TOKEN, _ORIGINAL_RUN_FORWARD_TOKEN
+    global _ORIGINAL_GENERATE_RESPONSE
 
     module_id = id(target_chat_module)
     if module_id in _INSTALLED_CHAT_MODULES:
@@ -571,11 +715,13 @@ def install(target_chat_module) -> None:
     _ORIGINAL_BATCHED_MOE_STEP = chat.batched_moe_step
     _ORIGINAL_RUN_GENERATED_TOKEN = chat.run_generated_token
     _ORIGINAL_RUN_FORWARD_TOKEN = chat.run_forward_token
+    _ORIGINAL_GENERATE_RESPONSE = chat.generate_response
 
     chat._expert_projection_triplet = _cached_expert_projection_triplet
     chat.batched_moe_step = _batched_moe_step_gpu
     chat.run_forward_token = _run_forward_token_with_predictor
     chat.run_generated_token = _run_generated_token_with_predictor
+    chat.generate_response = _generate_response_with_persistent_router
     chat.cache_stats = _cache_stats_with_experts
     chat.print_cache = _print_cache_with_experts
     _INSTALLED_CHAT_MODULES.add(module_id)
@@ -602,6 +748,7 @@ def main() -> None:
     print("expert_cache_kernel_fused_dequant=not-yet")
     print("routing_predictor=expert-cross-layer")
     print("routing_predictor_policy=same-token-previous-layers-to-current-layer")
+    print("routing_predictor_persistence=enabled")
     print(f"routing_predictor_top_n={_ROUTING_PREDICTOR.top_n}")
     print("routing_predictor_prefetch=async-RAM-first")
     print("q4_to_vram_promotion=async-after-actual-use")

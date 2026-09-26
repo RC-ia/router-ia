@@ -59,6 +59,14 @@ Predicted experts are prefetched into host RAM before the current layer resolves
 
 The predictive window is two experts per layer by default.
 
+### Persistent router learning
+
+The cross-layer predictor persists its learned transition counts between runs. By default the state is written to a model-specific JSON file in the current working directory, using the checkpoint index hash so different model checkpoints do not share learned routing data.
+
+Set `QWEN36_ROUTER_STATE` to choose another persistent location. The learned state is loaded when the model is first accessed and saved after each chat turn and again at process exit.
+
+The state keeps only the strongest observations for each routing context, controlled by `QWEN36_ROUTER_STATE_CONTEXT_LIMIT` (default 16), so the router remains compact.
+
 ## RAM budget
 
 The general runtime RAM cache has a fixed 8 GiB ceiling by default and evicts lower-priority cached tensors when full. Override it with `QWEN36_CACHE_GB`, for example `QWEN36_CACHE_GB=6` for a 6 GiB ceiling.
