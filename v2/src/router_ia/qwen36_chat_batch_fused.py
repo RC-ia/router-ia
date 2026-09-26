@@ -277,6 +277,13 @@ def _cache_stats_with_experts(root: Path) -> dict[str, int | float]:
     expert = cache.snapshot()
     predictor = _ROUTING_PREDICTOR.snapshot()
     stats.update({
+        "ram_expert_cpu_experts": int(_CPU_RUNTIME["experts"]),
+        "ram_expert_cpu_seconds": float(_CPU_RUNTIME["seconds"]),
+        "ram_expert_cpu_dequant_seconds": float(_CPU_RUNTIME["dequant_seconds"]),
+        "ram_expert_cpu_matmul_seconds": float(_CPU_RUNTIME["matmul_seconds"]),
+        "ram_expert_cpu_layers": int(_CPU_RUNTIME["layers"]),
+        "ram_expert_cpu_last_experts": int(_CPU_RUNTIME["last_cpu_experts"]),
+        "ram_expert_cpu_last_seconds": float(_CPU_RUNTIME["last_cpu_seconds"]),
         "expert_cache_items": int(expert["items"]),
         "expert_cache_bytes": int(expert["bytes"]),
         "expert_cache_budget": int(expert["budget_bytes"]),
@@ -327,6 +334,14 @@ def _print_cache_with_experts(root: Path, label: str) -> None:
         f"GPU compressions FP8>Q4={expert['fp8_to_q4']} | Q4 RAM evictions={expert['q4_ram_evictions']}"
     )
     print(
+        f"  ram_expert_cpu: experts={_CPU_RUNTIME['experts']} | "
+        f"layers={_CPU_RUNTIME['layers']} | "
+        f"total={_CPU_RUNTIME['seconds']:.3f}s | "
+        f"dequant={_CPU_RUNTIME['dequant_seconds']:.3f}s | "
+        f"matmul={_CPU_RUNTIME['matmul_seconds']:.3f}s | "
+        f"last={_CPU_RUNTIME['last_cpu_experts']} experts/{_CPU_RUNTIME['last_cpu_seconds']:.3f}s"
+    )
+    print(
         f"  routing_predictor: predictions={predictor['predictions']} | "
         f"predicted={predictor['predicted_experts']} | matched={predictor['matched_experts']} | "
         f"precision={predictor['expert_precision']:.2f}% | contexts={predictor['contexts']} | "
@@ -352,7 +367,9 @@ def main() -> None:
     print("expert_cache_fp16_persistent=disabled")
     print("expert_cache_fp8_promotion=disabled")
     print("expert_cache_prefetch=parallel-raw-fp8-stream")
-    print("expert_cache_compute=temporary-fp16")
+    print("expert_cache_compute=FP8-VRAM-GPU|Q4-RAM-CPU")
+    print("ram_expert_cpu=enabled-by-default")
+    print(f"ram_expert_cpu_workers={os.getenv('QWEN36_CPU_EXPERT_WORKERS', '2')}")
     print("expert_cache_compute_batch=single-gemm-gate-up-plus-batched-down")
     print("expert_cache_kernel_fused_dequant=not-yet")
     print("routing_predictor=enabled")

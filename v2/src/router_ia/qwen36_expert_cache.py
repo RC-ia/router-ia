@@ -249,6 +249,60 @@ class RoutedExpertCache:
 
         return [tuple(item) for item in result]  # type: ignore[arg-type]
 
+    def get_or_load_batch_tiered(
+        self, store, layer: int, expert_ids: list[int], layer_prefix: str
+    ) -> list[tuple[str, WarmEntry | ColdEntry]]:
+        """Return routed experts with their storage tier preserved.
+
+        fp8 entries remain GPU-resident and are decoded on CUDA by the
+        caller. q4 entries remain packed in host RAM so the caller can
+        execute them on CPU without a RAM->VRAM weight transfer.
+        """
+        layer = int(layer)
+        ids = [int(x) for x in expert_ids]
+        misses: list[int] = []
+        with self.lock:
+            fp8_bank = self.fp8_entries.setdefault(layer, OrderedDict())
+            q4_bank = self.q4_entries.setdefault(layer, OrderedDict())
+            for expert_id in ids:
+                if expert_id not in fp8_bank and expert_id not in q4_bank:
+                    misses.append(expert_id)
+
+        loaded: dict[int, WarmEntry | None] = {}
+        for expert_id in misses:
+            expert_prefix = f"{layer_prefix}mlp.experts.{expert_id}"
+            raw_weights, raw_scales = [], []
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                w, s = self._raw_projection_for_gpu(store, expert_prefix + "." + name)
+                raw_weights.append(w)
+                raw_scales.append(s)
+            raw_is_fp8 = all(w.dtype == torch.float8_e4m3fn for w in raw_weights)
+            if raw_is_fp8:
+                compact: WarmEntry = (
+                    (raw_weights[0], raw_scales[0]),
+                    (raw_weights[1], raw_scales[1]),
+                    (raw_weights[2], raw_scales[2]),
+                )
+            else:
+                fp16 = tuple(w.to(device="cuda", dtype=torch.float16) for w in raw_weights)
+                compact = _fp8_quantize_entry(fp16)  # type: ignore[arg-type]
+                self.fp16_to_fp8 += 1
+            loaded[expert_id] = compact
+
+        with self.lock:
+            for expert_id, compact in loaded.items():
+                if compact is not None:
+                    self._insert_fp8_locked(layer, expert_id, compact)
+                    self.loads += 1
+
+            found = self._lookup_batch_locked(layer, ids)
+
+        tiered: list[tuple[str, WarmEntry | ColdEntry]] = []
+        for tier, entry in found:
+            if tier not in ("fp8", "q4") or entry is None:
+                raise RuntimeError("Expert cache returned an unresolved route entry")
+            tiered.append((tier, entry))
+        return tiered
     def get(self, layer: int, expert_id: int):
         results = self.get_batch(layer, [expert_id])
         return results[0] if results else None
