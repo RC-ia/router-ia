@@ -366,8 +366,8 @@ def _cache_stats_with_experts(root: Path) -> dict[str, int | float]:
         "routing_predictor_predicted_experts": int(predictor["predicted_experts"]),
         "routing_predictor_matched_experts": int(predictor["matched_experts"]),
         "routing_predictor_precision": float(predictor["expert_precision"]),
-        "routing_predictor_contexts": int(predictor["contexts"]),
-        "routing_predictor_bigram_contexts": int(predictor["bigram_contexts"]),
+        "routing_predictor_transition_contexts": int(predictor["transition_contexts"]),
+        "routing_predictor_observations": int(predictor["observations"]),
     })
     return stats
 
@@ -402,8 +402,8 @@ def _print_cache_with_experts(root: Path, label: str) -> None:
     print(
         f"  routing_predictor: predictions={predictor['predictions']} | "
         f"predicted={predictor['predicted_experts']} | matched={predictor['matched_experts']} | "
-        f"precision={predictor['expert_precision']:.2f}% | contexts={predictor['contexts']} | "
-        f"bigrams={predictor['bigram_contexts']}"
+        f"precision={predictor['expert_precision']:.2f}% | transitions={predictor['transition_contexts']} | "
+        f"observations={predictor['observations']}"
     )
 
 

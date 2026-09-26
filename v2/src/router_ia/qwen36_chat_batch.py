@@ -260,6 +260,10 @@ def generate_response(root: Path, prompt: str, tokenizer, final_norm: torch.Tens
 
 
 def main() -> None:
+    # Enable the transition-aware expert cache for the normal V2 entry point.
+    # The fused module patches this already-imported module before generation.
+    if os.getenv("QWEN36_EXPERT_TRANSITIONS", "1") != "0":
+        from . import qwen36_chat_batch_fused as _expert_runtime  # noqa: F401
     parser = argparse.ArgumentParser(description="Stateful Qwen3.6 router mini-chat test")
     parser.add_argument("model_dir", type=Path)
     parser.add_argument("--device", default="cpu")

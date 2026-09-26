@@ -22,6 +22,7 @@ FP8_SLOTS_PER_LAYER = 8
 # Q4 is a RAM backing tier now. Keep it bounded so it does not consume the
 # model/runtime RAM budget indefinitely.
 Q4_SLOTS_PER_LAYER = 3
+PREDICTED_RAM_SLOTS_PER_LAYER = 4
 TOTAL_SLOTS_PER_LAYER = FP8_SLOTS_PER_LAYER + Q4_SLOTS_PER_LAYER
 
 FP8Matrix = tuple[torch.Tensor, torch.Tensor]
@@ -29,6 +30,7 @@ WarmEntry = tuple[FP8Matrix, FP8Matrix, FP8Matrix]
 Q4Matrix = tuple[torch.Tensor, torch.Tensor, tuple[int, int]]
 ColdEntry = tuple[Q4Matrix, Q4Matrix, Q4Matrix]
 FP16Entry = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+RamFP8Entry = tuple[FP8Matrix, FP8Matrix, FP8Matrix]
 
 
 def _fp8_dequantize_matrix(matrix: FP8Matrix) -> torch.Tensor:
@@ -125,6 +127,13 @@ class RoutedExpertCache:
 
         self.fp8_entries: dict[int, OrderedDict[int, WarmEntry]] = {layer: OrderedDict() for layer in range(self.layers)}
         self.q4_entries: dict[int, OrderedDict[int, ColdEntry]] = {layer: OrderedDict() for layer in range(self.layers)}
+        self.predicted_ram_entries: dict[int, OrderedDict[int, RamFP8Entry]] = {layer: OrderedDict() for layer in range(self.layers)}
+        self.predicted_ram_bytes: dict[tuple[int, int], int] = {}
+        self.predicted_ram_bytes_used = 0
+        self.predicted_ram_prefetches = 0
+        self.predicted_ram_hits = 0
+        self.predicted_ram_promotions = 0
+        self.predicted_ram_drops = 0
         self.entry_bytes: dict[tuple[int, int, str], int] = {}
         self.q4_ram_bytes: dict[tuple[int, int], int] = {}
         self.bytes_used = 0
@@ -165,6 +174,17 @@ class RoutedExpertCache:
             self.entry_bytes[(layer, expert_id, tier)] = size
             self.bytes_used += size
 
+    def _record_predicted_ram(self, layer: int, expert_id: int, entry: RamFP8Entry) -> None:
+        key = (int(layer), int(expert_id))
+        old = self.predicted_ram_bytes.pop(key, 0)
+        self.predicted_ram_bytes_used -= old
+        size = self._fp8_size(entry)
+        self.predicted_ram_bytes[key] = size
+        self.predicted_ram_bytes_used += size
+
+    def _erase_predicted_ram(self, layer: int, expert_id: int) -> None:
+        key = (int(layer), int(expert_id))
+        self.predicted_ram_bytes_used -= self.predicted_ram_bytes.pop(key, 0)
     def _erase(self, layer: int, expert_id: int, tier: str) -> None:
         if tier == "q4":
             self.q4_bytes_used -= self.q4_ram_bytes.pop((layer, expert_id), 0)
@@ -201,6 +221,44 @@ class RoutedExpertCache:
         for name in ("gate_proj", "up_proj", "down_proj"):
             self._raw_projection_for_gpu(store, prefix + "." + name)
 
+    def prefetch_expert_to_ram(self, store, layer: int, expert_id: int, layer_prefix: str) -> bool:
+        """Load a predicted expert into host RAM as FP8 without touching VRAM."""
+        layer = int(layer)
+        expert_id = int(expert_id)
+        with self.lock:
+            fp8_bank = self.fp8_entries.setdefault(layer, OrderedDict())
+            predicted_bank = self.predicted_ram_entries.setdefault(layer, OrderedDict())
+            q4_bank = self.q4_entries.setdefault(layer, OrderedDict())
+            if expert_id in fp8_bank or expert_id in predicted_bank or expert_id in q4_bank:
+                if expert_id in predicted_bank:
+                    predicted_bank.move_to_end(expert_id)
+                return False
+
+        prefix = f"{layer_prefix}mlp.experts.{expert_id}"
+        matrices = []
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            weight = store.load(prefix + "." + name + ".weight", device="cpu")
+            scale = store.load(prefix + "." + name + ".weight_scale_inv", device="cpu")
+            if weight.dtype != torch.float8_e4m3fn:
+                raise RuntimeError(f"Predicted RAM prefetch requires FP8 source weights: {prefix}.{name}")
+            matrices.append((weight.contiguous(), scale.contiguous()))
+        entry = (matrices[0], matrices[1], matrices[2])
+
+        with self.lock:
+            bank = self.predicted_ram_entries.setdefault(layer, OrderedDict())
+            if expert_id in self.fp8_entries.setdefault(layer, OrderedDict()) or expert_id in self.q4_entries.setdefault(layer, OrderedDict()):
+                return False
+            old = bank.pop(expert_id, None)
+            if old is not None:
+                self._erase_predicted_ram(layer, expert_id)
+            bank[expert_id] = entry
+            self._record_predicted_ram(layer, expert_id, entry)
+            self.predicted_ram_prefetches += 1
+            while len(bank) > PREDICTED_RAM_SLOTS_PER_LAYER:
+                victim_id, _ = bank.popitem(last=False)
+                self._erase_predicted_ram(layer, victim_id)
+                self.predicted_ram_drops += 1
+        return True
     def _lookup_batch_locked(self, layer: int, expert_ids: list[int]):
         found: list[tuple[str | None, WarmEntry | ColdEntry | None]] = []
         for expert_id in expert_ids:
@@ -211,6 +269,14 @@ class RoutedExpertCache:
                 self.fp8_hits += 1
                 fp8.move_to_end(expert_id)
                 found.append(("fp8", entry))
+                continue
+            predicted = self.predicted_ram_entries.setdefault(layer, OrderedDict())
+            predicted_entry = predicted.get(expert_id)
+            if predicted_entry is not None:
+                self.hits += 1
+                self.predicted_ram_hits += 1
+                predicted.move_to_end(expert_id)
+                found.append(("predicted_ram", predicted_entry))
                 continue
             q4 = self.q4_entries.setdefault(layer, OrderedDict())
             entry_q4 = q4.get(expert_id)
@@ -249,60 +315,54 @@ class RoutedExpertCache:
 
         return [tuple(item) for item in result]  # type: ignore[arg-type]
 
-    def get_or_load_batch_tiered(
-        self, store, layer: int, expert_ids: list[int], layer_prefix: str
-    ) -> list[tuple[str, WarmEntry | ColdEntry]]:
-        """Return routed experts with their storage tier preserved.
-
-        fp8 entries remain GPU-resident and are decoded on CUDA by the
-        caller. q4 entries remain packed in host RAM so the caller can
-        execute them on CPU without a RAM->VRAM weight transfer.
-        """
+    def get_or_load_batch_tiered(self, store, layer: int, expert_ids: list[int], layer_prefix: str):
+        """Resolve selected experts; predicted-RAM hits are promoted to VRAM."""
         layer = int(layer)
         ids = [int(x) for x in expert_ids]
-        misses: list[int] = []
+        misses = []
         with self.lock:
             fp8_bank = self.fp8_entries.setdefault(layer, OrderedDict())
+            predicted_bank = self.predicted_ram_entries.setdefault(layer, OrderedDict())
             q4_bank = self.q4_entries.setdefault(layer, OrderedDict())
             for expert_id in ids:
-                if expert_id not in fp8_bank and expert_id not in q4_bank:
+                if expert_id not in fp8_bank and expert_id not in predicted_bank and expert_id not in q4_bank:
                     misses.append(expert_id)
 
-        loaded: dict[int, WarmEntry | None] = {}
+        loaded = {}
         for expert_id in misses:
-            expert_prefix = f"{layer_prefix}mlp.experts.{expert_id}"
+            prefix = f"{layer_prefix}mlp.experts.{expert_id}"
             raw_weights, raw_scales = [], []
             for name in ("gate_proj", "up_proj", "down_proj"):
-                w, s = self._raw_projection_for_gpu(store, expert_prefix + "." + name)
+                w, s = self._raw_projection_for_gpu(store, prefix + "." + name)
                 raw_weights.append(w)
                 raw_scales.append(s)
-            raw_is_fp8 = all(w.dtype == torch.float8_e4m3fn for w in raw_weights)
-            if raw_is_fp8:
-                compact: WarmEntry = (
-                    (raw_weights[0], raw_scales[0]),
-                    (raw_weights[1], raw_scales[1]),
-                    (raw_weights[2], raw_scales[2]),
-                )
-            else:
-                fp16 = tuple(w.to(device="cuda", dtype=torch.float16) for w in raw_weights)
-                compact = _fp8_quantize_entry(fp16)  # type: ignore[arg-type]
-                self.fp16_to_fp8 += 1
-            loaded[expert_id] = compact
+            if not all(w.dtype == torch.float8_e4m3fn for w in raw_weights):
+                raise RuntimeError(f"Unexpected non-FP8 expert source for layer {layer}, expert {expert_id}")
+            loaded[expert_id] = ((raw_weights[0], raw_scales[0]), (raw_weights[1], raw_scales[1]), (raw_weights[2], raw_scales[2]))
 
         with self.lock:
             for expert_id, compact in loaded.items():
-                if compact is not None:
-                    self._insert_fp8_locked(layer, expert_id, compact)
-                    self.loads += 1
-
+                self._insert_fp8_locked(layer, expert_id, compact)
+                self.loads += 1
             found = self._lookup_batch_locked(layer, ids)
+            for pos, (tier, entry) in enumerate(found):
+                if tier != "predicted_ram" or entry is None:
+                    continue
+                bank = self.predicted_ram_entries.setdefault(layer, OrderedDict())
+                promoted = bank.pop(ids[pos], None)
+                if promoted is None:
+                    continue
+                self._erase_predicted_ram(layer, ids[pos])
+                self._insert_fp8_locked(layer, ids[pos], promoted)
+                self.predicted_ram_promotions += 1
+                found[pos] = ("fp8", promoted)
 
-        tiered: list[tuple[str, WarmEntry | ColdEntry]] = []
+        result = []
         for tier, entry in found:
             if tier not in ("fp8", "q4") or entry is None:
                 raise RuntimeError("Expert cache returned an unresolved route entry")
-            tiered.append((tier, entry))
-        return tiered
+            result.append((tier, entry))
+        return result
     def get(self, layer: int, expert_id: int):
         results = self.get_batch(layer, [expert_id])
         return results[0] if results else None
@@ -532,6 +592,12 @@ class RoutedExpertCache:
                 "q4_drops": self.q4_drops,
                 "q4_ram_evictions": self.q4_ram_evictions,
                 "q4_ram_bytes": self.q4_bytes_used,
+                "predicted_ram_bytes": self.predicted_ram_bytes_used,
+                "predicted_ram_items": sum(len(b) for b in self.predicted_ram_entries.values()),
+                "predicted_ram_prefetches": self.predicted_ram_prefetches,
+                "predicted_ram_hits": self.predicted_ram_hits,
+                "predicted_ram_promotions": self.predicted_ram_promotions,
+                "predicted_ram_drops": self.predicted_ram_drops,
                 "stream_prefetch_hits": self.stream_prefetch_hits,
                 "stream_prefetch_misses": self.stream_prefetch_misses,
                 "shared_items": q4_items,
@@ -545,7 +611,10 @@ class RoutedExpertCache:
             for layer in range(self.layers):
                 self.fp8_entries[layer].clear()
                 self.q4_entries[layer].clear()
+                self.predicted_ram_entries[layer].clear()
             self.entry_bytes.clear()
             self.q4_ram_bytes.clear()
+            self.predicted_ram_bytes.clear()
+            self.predicted_ram_bytes_used = 0
             self.bytes_used = 0
             self.q4_bytes_used = 0
