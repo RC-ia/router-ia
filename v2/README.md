@@ -45,19 +45,19 @@ The active policy is:
 - cold expert not cached -> existing GPU load path, then it becomes an FP8 VRAM entry.
 
 The CPU worker count is controlled by `QWEN36_CPU_EXPERT_WORKERS` and defaults to `2`.
-## Expert transition prefetch
+## Expert cross-layer prefetch
 
-V2 also learns transitions between routed experts across consecutive tokens. For each layer, the observed expert set becomes the context for predicting the next likely experts.
+V2 predicts the experts for the current layer from experts selected in earlier layers of the same token. Nearby layers receive more weight, while all earlier layers can contribute evidence.
 
-The transition cache uses three states:
+The predictor uses three states:
 
 1. **VRAM / FP8:** actively used expert.
 2. **RAM / predicted FP8:** speculative next expert. It is loaded into host RAM first and does not consume VRAM.
 3. **RAM / Q4:** cold expert retained for CPU execution.
 
-When a predicted FP8 expert is actually selected by the router, it is promoted from RAM to the VRAM expert cache. If the prediction is wrong, it stays only in the bounded predictive RAM window until eviction.
+Predicted experts are prefetched into host RAM before the current layer resolves its routed experts, allowing the RAM load to overlap the router and SSD path. When a predicted FP8 expert is selected, it can be reused from RAM and promoted into the VRAM expert cache.
 
-The predictive window is four experts per layer. This keeps the speculative RAM footprint bounded.
+The predictive window is two experts per layer by default.
 
 ## RAM budget
 

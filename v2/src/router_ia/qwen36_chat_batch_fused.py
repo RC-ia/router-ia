@@ -24,47 +24,69 @@ _ORIGINAL_CACHE_STATS = None
 _ORIGINAL_PRINT_CACHE = None
 _ORIGINAL_BATCHED_MOE_STEP = None
 _ORIGINAL_RUN_GENERATED_TOKEN = None
+_ORIGINAL_RUN_FORWARD_TOKEN = None
 _INSTALLED_CHAT_MODULES: set[int] = set()
 
 
-class ExpertTransitionPredictor:
-    """Learn expert-to-expert transitions across consecutive tokens."""
+class ExpertCrossLayerPredictor:
+    """Predict current-layer experts from earlier layers of the same token."""
 
     def __init__(self, top_n: int = 4, min_observations: int = 1) -> None:
         self.top_n = max(int(top_n), 1)
         self.min_observations = max(int(min_observations), 1)
-        self._transitions: dict[tuple[int, int], Counter[int]] = defaultdict(Counter)
-        self._last_routes: dict[int, tuple[int, ...]] = {}
+        self._transitions: dict[tuple[int, int, int], Counter[int]] = defaultdict(Counter)
         self._observations = 0
         self._predictions = 0
         self._predicted_experts = 0
         self._matched_experts = 0
         self._lock = Lock()
 
-    def observe(self, layer: int, expert_ids: list[int]) -> tuple[int, ...]:
-        layer = int(layer)
+    def observe(
+        self,
+        layer: int,
+        expert_ids: list[int],
+        context_routes: dict[int, tuple[int, ...]],
+    ) -> None:
+        target_layer = int(layer)
         current = tuple(dict.fromkeys(int(x) for x in expert_ids))
+        if not current or not context_routes:
+            return
         with self._lock:
-            previous = self._last_routes.get(layer, ())
-            if previous:
-                for previous_expert in previous:
-                    counter = self._transitions[(layer, previous_expert)]
+            for source_layer, source_ids in context_routes.items():
+                source_layer = int(source_layer)
+                if source_layer >= target_layer:
+                    continue
+                for source_expert in dict.fromkeys(int(x) for x in source_ids):
+                    counter = self._transitions[
+                        (target_layer, source_layer, source_expert)
+                    ]
                     for current_expert in current:
                         counter[current_expert] += 1
-                self._observations += 1
-            self._last_routes[layer] = current
-            return previous
+            self._observations += 1
 
-    def predict_next(self, layer: int, current_ids: list[int]) -> list[int]:
-        layer = int(layer)
+    def predict(
+        self,
+        layer: int,
+        context_routes: dict[int, tuple[int, ...]],
+    ) -> list[int]:
+        target_layer = int(layer)
         aggregate: Counter[int] = Counter()
         with self._lock:
-            for previous_expert in dict.fromkeys(int(x) for x in current_ids):
-                counter = self._transitions.get((layer, previous_expert))
-                if not counter or sum(counter.values()) < self.min_observations:
+            for source_layer, source_ids in context_routes.items():
+                source_layer = int(source_layer)
+                if source_layer >= target_layer:
                     continue
-                for expert, count in counter.most_common(self.top_n):
-                    aggregate[expert] += count
+                distance = max(target_layer - source_layer, 1)
+                layer_weight = 1.0 / (distance ** 0.5)
+                for source_expert in dict.fromkeys(int(x) for x in source_ids):
+                    counter = self._transitions.get(
+                        (target_layer, source_layer, source_expert)
+                    )
+                    if not counter or sum(counter.values()) < self.min_observations:
+                        continue
+                    for expert, count in counter.most_common(self.top_n):
+                        aggregate[expert] += float(count) * layer_weight
+
             predicted = [expert for expert, _ in aggregate.most_common(self.top_n)]
             if predicted:
                 self._predictions += 1
@@ -74,11 +96,17 @@ class ExpertTransitionPredictor:
     def record_matches(self, predicted: list[int], actual: list[int]) -> None:
         actual_set = {int(x) for x in actual}
         with self._lock:
-            self._matched_experts += sum(1 for expert in predicted if int(expert) in actual_set)
+            self._matched_experts += sum(
+                1 for expert in predicted if int(expert) in actual_set
+            )
 
     def snapshot(self) -> dict[str, int | float]:
         with self._lock:
-            precision = self._matched_experts / self._predicted_experts * 100.0 if self._predicted_experts else 0.0
+            precision = (
+                self._matched_experts / self._predicted_experts * 100.0
+                if self._predicted_experts
+                else 0.0
+            )
             return {
                 "predictions": self._predictions,
                 "predicted_experts": self._predicted_experts,
@@ -90,11 +118,11 @@ class ExpertTransitionPredictor:
                 "observations": self._observations,
             }
 
-_ROUTING_PREDICTOR = ExpertTransitionPredictor(
+_ROUTING_PREDICTOR = ExpertCrossLayerPredictor(
     top_n=max(int(os.getenv("QWEN36_ROUTER_PREDICT_TOP_N", "2")), 1),
     min_observations=max(int(os.getenv("QWEN36_ROUTING_MIN_OBSERVATIONS", "2")), 1),
 )
-_LAST_ROUTE_PREDICTIONS: dict[int, list[int]] = {}
+_CURRENT_TOKEN_ROUTES: dict[int, tuple[int, ...]] = {}
 _CPU_POOL = ThreadPoolExecutor(
     max_workers=max(int(os.getenv("QWEN36_CPU_EXPERT_POOL_WORKERS", "2")), 1),
     thread_name_prefix="ram-experts",
@@ -233,25 +261,48 @@ def _batched_moe_step_gpu(root: Path, layer: int, residual: torch.Tensor, top_k:
     prefix = base.layer_prefix(layer)
     post_norm = base.load_layer_weight(root, layer, "post_attention_layernorm.weight", device)
     moe_in = base.rmsnorm(residual, post_norm).reshape(1, base.HIDDEN).float()
+
+    predicted_current = _ROUTING_PREDICTOR.predict(
+        layer, _CURRENT_TOKEN_ROUTES
+    )
+
+    # Prefetch speculative candidates before resolving the current router
+    # result so RAM staging overlaps router/SSD work.
+    prefetch_cache = _expert_cache(root)
+    prefetch_store = cached._store(root)
+    for predicted_expert in predicted_current:
+        with _PREFETCH_LOCK:
+            done_prefetch = [
+                future for future in tuple(_PREFETCH_PENDING) if future.done()
+            ]
+            for future in done_prefetch:
+                _PREFETCH_PENDING.discard(future)
+            if len(_PREFETCH_PENDING) >= _PREFETCH_MAX_PENDING:
+                break
+            future = _PREFETCH_POOL.submit(
+                prefetch_cache.prefetch_expert_to_ram,
+                prefetch_store,
+                layer,
+                int(predicted_expert),
+                prefix,
+            )
+            _PREFETCH_PENDING.add(future)
+
     router_w = base.load_layer_weight(root, layer, "mlp.gate.weight", device).float()
     routed = base.route(moe_in.reshape(-1), router_w, top_k=top_k)
     expert_ids = [int(v) for v in routed.expert_ids.detach().cpu().tolist()]
     route_weights = [float(v) for v in routed.weights.detach().cpu().tolist()]
 
+    _ROUTING_PREDICTOR.observe(
+        layer, expert_ids, _CURRENT_TOKEN_ROUTES
+    )
+    if predicted_current:
+        _ROUTING_PREDICTOR.record_matches(predicted_current, expert_ids)
+    _CURRENT_TOKEN_ROUTES[int(layer)] = tuple(expert_ids)
+
     tiered = _expert_cache(root).get_or_load_batch_tiered(
         cached._store(root), layer, expert_ids, prefix
     )
-
-    _ROUTING_PREDICTOR.observe(layer, expert_ids)
-    previous_prediction = _LAST_ROUTE_PREDICTIONS.get(int(layer), [])
-    if previous_prediction:
-        _ROUTING_PREDICTOR.record_matches(previous_prediction, expert_ids)
-    predicted_next = _ROUTING_PREDICTOR.predict_next(layer, expert_ids)
-    predicted_next = [expert for expert in predicted_next if expert not in expert_ids]
-    _LAST_ROUTE_PREDICTIONS[int(layer)] = predicted_next
-    prefetch_cache = _expert_cache(root)
-    prefetch_store = cached._store(root)
-    for predicted_expert in predicted_next:
         with _PREFETCH_LOCK:
             done_prefetch = [future for future in tuple(_PREFETCH_PENDING) if future.done()]
             for future in done_prefetch:
@@ -373,10 +424,54 @@ def _batched_moe_step_gpu(root: Path, layer: int, residual: torch.Tensor, top_k:
     del shared_hidden, shared_out, moe_out
     return layer_out, expert_ids, route_weights, shared_gate_value, moe_input_norm
 
-def _run_generated_token_with_predictor(root: Path, token_id: int, final_norm: torch.Tensor, lm_head: torch.Tensor, final_norm_name: str, lm_head_name: str, device: str, sampling_top_k: int, temperature: float):
+def _run_forward_token_with_predictor(
+    root: Path,
+    token_id: int,
+    final_norm: torch.Tensor,
+    lm_head: torch.Tensor,
+    final_norm_name: str,
+    lm_head_name: str,
+    device: str,
+    advance_state: bool = True,
+):
+    global _CURRENT_TOKEN_ROUTES
+    _CURRENT_TOKEN_ROUTES = {}
+    try:
+        return _ORIGINAL_RUN_FORWARD_TOKEN(
+            root,
+            token_id,
+            final_norm,
+            lm_head,
+            final_norm_name,
+            lm_head_name,
+            device,
+            advance_state,
+        )
+    finally:
+        _CURRENT_TOKEN_ROUTES = {}
+
+
+def _run_generated_token_with_predictor(
+    root: Path,
+    token_id: int,
+    final_norm: torch.Tensor,
+    lm_head: torch.Tensor,
+    final_norm_name: str,
+    lm_head_name: str,
+    device: str,
+    sampling_top_k: int,
+    temperature: float,
+):
     return _ORIGINAL_RUN_GENERATED_TOKEN(
-        root, token_id, final_norm, lm_head, final_norm_name, lm_head_name,
-        device, sampling_top_k, temperature
+        root,
+        token_id,
+        final_norm,
+        lm_head,
+        final_norm_name,
+        lm_head_name,
+        device,
+        sampling_top_k,
+        temperature,
     )
 
 
@@ -478,7 +573,7 @@ def install(target_chat_module) -> None:
     global chat
     global _ORIGINAL_EXPERT_TRIPLET, _ORIGINAL_CACHE_STATS
     global _ORIGINAL_PRINT_CACHE, _ORIGINAL_BATCHED_MOE_STEP
-    global _ORIGINAL_RUN_GENERATED_TOKEN
+    global _ORIGINAL_RUN_GENERATED_TOKEN, _ORIGINAL_RUN_FORWARD_TOKEN
 
     module_id = id(target_chat_module)
     if module_id in _INSTALLED_CHAT_MODULES:
@@ -490,9 +585,11 @@ def install(target_chat_module) -> None:
     _ORIGINAL_PRINT_CACHE = chat.print_cache
     _ORIGINAL_BATCHED_MOE_STEP = chat.batched_moe_step
     _ORIGINAL_RUN_GENERATED_TOKEN = chat.run_generated_token
+    _ORIGINAL_RUN_FORWARD_TOKEN = chat.run_forward_token
 
     chat._expert_projection_triplet = _cached_expert_projection_triplet
     chat.batched_moe_step = _batched_moe_step_gpu
+    chat.run_forward_token = _run_forward_token_with_predictor
     chat.run_generated_token = _run_generated_token_with_predictor
     chat.cache_stats = _cache_stats_with_experts
     chat.print_cache = _print_cache_with_experts
@@ -518,8 +615,8 @@ def main() -> None:
     print(f"ram_expert_cpu_workers={os.getenv('QWEN36_CPU_EXPERT_WORKERS', '2')}")
     print("expert_cache_compute_batch=single-gemm-gate-up-plus-batched-down")
     print("expert_cache_kernel_fused_dequant=not-yet")
-    print("routing_predictor=expert-transition")
-    print("routing_predictor_policy=previous-route-to-next-expert")
+    print("routing_predictor=expert-cross-layer")
+    print("routing_predictor_policy=same-token-previous-layers-to-current-layer")
     print(f"routing_predictor_top_n={_ROUTING_PREDICTOR.top_n}")
     print("routing_predictor_prefetch=async-RAM-first")
     print("q4_to_vram_promotion=async-after-actual-use")
