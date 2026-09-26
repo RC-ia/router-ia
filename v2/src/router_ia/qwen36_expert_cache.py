@@ -8,6 +8,7 @@ from threading import Lock
 import torch
 
 from . import qwen36_dequant as dequant
+from .qwen36_cached_loop import SharedRamBudget
 
 MODEL_LAYERS = 40
 EXPERTS_PER_LAYER = 256
@@ -114,11 +115,12 @@ def _move_q4_to_cpu(entry: ColdEntry) -> ColdEntry:
 class RoutedExpertCache:
     """Per-layer FP8 GPU cache with a colder Q4 backing tier in system RAM."""
 
-    def __init__(self, budget_bytes: int, layers: int = MODEL_LAYERS) -> None:
+    def __init__(self, budget_bytes: int, layers: int = MODEL_LAYERS, shared_budget: SharedRamBudget | None = None) -> None:
         self.budget_bytes = max(int(budget_bytes), 0)
         self.layers = max(int(layers), 1)
+        self.shared_budget = shared_budget
         self.fp8_slots = min(FP8_SLOTS_PER_LAYER, self._budget_fp8_slots())
-        self.q4_slots = self._budget_q4_slots()
+        self.q4_slots = EXPERTS_PER_LAYER
         self.slots_per_layer = self.fp8_slots + self.q4_slots
         self.total_slots = self.slots_per_layer * self.layers
 
@@ -171,6 +173,45 @@ class RoutedExpertCache:
             return 0
         return min(EXPERTS_PER_LAYER, max(Q4_MIN_SLOTS_PER_LAYER, slots))
 
+    def _ram_budget_locked(self) -> int:
+        if self.shared_budget is not None:
+            return self.shared_budget.available("expert")
+        return self.budget_bytes
+
+    def _ram_used_locked(self) -> int:
+        return self.q4_bytes_used + self.predicted_ram_bytes_used
+
+    def _sync_shared_ram_locked(self) -> None:
+        if self.shared_budget is not None:
+            self.shared_budget.set_usage("expert", self._ram_used_locked())
+
+    def _make_ram_room_locked(self, extra_bytes: int) -> bool:
+        extra_bytes = max(int(extra_bytes), 0)
+        while self._ram_used_locked() + extra_bytes > self._ram_budget_locked():
+            victim = None
+            for layer, bank in self.predicted_ram_entries.items():
+                if bank:
+                    victim = (layer, next(iter(bank)))
+                    break
+            if victim is not None:
+                layer, expert_id = victim
+                self.predicted_ram_entries[layer].pop(expert_id, None)
+                self._erase_predicted_ram(layer, expert_id)
+                self.predicted_ram_drops += 1
+                continue
+            victim = None
+            for layer, bank in self.q4_entries.items():
+                if bank:
+                    victim = (layer, next(iter(bank)))
+                    break
+            if victim is None:
+                return False
+            layer, expert_id = victim
+            self.q4_entries[layer].pop(expert_id, None)
+            self._erase(layer, expert_id, "q4")
+            self.q4_drops += 1
+            self.q4_ram_evictions += 1
+        return True
     @staticmethod
     def _fp8_size(entry: WarmEntry) -> int:
         return sum(int(w.numel()) * int(w.element_size()) + int(s.numel()) * int(s.element_size()) for w, s in entry)
@@ -183,6 +224,7 @@ class RoutedExpertCache:
         if tier == "q4":
             self.q4_ram_bytes[(layer, expert_id)] = size
             self.q4_bytes_used += size
+            self._sync_shared_ram_locked()
         else:
             self.entry_bytes[(layer, expert_id, tier)] = size
             self.bytes_used += size
@@ -194,13 +236,16 @@ class RoutedExpertCache:
         size = self._fp8_size(entry)
         self.predicted_ram_bytes[key] = size
         self.predicted_ram_bytes_used += size
+        self._sync_shared_ram_locked()
 
     def _erase_predicted_ram(self, layer: int, expert_id: int) -> None:
         key = (int(layer), int(expert_id))
         self.predicted_ram_bytes_used -= self.predicted_ram_bytes.pop(key, 0)
+        self._sync_shared_ram_locked()
     def _erase(self, layer: int, expert_id: int, tier: str) -> None:
         if tier == "q4":
             self.q4_bytes_used -= self.q4_ram_bytes.pop((layer, expert_id), 0)
+            self._sync_shared_ram_locked()
         else:
             self.bytes_used -= self.entry_bytes.pop((layer, expert_id, tier), 0)
 
@@ -264,6 +309,8 @@ class RoutedExpertCache:
             old = bank.pop(expert_id, None)
             if old is not None:
                 self._erase_predicted_ram(layer, expert_id)
+            if not self._make_ram_room_locked(self._fp8_size(entry)):
+                return False
             bank[expert_id] = entry
             self._record_predicted_ram(layer, expert_id, entry)
             self.predicted_ram_prefetches += 1
@@ -451,9 +498,10 @@ class RoutedExpertCache:
                 old_q4 = q4.pop(victim_id, None)
                 if old_q4 is not None:
                     self._erase(layer, victim_id, "q4")
-                q4[victim_id] = cold
-                self._record(layer, victim_id, "q4", self._q4_size(cold))
-                self.fp8_to_q4 += 1
+                if self._make_ram_room_locked(self._q4_size(cold)):
+                    q4[victim_id] = cold
+                    self._record(layer, victim_id, "q4", self._q4_size(cold))
+                    self.fp8_to_q4 += 1
                 while len(q4) > self.q4_slots:
                     dropped_id, _ = q4.popitem(last=False)
                     self._erase(layer, dropped_id, "q4")
@@ -683,3 +731,4 @@ class RoutedExpertCache:
             self.q4_promotion_pending.clear()
             self.bytes_used = 0
             self.q4_bytes_used = 0
+            self._sync_shared_ram_locked()

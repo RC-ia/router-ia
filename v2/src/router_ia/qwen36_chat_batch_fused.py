@@ -116,7 +116,11 @@ def _expert_cache(root: Path) -> RoutedExpertCache:
     key = root.resolve()
     cache = _EXPERT_CACHES.get(key)
     if cache is None:
-        cache = RoutedExpertCache(cached.CACHE_BUDGET_BYTES)
+        store = cached._store(root)
+        cache = RoutedExpertCache(
+            cached.CACHE_BUDGET_BYTES,
+            shared_budget=store.shared_ram_budget,
+        )
         _EXPERT_CACHES[key] = cache
     return cache
 
@@ -388,6 +392,8 @@ def _cache_stats_with_experts(root: Path) -> dict[str, int | float]:
         "expert_cache_host_ram_bytes": int(expert["host_ram_bytes"]),
         "expert_cache_host_ram_budget": int(expert["host_ram_budget"]),
         "expert_cache_host_ram_utilization": float(expert["host_ram_utilization"]),
+        "shared_ram_bytes": int(cached._store(root).shared_ram_budget.snapshot()["used_bytes"]),
+        "shared_ram_budget": int(cached._store(root).shared_ram_budget.snapshot()["total_bytes"]),
         "expert_cache_q4_promotions": int(expert["q4_promotions"]),
         "expert_cache_total_slots": int(expert["total_slots"]),
         "expert_cache_hits": int(expert["hits"]),

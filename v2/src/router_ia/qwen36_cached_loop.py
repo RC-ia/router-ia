@@ -123,10 +123,53 @@ def _is_expert_tensor(name: str) -> bool:
     return parts[1] in {"gate_proj", "up_proj", "down_proj"}
 
 
+class SharedRamBudget:
+    """Global host-RAM budget shared by general tensors and routed experts."""
+
+    def __init__(self, total_bytes: int) -> None:
+        self.total_bytes = max(int(total_bytes), 0)
+        self._usage = {"general": 0, "expert": 0}
+        self._lock = Lock()
+
+    def set_usage(self, kind: str, value: int) -> None:
+        with self._lock:
+            self._usage[str(kind)] = max(int(value), 0)
+
+    def available(self, kind: str) -> int:
+        kind = str(kind)
+        with self._lock:
+            other = sum(value for key, value in self._usage.items() if key != kind)
+            return max(self.total_bytes - other, 0)
+
+    def snapshot(self) -> dict[str, int | float]:
+        with self._lock:
+            general = int(self._usage.get("general", 0))
+            expert = int(self._usage.get("expert", 0))
+            used = general + expert
+            return {
+                "total_bytes": self.total_bytes,
+                "general_bytes": general,
+                "expert_bytes": expert,
+                "used_bytes": used,
+                "free_bytes": max(self.total_bytes - used, 0),
+                "utilization": used / self.total_bytes * 100.0 if self.total_bytes else 0.0,
+            }
+
+
 class _PriorityTensorCache:
-    def __init__(self, max_bytes: int, name: str, evict: bool = True, policy: str = "priority") -> None:
+    def __init__(
+        self,
+        max_bytes: int,
+        name: str,
+        evict: bool = True,
+        policy: str = "priority",
+        shared_budget: SharedRamBudget | None = None,
+        budget_kind: str = "general",
+    ) -> None:
         self.max_bytes = max_bytes
         self.name = name
+        self.shared_budget = shared_budget
+        self.budget_kind = budget_kind
         self.evict = evict
         self.policy = policy if policy in {"priority", "lru"} else "priority"
         self.items: dict[str, torch.Tensor] = {}
@@ -197,8 +240,11 @@ class _PriorityTensorCache:
             if size > self.max_bytes:
                 self.skipped_oversize += 1
                 return False
+            effective_max = self.max_bytes
+            if self.shared_budget is not None:
+                effective_max = min(self.max_bytes, self.shared_budget.available(self.budget_kind))
             if self.evict:
-                while self.bytes_used + size > self.max_bytes and self.items:
+                while self.bytes_used + size > effective_max and self.items:
                     victim = next(iter(self.order)) if self.policy == "lru" else min(self.items, key=self._score)
                     self._remove(victim)
                     self.evictions += 1
@@ -207,7 +253,7 @@ class _PriorityTensorCache:
             elif self.bytes_used + size > self.max_bytes:
                 self.skipped_oversize += 1
                 return False
-            if self.bytes_used + size > self.max_bytes:
+            if self.bytes_used + size > effective_max:
                 self.skipped_oversize += 1
                 return False
             self.items[name] = tensor
@@ -217,6 +263,8 @@ class _PriorityTensorCache:
             self.item_last_access[name] = self.clock
             self.item_expert[name] = expert
             self.bytes_used += size
+            if self.shared_budget is not None:
+                self.shared_budget.set_usage(self.budget_kind, self.bytes_used)
             return True
 
     def clear(self) -> None:
@@ -228,6 +276,25 @@ class _PriorityTensorCache:
             self.item_last_access.clear()
             self.item_expert.clear()
             self.bytes_used = 0
+            if self.shared_budget is not None:
+                self.shared_budget.set_usage(self.budget_kind, 0)
+
+    def evict_bytes(self, target_bytes: int) -> int:
+        target_bytes = max(int(target_bytes), 0)
+        freed = 0
+        with self.lock:
+            while freed < target_bytes and self.items:
+                victim = next(iter(self.order)) if self.policy == "lru" else min(self.items, key=self._score)
+                size, _ = self._remove(victim)
+                freed += size
+                self.evictions += 1
+            if self.shared_budget is not None:
+                self.shared_budget.set_usage(self.budget_kind, self.bytes_used)
+        return freed
+
+    def sync_shared_budget(self) -> None:
+        if self.shared_budget is not None:
+            self.shared_budget.set_usage(self.budget_kind, self.bytes_used)
 
     def snapshot(self) -> dict[str, int | float]:
         with self.lock:
@@ -358,9 +425,16 @@ class _ShardStore:
         self.handles: dict[Path, object] = {}
         self.handle_opens = 0
         self.handle_hits = 0
+        self.shared_ram_budget = SharedRamBudget(CACHE_BUDGET_BYTES)
         self.ram_cache = _PriorityTensorCache(
-            CACHE_BUDGET_BYTES, "ram", evict=True, policy="lru"
+            CACHE_BUDGET_BYTES,
+            "ram",
+            evict=True,
+            policy="lru",
+            shared_budget=self.shared_ram_budget,
+            budget_kind="general",
         )
+        self.ram_cache.sync_shared_budget()
         self.vram_cache = _DualVRAMCache(VRAM_CACHE_BUDGET_BYTES)
         self.target_device = "cpu"
         self._last_log_loads = 0
