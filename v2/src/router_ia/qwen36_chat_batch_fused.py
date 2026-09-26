@@ -111,6 +111,15 @@ _PREFETCH_MAX_PENDING = max(int(os.getenv("QWEN36_ROUTER_PREFETCH_MAX_PENDING", 
 _PREFETCH_PENDING = set()
 _PREFETCH_LOCK = Lock()
 _COLLECT_LAYER_STATS = os.getenv("QWEN36_LAYER_STATS", "0") == "1"
+_CPU_RUNTIME = {
+    "experts": 0,
+    "seconds": 0.0,
+    "dequant_seconds": 0.0,
+    "matmul_seconds": 0.0,
+    "layers": 0,
+    "last_cpu_experts": 0,
+    "last_cpu_seconds": 0.0,
+}
 
 
 def _expert_cache(root: Path) -> RoutedExpertCache:
