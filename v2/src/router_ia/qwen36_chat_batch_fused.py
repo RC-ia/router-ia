@@ -180,42 +180,69 @@ def _route_gate_up_single_gemm(gate_w: torch.Tensor, up_w: torch.Tensor, x: torc
 
 
 def _batched_moe_step_gpu(root: Path, layer: int, residual: torch.Tensor, top_k: int, device: str):
-    """MoE step whose routed expert weights are prepared on CUDA."""
+    """Mixed MoE execution: FP8/VRAM experts on GPU, Q4/RAM experts on CPU."""
     if device != "cuda":
         return _ORIGINAL_BATCHED_MOE_STEP(root, layer, residual, top_k, device)
 
+    from . import qwen36_cpu_expert as cpu_expert
     prefix = base.layer_prefix(layer)
     post_norm = base.load_layer_weight(root, layer, "post_attention_layernorm.weight", device)
     moe_in = base.rmsnorm(residual, post_norm).reshape(1, base.HIDDEN).float()
     router_w = base.load_layer_weight(root, layer, "mlp.gate.weight", device).float()
     routed = base.route(moe_in.reshape(-1), router_w, top_k=top_k)
     expert_ids = [int(v) for v in routed.expert_ids.detach().cpu().tolist()]
-    route_weights = routed.weights
+    route_weights = [float(v) for v in routed.weights.detach().cpu().tolist()]
 
-    triplets = _load_route_batch_preserving_duplicates(root, layer, prefix, expert_ids)
-    if len(triplets) != len(expert_ids):
-        raise RuntimeError(f"Expert route batch mismatch: requested {len(expert_ids)}, loaded {len(triplets)}")
+    tiered = _expert_cache(root).get_or_load_batch_tiered(
+        cached._store(root), layer, expert_ids, prefix
+    )
 
     if _CURRENT_TOKEN_ID is not None:
         _ROUTING_PREDICTOR.observe(_LAST_INPUT_TOKEN, _CURRENT_TOKEN_ID, layer, expert_ids)
 
-    gate_w = torch.stack([triplet[0] for triplet in triplets], dim=0)
-    up_w = torch.stack([triplet[1] for triplet in triplets], dim=0)
-    down_w = torch.stack([triplet[2] for triplet in triplets], dim=0)
-    batch_x = moe_in.reshape(-1).to(dtype=torch.float16)
+    fp8_entries = [entry for tier, entry in tiered if tier == "fp8"]
+    q4_entries = [entry for tier, entry in tiered if tier == "q4"]
+    routed_sum = torch.zeros_like(moe_in)
 
-    with torch.autocast(device_type="cuda", dtype=torch.float16):
-        gate, up = _route_gate_up_single_gemm(gate_w, up_w, batch_x)
-        hidden = F.silu(gate) * up
-        expert_out = _route_projection_batched(down_w, hidden, len(expert_ids))
-        routing = route_weights.to(dtype=expert_out.dtype).reshape(-1, 1)
-        routed_sum = (expert_out * routing).sum(dim=0, keepdim=True)
+    cpu_result = None
+    if q4_entries:
+        workers_raw = int(os.getenv("QWEN36_CPU_EXPERT_WORKERS", "2"))
+        workers = min(max(workers_raw, 1), len(q4_entries))
+        cpu_result = cpu_expert.run_q4_expert_batch_cpu(q4_entries, moe_in, workers=workers)
+
+    expert_out = None
+    fp8_weights = fp8_scales = gate_w = up_w = down_w = batch_x = None
+    if fp8_entries:
+        fp8_weights = []
+        fp8_scales = []
+        for projection in range(3):
+            fp8_weights.append(torch.stack([entry[projection][0] for entry in fp8_entries], dim=0))
+            fp8_scales.append(torch.stack([entry[projection][1] for entry in fp8_entries], dim=0))
+        gate_w = dequant.dequantize_fp8_blockwise_batch(fp8_weights[0], fp8_scales[0]).to(dtype=torch.float16)
+        up_w = dequant.dequantize_fp8_blockwise_batch(fp8_weights[1], fp8_scales[1]).to(dtype=torch.float16)
+        down_w = dequant.dequantize_fp8_blockwise_batch(fp8_weights[2], fp8_scales[2]).to(dtype=torch.float16)
+        batch_x = moe_in.reshape(-1).to(dtype=torch.float16)
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            gate, up = _route_gate_up_single_gemm(gate_w, up_w, batch_x)
+            hidden = F.silu(gate) * up
+            expert_out = _route_projection_batched(down_w, hidden, len(fp8_entries))
+
+    fp8_local = 0
+    q4_local = 0
+    for route_pos, (tier, _) in enumerate(tiered):
+        weight = route_weights[route_pos]
+        if tier == "fp8":
+            out = expert_out[fp8_local:fp8_local + 1]
+            fp8_local += 1
+        else:
+            out = cpu_result[0][q4_local].to(device="cuda", dtype=torch.float32)
+            q4_local += 1
+        routed_sum.add_(out.float(), alpha=weight)
 
     shared_gate_w = base.load_layer_weight(root, layer, "mlp.shared_expert_gate.weight", device).float()
     shared_gate_proj = chat._projection(root, f"{prefix}mlp.shared_expert.gate_proj", device)
     shared_up_proj = chat._projection(root, f"{prefix}mlp.shared_expert.up_proj", device)
     shared_down_proj = chat._projection(root, f"{prefix}mlp.shared_expert.down_proj", device)
-
     with torch.autocast(device_type="cuda", dtype=torch.float16):
         shared_gate = torch.sigmoid(F.linear(moe_in, shared_gate_w))
         shared_hidden = F.silu(F.linear(moe_in.to(shared_gate_proj.dtype), shared_gate_proj)) * F.linear(moe_in.to(shared_up_proj.dtype), shared_up_proj)
@@ -225,14 +252,28 @@ def _batched_moe_step_gpu(root: Path, layer: int, residual: torch.Tensor, top_k:
     layer_out = residual + moe_out
     shared_gate_value = float(shared_gate.float().item())
     moe_input_norm = float(torch.linalg.vector_norm(moe_in).item())
-    weights = route_weights.detach().cpu().tolist()
 
-    del post_norm, moe_in, router_w, routed, triplets, gate_w, up_w, down_w, batch_x
-    del gate, up, hidden, expert_out, route_weights, routing, routed_sum
+    if cpu_result is not None:
+        s = cpu_result[1]
+        _CPU_RUNTIME["experts"] += s.experts
+        _CPU_RUNTIME["seconds"] += s.seconds
+        _CPU_RUNTIME["dequant_seconds"] += s.dequant_seconds
+        _CPU_RUNTIME["matmul_seconds"] += s.matmul_seconds
+        _CPU_RUNTIME["layers"] += 1
+        _CPU_RUNTIME["last_cpu_experts"] = s.experts
+        _CPU_RUNTIME["last_cpu_seconds"] = s.seconds
+    else:
+        _CPU_RUNTIME["last_cpu_experts"] = 0
+        _CPU_RUNTIME["last_cpu_seconds"] = 0.0
+
+    del post_norm, moe_in, router_w, routed, tiered, fp8_entries, q4_entries
+    if expert_out is not None:
+        del expert_out
+    if gate_w is not None:
+        del fp8_weights, fp8_scales, gate_w, up_w, down_w, batch_x
     del shared_gate_w, shared_gate, shared_gate_proj, shared_up_proj, shared_down_proj
     del shared_hidden, shared_out, moe_out
-    return layer_out, expert_ids, weights, shared_gate_value, moe_input_norm
-
+    return layer_out, expert_ids, route_weights, shared_gate_value, moe_input_norm
 
 def _prefetch_predicted_routes(root: Path, previous_token: int | None, token_id: int) -> tuple[int, int]:
     if not torch.cuda.is_available():
@@ -246,6 +287,11 @@ def _prefetch_predicted_routes(root: Path, previous_token: int | None, token_id:
             continue
         prefix = base.layer_prefix(layer)
         for expert_id in predicted:
+            # Do not warm a RAM-resident Q4 expert into VRAM. Its next route
+            # should continue to use the CPU path unless it is evicted from RAM.
+            with expert_cache.lock:
+                if int(expert_id) in expert_cache.q4_entries.get(layer, {}):
+                    continue
             jobs.append((prefix, int(expert_id)))
     if not jobs:
         return 0, 0
