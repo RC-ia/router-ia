@@ -253,9 +253,9 @@ def _batched_moe_step_gpu(root: Path, layer: int, residual: torch.Tensor, top_k:
     prefetch_store = cached._store(root)
     for predicted_expert in predicted_next:
         with _PREFETCH_LOCK:
-            _PREFETCH_PENDING.difference_update(
-                future for future in _PREFETCH_PENDING if future.done()
-            )
+            done_prefetch = [future for future in tuple(_PREFETCH_PENDING) if future.done()]
+            for future in done_prefetch:
+                _PREFETCH_PENDING.discard(future)
             if len(_PREFETCH_PENDING) >= _PREFETCH_MAX_PENDING:
                 break
             future = _PREFETCH_POOL.submit(
