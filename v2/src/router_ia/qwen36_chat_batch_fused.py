@@ -374,7 +374,7 @@ def _cache_stats_with_experts(root: Path) -> dict[str, int | float]:
     stats = dict(_ORIGINAL_CACHE_STATS(root))
     cache = _EXPERT_CACHES.get(root.resolve())
     if cache is None:
-        return stats
+        cache = _expert_cache(root)
     expert = cache.snapshot()
     predictor = _ROUTING_PREDICTOR.snapshot()
     stats.update({
@@ -425,7 +425,7 @@ def _print_cache_with_experts(root: Path, label: str) -> None:
     _ORIGINAL_PRINT_CACHE(root, label)
     cache = _EXPERT_CACHES.get(root.resolve())
     if cache is None:
-        return
+        cache = _expert_cache(root)
     expert = cache.snapshot()
     predictor = _ROUTING_PREDICTOR.snapshot()
     print(

@@ -19,7 +19,7 @@ BLOCK = 128
 FP8_MAX = 448.0
 FP16_EXPERT_BYTES_ESTIMATE = 3 * EXPERT_HIDDEN * HIDDEN * 2
 
-FP8_SLOTS_PER_LAYER = 8
+FP8_SLOTS_PER_LAYER = max(int(__import__("os").getenv("QWEN36_FP8_EXPERT_SLOTS_PER_LAYER", "4")), 1)
 Q4_MIN_SLOTS_PER_LAYER = 3
 PREDICTED_RAM_SLOTS_PER_LAYER = 4
 FP8_EXPERT_BYTES_ESTIMATE = 3 * EXPERT_HIDDEN * HIDDEN + 4096
@@ -254,24 +254,16 @@ class RoutedExpertCache:
         return f"{proj}.{kind}.__expert_prefetch__"
 
     def _raw_projection_for_gpu(self, store, proj: str):
-        if hasattr(store, "vram_cache"):
-            wk = self._stream_key(proj, "weight")
-            sk = self._stream_key(proj, "scale")
-            w = store.vram_cache.get_stream(wk)
-            s = store.vram_cache.get_stream(sk)
-            if w is not None and s is not None:
-                self.stream_prefetch_hits += 1
-                return w, s
-            self.stream_prefetch_misses += 1
-
+        # Raw expert FP8 weights are owned by RoutedExpertCache. Do not place
+        # another copy in the general VRAM stream: that stream is reserved for
+        # decoded FP16 matrices used by GEMM.
         weight = store.load(proj + ".weight", device="cpu")
         scale = store.load(proj + ".weight_scale_inv", device="cpu")
-        if weight.dtype == torch.float8_e4m3fn and hasattr(store, "vram_cache"):
-            gpu_weight = weight.to(device="cuda")
-            gpu_scale = scale.to(device="cuda")
-            store.vram_cache.put_stream(self._stream_key(proj, "weight"), gpu_weight)
-            store.vram_cache.put_stream(self._stream_key(proj, "scale"), gpu_scale)
-            return gpu_weight, gpu_scale
+        if weight.dtype == torch.float8_e4m3fn:
+            return (
+                weight.to(device="cuda", non_blocking=True),
+                scale.to(device="cuda", non_blocking=True),
+            )
         return weight, scale
 
     def prefetch_expert_raw(self, store, layer_prefix: str, expert_id: int) -> None:
