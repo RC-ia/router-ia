@@ -99,9 +99,16 @@ _CPU_POOL = ThreadPoolExecutor(
     thread_name_prefix="ram-experts",
 )
 _PREFETCH_POOL = ThreadPoolExecutor(
-    max_workers=max(int(os.getenv("QWEN36_ROUTER_PREFETCH_WORKERS", "2")), 1),
+    max_workers=max(int(os.getenv("QWEN36_ROUTER_PREFETCH_WORKERS", "1")), 1),
     thread_name_prefix="expert-prefetch",
 )
+_PROMOTION_POOL = ThreadPoolExecutor(
+    max_workers=max(int(os.getenv("QWEN36_ROUTER_PROMOTION_WORKERS", "2")), 1),
+    thread_name_prefix="expert-promote",
+)
+_PREFETCH_MAX_PENDING = max(int(os.getenv("QWEN36_ROUTER_PREFETCH_MAX_PENDING", "6")), 1)
+_PREFETCH_PENDING = set()
+_PREFETCH_LOCK = Lock()
 _COLLECT_LAYER_STATS = os.getenv("QWEN36_LAYER_STATS", "0") == "1"
 
 
@@ -209,13 +216,20 @@ def _batched_moe_step_gpu(root: Path, layer: int, residual: torch.Tensor, top_k:
     prefetch_cache = _expert_cache(root)
     prefetch_store = cached._store(root)
     for predicted_expert in predicted_next:
-        _PREFETCH_POOL.submit(
-            prefetch_cache.prefetch_expert_to_ram,
-            prefetch_store,
-            layer,
-            int(predicted_expert),
-            prefix,
-        )
+        with _PREFETCH_LOCK:
+            _PREFETCH_PENDING.difference_update(
+                future for future in _PREFETCH_PENDING if future.done()
+            )
+            if len(_PREFETCH_PENDING) >= _PREFETCH_MAX_PENDING:
+                break
+            future = _PREFETCH_POOL.submit(
+                prefetch_cache.prefetch_expert_to_ram,
+                prefetch_store,
+                layer,
+                int(predicted_expert),
+                prefix,
+            )
+            _PREFETCH_PENDING.add(future)
 
     fp8_entries = [entry for tier, entry in tiered if tier == "fp8"]
     q4_entries = [entry for tier, entry in tiered if tier == "q4"]
@@ -254,7 +268,7 @@ def _batched_moe_step_gpu(root: Path, layer: int, residual: torch.Tensor, top_k:
         promote_store = cached._store(root)
         for route_pos, (tier, _) in enumerate(tiered):
             if tier == "q4":
-                _PREFETCH_POOL.submit(
+                _PROMOTION_POOL.submit(
                     promote_cache.promote_q4_to_vram,
                     promote_store,
                     layer,
