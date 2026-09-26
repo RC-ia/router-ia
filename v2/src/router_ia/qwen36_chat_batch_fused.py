@@ -13,17 +13,18 @@ import torch.nn.functional as F
 
 from . import qwen36_cached_loop as cached
 from . import qwen36_dequant as dequant
-from . import qwen36_chat_batch as chat
 from . import qwen36_40layer_loop as base
 from .qwen36_expert_cache import RoutedExpertCache
 
 
+chat = None
 _EXPERT_CACHES: dict[Path, RoutedExpertCache] = {}
-_ORIGINAL_EXPERT_TRIPLET = chat._expert_projection_triplet
-_ORIGINAL_CACHE_STATS = chat.cache_stats
-_ORIGINAL_PRINT_CACHE = chat.print_cache
-_ORIGINAL_BATCHED_MOE_STEP = chat.batched_moe_step
-_ORIGINAL_RUN_GENERATED_TOKEN = chat.run_generated_token
+_ORIGINAL_EXPERT_TRIPLET = None
+_ORIGINAL_CACHE_STATS = None
+_ORIGINAL_PRINT_CACHE = None
+_ORIGINAL_BATCHED_MOE_STEP = None
+_ORIGINAL_RUN_GENERATED_TOKEN = None
+_INSTALLED_CHAT_MODULES: set[int] = set()
 
 
 class ExpertTransitionPredictor:
@@ -459,18 +460,44 @@ def _print_cache_with_experts(root: Path, label: str) -> None:
     )
 
 
-chat._expert_projection_triplet = _cached_expert_projection_triplet
-chat.batched_moe_step = _batched_moe_step_gpu
-chat.run_generated_token = _run_generated_token_with_predictor
-chat.cache_stats = _cache_stats_with_experts
-chat.print_cache = _print_cache_with_experts
+def install(target_chat_module) -> None:
+    """Install the fused runtime onto the exact chat module being executed.
+
+    This avoids the __main__ vs router_ia.qwen36_chat_batch duplicate-module
+    trap when qwen36_chat_batch.py is launched with python -m.
+    """
+    global chat
+    global _ORIGINAL_EXPERT_TRIPLET, _ORIGINAL_CACHE_STATS
+    global _ORIGINAL_PRINT_CACHE, _ORIGINAL_BATCHED_MOE_STEP
+    global _ORIGINAL_RUN_GENERATED_TOKEN
+
+    module_id = id(target_chat_module)
+    if module_id in _INSTALLED_CHAT_MODULES:
+        return
+
+    chat = target_chat_module
+    _ORIGINAL_EXPERT_TRIPLET = chat._expert_projection_triplet
+    _ORIGINAL_CACHE_STATS = chat.cache_stats
+    _ORIGINAL_PRINT_CACHE = chat.print_cache
+    _ORIGINAL_BATCHED_MOE_STEP = chat.batched_moe_step
+    _ORIGINAL_RUN_GENERATED_TOKEN = chat.run_generated_token
+
+    chat._expert_projection_triplet = _cached_expert_projection_triplet
+    chat.batched_moe_step = _batched_moe_step_gpu
+    chat.run_generated_token = _run_generated_token_with_predictor
+    chat.cache_stats = _cache_stats_with_experts
+    chat.print_cache = _print_cache_with_experts
+    _INSTALLED_CHAT_MODULES.add(module_id)
 
 
 def main() -> None:
+    from . import qwen36_chat_batch as chat_module
+
+    install(chat_module)
     cache = _expert_cache(Path("."))
     print("expert_cache=complete-layer-expert")
     print("expert_cache_key=(layer,expert)")
-    print("expert_cache_policy=per-layer-8fp8-vram-3q4-ram")
+    print("expert_cache_policy=per-layer-4fp8-vram-3q4-ram")
     print("expert_cache_budget=fp8-vram-stream-budget")
     print("expert_cache_entry=FP8-VRAM|Q4-RAM")
     print("expert_cache_eviction=FP8-to-Q4-RAM")

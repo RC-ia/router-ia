@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import gc
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from time import perf_counter
@@ -263,7 +264,11 @@ def main() -> None:
     # Enable the transition-aware expert cache for the normal V2 entry point.
     # The fused module patches this already-imported module before generation.
     if os.getenv("QWEN36_EXPERT_TRANSITIONS", "1") != "0":
-        from . import qwen36_chat_batch_fused as _expert_runtime  # noqa: F401
+        from . import qwen36_chat_batch_fused as _expert_runtime
+        _expert_runtime.install(sys.modules[__name__])
+        print("expert_runtime=fused")
+    else:
+        print("expert_runtime=legacy")
     parser = argparse.ArgumentParser(description="Stateful Qwen3.6 router mini-chat test")
     parser.add_argument("model_dir", type=Path)
     parser.add_argument("--device", default="cpu")
