@@ -188,6 +188,28 @@ def _route_gate_up_single_gemm(gate_w: torch.Tensor, up_w: torch.Tensor, x: torc
     return result[:, :out_features], result[:, out_features:]
 
 
+def _decoded_expert_triplet(
+    root: Path,
+    layer: int,
+    expert_id: int,
+    entry,
+    store,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reuse FP16 expert matrices from the bounded VRAM stream cache."""
+    decoded = []
+    for projection in range(3):
+        key = f"expert.fp16.{int(layer)}.{int(expert_id)}.{projection}"
+        cached_weight = store.vram_cache.get_stream(key)
+        if cached_weight is None:
+            weight, scale = entry[projection]
+            cached_weight = dequant.dequantize_fp8_blockwise(
+                weight, scale
+            ).to(dtype=torch.float16)
+            store.vram_cache.put_stream(key, cached_weight)
+        decoded.append(cached_weight)
+    return decoded[0], decoded[1], decoded[2]
+
+
 def _batched_moe_step_gpu(root: Path, layer: int, residual: torch.Tensor, top_k: int, device: str):
     """Mixed MoE execution: FP8/VRAM experts on GPU, Q4/RAM experts on CPU."""
     if device != "cuda":
@@ -231,7 +253,11 @@ def _batched_moe_step_gpu(root: Path, layer: int, residual: torch.Tensor, top_k:
             )
             _PREFETCH_PENDING.add(future)
 
-    fp8_entries = [entry for tier, entry in tiered if tier == "fp8"]
+    fp8_entries = [
+        (expert_ids[pos], entry)
+        for pos, (tier, entry) in enumerate(tiered)
+        if tier == "fp8"
+    ]
     q4_entries = [entry for tier, entry in tiered if tier == "q4"]
     routed_sum = torch.zeros_like(moe_in)
 
@@ -248,14 +274,19 @@ def _batched_moe_step_gpu(root: Path, layer: int, residual: torch.Tensor, top_k:
     expert_out = None
     fp8_weights = fp8_scales = gate_w = up_w = down_w = batch_x = None
     if fp8_entries:
-        fp8_weights = []
-        fp8_scales = []
-        for projection in range(3):
-            fp8_weights.append(torch.stack([entry[projection][0] for entry in fp8_entries], dim=0))
-            fp8_scales.append(torch.stack([entry[projection][1] for entry in fp8_entries], dim=0))
-        gate_w = dequant.dequantize_fp8_blockwise_batch(fp8_weights[0], fp8_scales[0]).to(dtype=torch.float16)
-        up_w = dequant.dequantize_fp8_blockwise_batch(fp8_weights[1], fp8_scales[1]).to(dtype=torch.float16)
-        down_w = dequant.dequantize_fp8_blockwise_batch(fp8_weights[2], fp8_scales[2]).to(dtype=torch.float16)
+        decoded = [
+            _decoded_expert_triplet(
+                root,
+                layer,
+                int(expert_id),
+                entry,
+                cached._store(root),
+            )
+            for expert_id, entry in fp8_entries
+        ]
+        gate_w = torch.stack([item[0] for item in decoded], dim=0)
+        up_w = torch.stack([item[1] for item in decoded], dim=0)
+        down_w = torch.stack([item[2] for item in decoded], dim=0)
         batch_x = moe_in.reshape(-1).to(dtype=torch.float16)
         with torch.autocast(device_type="cuda", dtype=torch.float16):
             gate, up = _route_gate_up_single_gemm(gate_w, up_w, batch_x)
