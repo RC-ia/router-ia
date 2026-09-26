@@ -303,21 +303,6 @@ def _batched_moe_step_gpu(root: Path, layer: int, residual: torch.Tensor, top_k:
     tiered = _expert_cache(root).get_or_load_batch_tiered(
         cached._store(root), layer, expert_ids, prefix
     )
-        with _PREFETCH_LOCK:
-            done_prefetch = [future for future in tuple(_PREFETCH_PENDING) if future.done()]
-            for future in done_prefetch:
-                _PREFETCH_PENDING.discard(future)
-            if len(_PREFETCH_PENDING) >= _PREFETCH_MAX_PENDING:
-                break
-            future = _PREFETCH_POOL.submit(
-                prefetch_cache.prefetch_expert_to_ram,
-                prefetch_store,
-                layer,
-                int(predicted_expert),
-                prefix,
-            )
-            _PREFETCH_PENDING.add(future)
-
     fp8_entries = [
         (expert_ids[pos], entry)
         for pos, (tier, entry) in enumerate(tiered)
