@@ -28,6 +28,7 @@ import sys
 from contextlib import ExitStack
 from pathlib import Path
 from threading import Lock
+from collections import OrderedDict
 
 import torch
 from safetensors import safe_open
@@ -123,11 +124,13 @@ def _is_expert_tensor(name: str) -> bool:
 
 
 class _PriorityTensorCache:
-    def __init__(self, max_bytes: int, name: str, evict: bool = True) -> None:
+    def __init__(self, max_bytes: int, name: str, evict: bool = True, policy: str = "priority") -> None:
         self.max_bytes = max_bytes
         self.name = name
         self.evict = evict
+        self.policy = policy if policy in {"priority", "lru"} else "priority"
         self.items: dict[str, torch.Tensor] = {}
+        self.order: OrderedDict[str, None] = OrderedDict()
         self.item_bytes: dict[str, int] = {}
         self.item_hits: dict[str, int] = {}
         self.item_last_access: dict[str, int] = {}
@@ -159,6 +162,7 @@ class _PriorityTensorCache:
         size = self.item_bytes.pop(name, 0)
         expert = self.item_expert.pop(name, False)
         self.items.pop(name, None)
+        self.order.pop(name, None)
         self.item_hits.pop(name, None)
         self.item_last_access.pop(name, None)
         self.bytes_used -= size
@@ -176,6 +180,8 @@ class _PriorityTensorCache:
             self.hits += 1
             self.item_hits[name] = self.item_hits.get(name, 0) + 1
             self.item_last_access[name] = self.clock
+            if self.policy == "lru":
+                self.order.move_to_end(name)
             if self.item_expert.get(name, False):
                 self.expert_hits += 1
             return tensor
@@ -193,7 +199,7 @@ class _PriorityTensorCache:
                 return False
             if self.evict:
                 while self.bytes_used + size > self.max_bytes and self.items:
-                    victim = min(self.items, key=self._score)
+                    victim = next(iter(self.order)) if self.policy == "lru" else min(self.items, key=self._score)
                     self._remove(victim)
                     self.evictions += 1
                     if _is_expert_tensor(victim):
@@ -205,6 +211,7 @@ class _PriorityTensorCache:
                 self.skipped_oversize += 1
                 return False
             self.items[name] = tensor
+            self.order[name] = None
             self.item_bytes[name] = size
             self.item_hits[name] = 0
             self.item_last_access[name] = self.clock
@@ -215,6 +222,7 @@ class _PriorityTensorCache:
     def clear(self) -> None:
         with self.lock:
             self.items.clear()
+            self.order.clear()
             self.item_bytes.clear()
             self.item_hits.clear()
             self.item_last_access.clear()
@@ -265,7 +273,7 @@ class _DualVRAMCache:
             EXPERT_VRAM_BUDGET_BYTES, "vram-experts", evict=True
         )
         self.stream = _PriorityTensorCache(
-            STREAM_BUDGET_BYTES, "vram-stream", evict=True
+            STREAM_BUDGET_BYTES, "vram-stream", evict=True, policy="lru"
         )
         self.max_bytes = total_bytes
 
@@ -350,7 +358,9 @@ class _ShardStore:
         self.handles: dict[Path, object] = {}
         self.handle_opens = 0
         self.handle_hits = 0
-        self.ram_cache = _PriorityTensorCache(CACHE_BUDGET_BYTES, "ram", evict=True)
+        self.ram_cache = _PriorityTensorCache(
+            CACHE_BUDGET_BYTES, "ram", evict=True, policy="lru"
+        )
         self.vram_cache = _DualVRAMCache(VRAM_CACHE_BUDGET_BYTES)
         self.target_device = "cpu"
         self._last_log_loads = 0
@@ -409,6 +419,7 @@ class _ShardStore:
         raise KeyError(f"Tensor not found: {name}")
 
     def load(self, name: str, device: str):
+        is_expert = _is_expert_tensor(name)
         if device == "cuda":
             self.target_device = "cuda"
             cached_tensor = self.vram_cache.get(name)
@@ -416,18 +427,19 @@ class _ShardStore:
                 self._maybe_log_progress(name)
                 return cached_tensor
 
-        cpu_cached = self.ram_cache.get(name)
+        cpu_cached = None if is_expert else self.ram_cache.get(name)
         if cpu_cached is not None:
             if device == "cpu":
                 self._maybe_log_progress(name)
                 return cpu_cached
-            gpu_tensor = cpu_cached.to(device=device)
+            gpu_tensor = cpu_cached.to(device=device, non_blocking=True)
             self.vram_cache.put(name, gpu_tensor)
             self._maybe_log_progress(name)
             return gpu_tensor
 
         tensor = self._load_ssd(name)
-        self.ram_cache.put(name, tensor)
+        if not is_expert:
+            self.ram_cache.put(name, tensor)
         if device == "cpu":
             self._maybe_log_progress(name)
             return tensor
