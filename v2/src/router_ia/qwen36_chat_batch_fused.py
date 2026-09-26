@@ -204,11 +204,16 @@ def _batched_moe_step_gpu(root: Path, layer: int, residual: torch.Tensor, top_k:
     q4_entries = [entry for tier, entry in tiered if tier == "q4"]
     routed_sum = torch.zeros_like(moe_in)
 
-    cpu_result = None
+    cpu_future = None
+    cpu_pool = None
     if q4_entries:
         workers_raw = int(os.getenv("QWEN36_CPU_EXPERT_WORKERS", "2"))
         workers = min(max(workers_raw, 1), len(q4_entries))
-        cpu_result = cpu_expert.run_q4_expert_batch_cpu(q4_entries, moe_in, workers=workers)
+        # Start RAM-resident experts first so CPU execution overlaps the GPU path.
+        cpu_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ram-experts")
+        cpu_future = cpu_pool.submit(
+            cpu_expert.run_q4_expert_batch_cpu, q4_entries, moe_in, workers=workers
+        )
 
     expert_out = None
     fp8_weights = fp8_scales = gate_w = up_w = down_w = batch_x = None
@@ -226,6 +231,10 @@ def _batched_moe_step_gpu(root: Path, layer: int, residual: torch.Tensor, top_k:
             gate, up = _route_gate_up_single_gemm(gate_w, up_w, batch_x)
             hidden = F.silu(gate) * up
             expert_out = _route_projection_batched(down_w, hidden, len(fp8_entries))
+
+    cpu_result = cpu_future.result() if cpu_future is not None else None
+    if cpu_pool is not None:
+        cpu_pool.shutdown(wait=True)
 
     fp8_local = 0
     q4_local = 0
