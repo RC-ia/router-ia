@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
+import os
 from pathlib import Path
 from threading import Lock
 
@@ -11,6 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from . import qwen36_cached_loop as cached
+from . import qwen36_dequant as dequant
 from . import qwen36_chat_batch as chat
 from . import qwen36_40layer_loop as base
 from .qwen36_expert_cache import RoutedExpertCache
@@ -267,6 +269,7 @@ def _run_generated_token_with_predictor(root: Path, token_id: int, final_norm: t
     return result
 
 _CURRENT_TOKEN_ID: int | None = None
+_CPU_RUNTIME = {"experts": 0, "seconds": 0.0, "dequant_seconds": 0.0, "matmul_seconds": 0.0, "layers": 0, "last_cpu_experts": 0, "last_cpu_seconds": 0.0}
 
 
 def _cache_stats_with_experts(root: Path) -> dict[str, int | float]:
