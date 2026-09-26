@@ -452,10 +452,49 @@ class RoutedExpertCache:
                 self.predicted_ram_promotions += 1
                 found[pos] = ("fp8", promoted)
 
+        unresolved = [
+            int(ids[pos])
+            for pos, (tier, entry) in enumerate(found)
+            if tier not in ("fp8", "q4") or entry is None
+        ]
+        if unresolved:
+            # A speculative prefetch/promotion can change residency between
+            # route resolution and the final lookup. Re-resolve misses directly
+            # from the checkpoint rather than returning a partial route.
+            retry_loaded = {}
+            for expert_id in dict.fromkeys(unresolved):
+                prefix = f"{layer_prefix}mlp.experts.{expert_id}"
+                raw_weights, raw_scales = [], []
+                for name in ("gate_proj", "up_proj", "down_proj"):
+                    w, s = self._raw_projection_for_gpu(
+                        store, prefix + "." + name
+                    )
+                    raw_weights.append(w)
+                    raw_scales.append(s)
+                if not all(w.dtype == torch.float8_e4m3fn for w in raw_weights):
+                    raise RuntimeError(
+                        f"Unexpected non-FP8 expert source during retry: "
+                        f"layer={layer}, expert={expert_id}"
+                    )
+                retry_loaded[expert_id] = (
+                    (raw_weights[0], raw_scales[0]),
+                    (raw_weights[1], raw_scales[1]),
+                    (raw_weights[2], raw_scales[2]),
+                )
+
+            with self.lock:
+                for expert_id, compact in retry_loaded.items():
+                    self._insert_fp8_locked(layer, expert_id, compact)
+                    self.loads += 1
+                found = self._lookup_batch_locked(layer, ids)
+
         result = []
-        for tier, entry in found:
+        for pos, (tier, entry) in enumerate(found):
             if tier not in ("fp8", "q4") or entry is None:
-                raise RuntimeError("Expert cache returned an unresolved route entry")
+                raise RuntimeError(
+                    "Expert cache returned an unresolved route entry: "
+                    f"layer={layer}, expert={ids[pos]}, tier={tier!r}"
+                )
             result.append((tier, entry))
         return result
     def get(self, layer: int, expert_id: int):
