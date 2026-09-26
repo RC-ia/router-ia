@@ -19,11 +19,10 @@ FP8_MAX = 448.0
 FP16_EXPERT_BYTES_ESTIMATE = 3 * EXPERT_HIDDEN * HIDDEN * 2
 
 FP8_SLOTS_PER_LAYER = 8
-# Q4 is a RAM backing tier now. Keep it bounded so it does not consume the
-# model/runtime RAM budget indefinitely.
-Q4_SLOTS_PER_LAYER = 3
+Q4_MIN_SLOTS_PER_LAYER = 3
 PREDICTED_RAM_SLOTS_PER_LAYER = 4
-TOTAL_SLOTS_PER_LAYER = FP8_SLOTS_PER_LAYER + Q4_SLOTS_PER_LAYER
+FP8_EXPERT_BYTES_ESTIMATE = 3 * EXPERT_HIDDEN * HIDDEN + 4096
+Q4_EXPERT_BYTES_ESTIMATE = 3 * ((EXPERT_HIDDEN * HIDDEN + 1) // 2) + 16
 
 FP8Matrix = tuple[torch.Tensor, torch.Tensor]
 WarmEntry = tuple[FP8Matrix, FP8Matrix, FP8Matrix]
@@ -118,12 +117,10 @@ class RoutedExpertCache:
     def __init__(self, budget_bytes: int, layers: int = MODEL_LAYERS) -> None:
         self.budget_bytes = max(int(budget_bytes), 0)
         self.layers = max(int(layers), 1)
-        self.slots_per_layer = min(TOTAL_SLOTS_PER_LAYER, self._budget_slots())
+        self.fp8_slots = min(FP8_SLOTS_PER_LAYER, self._budget_fp8_slots())
+        self.q4_slots = self._budget_q4_slots()
+        self.slots_per_layer = self.fp8_slots + self.q4_slots
         self.total_slots = self.slots_per_layer * self.layers
-        remaining = self.slots_per_layer
-        self.fp8_slots = min(FP8_SLOTS_PER_LAYER, remaining)
-        remaining -= self.fp8_slots
-        self.q4_slots = min(Q4_SLOTS_PER_LAYER, remaining)
 
         self.fp8_entries: dict[int, OrderedDict[int, WarmEntry]] = {layer: OrderedDict() for layer in range(self.layers)}
         self.q4_entries: dict[int, OrderedDict[int, ColdEntry]] = {layer: OrderedDict() for layer in range(self.layers)}
@@ -152,11 +149,25 @@ class RoutedExpertCache:
         self.stream_prefetch_misses = 0
         self.lock = Lock()
 
-    def _budget_slots(self) -> int:
+    def _budget_fp8_slots(self) -> int:
         if not self.budget_bytes:
             return 0
-        target_per_layer = FP8_SLOTS_PER_LAYER * (FP16_EXPERT_BYTES_ESTIMATE // 2)
-        return FP8_SLOTS_PER_LAYER if self.budget_bytes // max(target_per_layer, 1) >= self.layers else 0
+        return FP8_SLOTS_PER_LAYER if self.budget_bytes >= self.layers * FP8_EXPERT_BYTES_ESTIMATE else 0
+
+    def _budget_q4_slots(self) -> int:
+        if not self.budget_bytes or not self.layers:
+            return 0
+        predicted_bytes = (
+            self.layers
+            * PREDICTED_RAM_SLOTS_PER_LAYER
+            * FP8_EXPERT_BYTES_ESTIMATE
+        )
+        remaining = max(self.budget_bytes - predicted_bytes, 0)
+        per_layer = remaining // self.layers
+        slots = int(per_layer // max(Q4_EXPERT_BYTES_ESTIMATE, 1))
+        if slots <= 0:
+            return 0
+        return min(EXPERTS_PER_LAYER, max(Q4_MIN_SLOTS_PER_LAYER, slots))
 
     @staticmethod
     def _fp8_size(entry: WarmEntry) -> int:
@@ -593,6 +604,13 @@ class RoutedExpertCache:
                 "q4_ram_evictions": self.q4_ram_evictions,
                 "q4_ram_bytes": self.q4_bytes_used,
                 "predicted_ram_bytes": self.predicted_ram_bytes_used,
+                "host_ram_bytes": self.q4_bytes_used + self.predicted_ram_bytes_used,
+                "host_ram_budget": self.budget_bytes,
+                "host_ram_utilization": (
+                    (self.q4_bytes_used + self.predicted_ram_bytes_used)
+                    / self.budget_bytes * 100.0
+                    if self.budget_bytes else 0.0
+                ),
                 "predicted_ram_items": sum(len(b) for b in self.predicted_ram_entries.values()),
                 "predicted_ram_prefetches": self.predicted_ram_prefetches,
                 "predicted_ram_hits": self.predicted_ram_hits,

@@ -98,7 +98,7 @@ def _expert_cache(root: Path) -> RoutedExpertCache:
     key = root.resolve()
     cache = _EXPERT_CACHES.get(key)
     if cache is None:
-        cache = RoutedExpertCache(cached.STREAM_BUDGET_BYTES)
+        cache = RoutedExpertCache(cached.CACHE_BUDGET_BYTES)
         _EXPERT_CACHES[key] = cache
     return cache
 
@@ -310,6 +310,9 @@ def _cache_stats_with_experts(root: Path) -> dict[str, int | float]:
         "expert_cache_bytes": int(expert["bytes"]),
         "expert_cache_budget": int(expert["budget_bytes"]),
         "expert_cache_q4_ram_bytes": int(expert["q4_ram_bytes"]),
+        "expert_cache_host_ram_bytes": int(expert["host_ram_bytes"]),
+        "expert_cache_host_ram_budget": int(expert["host_ram_budget"]),
+        "expert_cache_host_ram_utilization": float(expert["host_ram_utilization"]),
         "expert_cache_total_slots": int(expert["total_slots"]),
         "expert_cache_hits": int(expert["hits"]),
         "expert_cache_misses": int(expert["misses"]),
@@ -348,6 +351,8 @@ def _print_cache_with_experts(root: Path, label: str) -> None:
         f"fp8_vram={expert['bytes'] / 1024**2:.1f}/{expert['budget_bytes'] / 1024**2:.1f} MiB | "
         f"q4_ram_entries={expert['cold_items']} | "
         f"q4_ram={expert['q4_ram_bytes'] / 1024**2:.1f} MiB | "
+        f"predicted_ram={expert['predicted_ram_bytes'] / 1024**2:.1f} MiB | "
+        f"host_ram={expert['host_ram_bytes'] / 1024**2:.1f}/{expert['host_ram_budget'] / 1024**2:.1f} MiB | "
         f"hit_rate={expert['hit_rate']:.2f}% | hits={expert['hits']} | misses={expert['misses']} | loads={expert['loads']}"
     )
     print(
