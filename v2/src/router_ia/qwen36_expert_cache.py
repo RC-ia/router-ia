@@ -250,7 +250,7 @@ class RoutedExpertCache:
         prefix = f"{layer_prefix}mlp.experts.{expert_id}"
         matrices = []
         for name in ("gate_proj", "up_proj", "down_proj"):
-                weight = store._load_ssd(prefix + "." + name + ".weight")
+            weight = store._load_ssd(prefix + "." + name + ".weight")
             scale = store._load_ssd(prefix + "." + name + ".weight_scale_inv")
             if weight.dtype != torch.float8_e4m3fn:
                 raise RuntimeError(f"Predicted RAM prefetch requires FP8 source weights: {prefix}.{name}")
