@@ -58,3 +58,7 @@ The transition cache uses three states:
 When a predicted FP8 expert is actually selected by the router, it is promoted from RAM to the VRAM expert cache. If the prediction is wrong, it stays only in the bounded predictive RAM window until eviction.
 
 The predictive window is four experts per layer. This keeps the speculative RAM footprint bounded.
+
+## RAM budget
+
+The general runtime RAM cache has a fixed 8 GiB ceiling by default and evicts lower-priority cached tensors when full. Override it with `QWEN36_CACHE_GB`, for example `QWEN36_CACHE_GB=6` for a 6 GiB ceiling.
