@@ -7,6 +7,14 @@ name = "router-ia-v2-runtime"
 version = "0.2.0"
 description = "Curated Qwen3.6 router inference runtime"
 requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "safetensors>=0.4.3",
+    "transformers>=4.45",
+]
+
+[project.scripts]
+router-ia-v2 = "router_ia.qwen36_chat_batch:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
