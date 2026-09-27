@@ -210,11 +210,11 @@ def run_generated_token(root: Path, token_id: int, final_norm: torch.Tensor, lm_
     return next_id, elapsed, peak_logit
 
 
-def generate_response(root: Path, prompt: str, tokenizer, final_norm: torch.Tensor, lm_head: torch.Tensor, final_norm_name: str, lm_head_name: str, device: str, max_new_tokens: int, sampling_top_k: int, temperature: float) -> None:
+def generate_response(root: Path, prompt: str, tokenizer, final_norm: torch.Tensor, lm_head: torch.Tensor, final_norm_name: str, lm_head_name: str, device: str, max_new_tokens: int, sampling_top_k: int, temperature: float) -> list[int]:
     prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
     if not prompt_ids:
         print("IA> [nenhum token produzido pelo tokenizer]")
-        return
+        return []
     state = attention_cache.state_for(root, device)
     state.reset()
     attention_cache.activate(root, state)
@@ -232,25 +232,26 @@ def generate_response(root: Path, prompt: str, tokenizer, final_norm: torch.Tens
                 del prompt_logits
             prompt_logits, _, _ = run_forward_token(root, int(prompt_id), final_norm, lm_head, final_norm_name, lm_head_name, device)
         prefill_elapsed = perf_counter() - prefill_start
-        next_id = sample_next(prompt_logits, temperature, sampling_top_k)
+        if max_new_tokens > 0:
+            next_id = sample_next(prompt_logits, temperature, sampling_top_k)
+            generated.append(next_id)
+            print(tokenizer.decode([next_id], skip_special_tokens=True), end="", flush=True)
+            print(f"\n  [step 01] token={next_id} | source=prefill | prefill_time={prefill_elapsed:.3f}s | attn_tokens={attention_cache.stats(root)['tokens_seen']} | kv_tokens={attention_cache.stats(root)['full_tokens']}", flush=True)
+            if eos_id is None or next_id != int(eos_id):
+                for step in range(2, max_new_tokens + 1):
+                    before = cache_stats(root)
+                    next_id, elapsed, peak = run_generated_token(root, next_id, final_norm, lm_head, final_norm_name, lm_head_name, device, sampling_top_k, temperature)
+                    after = cache_stats(root)
+                    delta_hits = int(after.get("hits", 0)) - int(before.get("hits", 0))
+                    delta_misses = int(after.get("misses", 0)) - int(before.get("misses", 0))
+                    step_hit_rate = delta_hits / max(delta_hits + delta_misses, 1) * 100.0
+                    generated.append(next_id)
+                    print(tokenizer.decode([next_id], skip_special_tokens=True), end="", flush=True)
+                    attn = attention_cache.stats(root)
+                    print(f"\n  [step {step:02d}] token={next_id} | time={elapsed:.3f}s | attn_tokens={attn['tokens_seen']} | kv_tokens={attn['full_tokens']} | attn_mem={attn['bytes'] / 1024**2:.1f}MiB | step_hit_rate={step_hit_rate:.1f}% | global_hit_rate={after.get('hit_rate', 0.0):.2f}% | ram_hit={after.get('ram_hit_rate', 0.0):.2f}% | vram_hit={after.get('vram_hit_rate', 0.0):.2f}% | expert_vram_hit={after.get('vram_expert_hit_rate', 0.0):.2f}% | stream_hit={after.get('vram_stream_hit_rate', 0.0):.2f}% | hits+{delta_hits} misses+{delta_misses} | peak_logit={peak:.4f}", flush=True)
+                    if eos_id is not None and next_id == int(eos_id):
+                        break
         del prompt_logits
-        generated.append(next_id)
-        print(tokenizer.decode([next_id], skip_special_tokens=True), end="", flush=True)
-        print(f"\n  [step 01] token={next_id} | source=prefill | prefill_time={prefill_elapsed:.3f}s | attn_tokens={attention_cache.stats(root)['tokens_seen']} | kv_tokens={attention_cache.stats(root)['full_tokens']}", flush=True)
-        if eos_id is None or next_id != int(eos_id):
-            for step in range(2, max_new_tokens + 1):
-                before = cache_stats(root)
-                next_id, elapsed, peak = run_generated_token(root, next_id, final_norm, lm_head, final_norm_name, lm_head_name, device, sampling_top_k, temperature)
-                after = cache_stats(root)
-                delta_hits = int(after.get("hits", 0)) - int(before.get("hits", 0))
-                delta_misses = int(after.get("misses", 0)) - int(before.get("misses", 0))
-                step_hit_rate = delta_hits / max(delta_hits + delta_misses, 1) * 100.0
-                generated.append(next_id)
-                print(tokenizer.decode([next_id], skip_special_tokens=True), end="", flush=True)
-                attn = attention_cache.stats(root)
-                print(f"\n  [step {step:02d}] token={next_id} | time={elapsed:.3f}s | attn_tokens={attn['tokens_seen']} | kv_tokens={attn['full_tokens']} | attn_mem={attn['bytes'] / 1024**2:.1f}MiB | step_hit_rate={step_hit_rate:.1f}% | global_hit_rate={after.get('hit_rate', 0.0):.2f}% | ram_hit={after.get('ram_hit_rate', 0.0):.2f}% | vram_hit={after.get('vram_hit_rate', 0.0):.2f}% | expert_vram_hit={after.get('vram_expert_hit_rate', 0.0):.2f}% | stream_hit={after.get('vram_stream_hit_rate', 0.0):.2f}% | hits+{delta_hits} misses+{delta_misses} | peak_logit={peak:.4f}", flush=True)
-                if eos_id is not None and next_id == int(eos_id):
-                    break
         print()
         print(f"  resposta: {len(generated)} tokens | wall={perf_counter() - turn_start:.3f}s")
         print_attention(root, "after turn")
@@ -258,6 +259,14 @@ def generate_response(root: Path, prompt: str, tokenizer, final_norm: torch.Tens
     finally:
         attention_cache.deactivate(root)
         gc.collect()
+    return generated
+
+
+def non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return parsed
 
 
 def main() -> None:
@@ -273,7 +282,7 @@ def main() -> None:
     parser.add_argument("model_dir", type=Path)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--prompt", type=str, default=None, help="Run a single custom prompt instead of the default 4-prompt benchmark")
-    parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
+    parser.add_argument("--max-new-tokens", type=non_negative_int, default=DEFAULT_MAX_NEW_TOKENS)
     parser.add_argument("--sampling-top-k", type=int, default=20)
     parser.add_argument("--temperature", type=float, default=0.0)
     args = parser.parse_args()
