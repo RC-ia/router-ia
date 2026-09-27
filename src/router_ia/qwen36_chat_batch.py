@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from . import qwen36_attention_cache as attention_cache
 from . import qwen36_cached_loop as cached
 from . import qwen36_40layer_loop as base
+from .device_utils import is_cuda, parse_device
 from .qwen36_mini_chat import load_final_norm, load_lm_head, load_tokenizer, sample_next
 
 DEFAULT_MAX_NEW_TOKENS = 4
@@ -128,7 +129,7 @@ def batched_moe_step(root: Path, layer: int, residual: torch.Tensor, top_k: int,
     routed = base.route(moe_in.reshape(-1), router_w, top_k=top_k)
     expert_ids = [int(v) for v in routed.expert_ids.detach().cpu().tolist()]
     weights = [float(v) for v in routed.weights.detach().cpu().tolist()]
-    if device == "cuda":
+    if is_cuda(device):
         _warm_expert_raw_cache(root, prefix, expert_ids)
     with ThreadPoolExecutor(max_workers=min(EXPERT_LOAD_WORKERS, len(expert_ids))) as pool:
         futures = [pool.submit(_expert_projection_triplet, root, prefix, expert_id, device) for expert_id in expert_ids]
@@ -137,7 +138,7 @@ def batched_moe_step(root: Path, layer: int, residual: torch.Tensor, top_k: int,
     up_w = torch.stack([triplet[1] for triplet in triplets], dim=0)
     down_w = torch.stack([triplet[2] for triplet in triplets], dim=0)
     batch_x = moe_in.expand(len(expert_ids), -1)
-    if device == "cuda":
+    if is_cuda(device):
         with torch.autocast(device_type="cuda", dtype=torch.float16):
             batch_x_compute = batch_x.to(dtype=torch.float16)
             gate = torch.bmm(gate_w, batch_x_compute.unsqueeze(-1)).squeeze(-1)
@@ -158,7 +159,7 @@ def batched_moe_step(root: Path, layer: int, residual: torch.Tensor, top_k: int,
     shared_gate_proj = _projection(root, f"{prefix}mlp.shared_expert.gate_proj", device)
     shared_up_proj = _projection(root, f"{prefix}mlp.shared_expert.up_proj", device)
     shared_down_proj = _projection(root, f"{prefix}mlp.shared_expert.down_proj", device)
-    if device == "cuda":
+    if is_cuda(device):
         with torch.autocast(device_type="cuda", dtype=torch.float16):
             shared_gate = torch.sigmoid(F.linear(moe_in, shared_gate_w))
             shared_hidden = F.silu(F.linear(moe_in.to(shared_gate_proj.dtype), shared_gate_proj)) * F.linear(moe_in.to(shared_up_proj.dtype), shared_up_proj)
@@ -181,20 +182,20 @@ def run_forward_token(root: Path, token_id: int, final_norm: torch.Tensor, lm_he
         residual = attention_cache.step_attention(root, layer, x, device)
         x, *_ = batched_moe_step(root, layer, residual, top_k=8, device=device)
         del residual
-    if device == "cuda":
+    if is_cuda(device):
         final_norm_runtime = cached.cached_runtime_tensor(root, final_norm_name, device, dtype=torch.float32)
         lm_head_runtime = cached.cached_runtime_tensor(root, lm_head_name, device, dtype=torch.float16)
     else:
         final_norm_runtime = final_norm
         lm_head_runtime = lm_head
     x = base.rmsnorm(x, final_norm_runtime)
-    if device == "cuda":
+    if is_cuda(device):
         with torch.autocast(device_type="cuda", dtype=torch.float16):
             logits = F.linear(x, lm_head_runtime)
     else:
         logits = F.linear(x, lm_head_runtime)
-    if device == "cuda":
-        torch.cuda.synchronize()
+    if is_cuda(device):
+        torch.cuda.synchronize(device)
     elapsed = perf_counter() - start
     peak_logit = float(torch.max(logits.float()).item())
     if advance_state:
@@ -259,18 +260,24 @@ def generate_response(root: Path, prompt: str, tokenizer, final_norm: torch.Tens
         gc.collect()
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser with native PyTorch device support."""
     parser = argparse.ArgumentParser(description="Stateful Qwen3.6 router mini-chat test")
     parser.add_argument("model_dir", type=Path)
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", type=parse_device, default=torch.device("cpu"))
     parser.add_argument("--prompt", type=str, default=None, help="Run a single custom prompt instead of the default 4-prompt benchmark")
     parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     parser.add_argument("--sampling-top-k", type=int, default=20)
     parser.add_argument("--temperature", type=float, default=0.0)
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
     root = args.model_dir.resolve()
-    device = args.device.lower()
-    if device == "cuda" and not torch.cuda.is_available():
+    device = args.device
+    if is_cuda(device) and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but not available")
     cached._configure_vram_limit(device)
     tokenizer = load_tokenizer(root)

@@ -19,6 +19,8 @@ from time import perf_counter
 import torch
 import torch.nn.functional as F
 
+from .device_utils import is_cuda
+
 from .qwen36_gated_norm_probe import gated_rmsnorm
 from .qwen36_linear_attention_hf import linear_attention_step as linear_attention_step_hf
 from .qwen36_op_probe import (
@@ -130,7 +132,7 @@ def full_attention_step(root: Path, layer: int, x0: torch.Tensor, device: str) -
     del q_gate, q, gate, k, v, q_norm_w, k_norm_w, scores, attn_weights, attn
     del attn_flat, out_w, attn_projected
     gc.collect()
-    if device == "cuda":
+    if is_cuda(device):
         torch.cuda.empty_cache()
     return residual
 
@@ -144,8 +146,8 @@ def run_routed_expert(root: Path, layer: int, expert: int, x: torch.Tensor, devi
     gate_w = load_moe_projection(root, layer, expert, "gate_proj", device)
     up_w = load_moe_projection(root, layer, expert, "up_proj", device)
     down_w = load_moe_projection(root, layer, expert, "down_proj", device)
-    gate = F.linear(x.to(gate_w.dtype) if device == "cuda" else x, gate_w)
-    up = F.linear(x.to(up_w.dtype) if device == "cuda" else x, up_w)
+    gate = F.linear(x.to(gate_w.dtype) if is_cuda(device) else x, gate_w)
+    up = F.linear(x.to(up_w.dtype) if is_cuda(device) else x, up_w)
     hidden = F.silu(gate) * up
     out = F.linear(hidden, down_w)
     del gate_w, up_w, down_w, gate, up, hidden
@@ -163,7 +165,7 @@ def run_shared_expert(root: Path, layer: int, x: torch.Tensor, device: str) -> t
     down_w = load_shared_projection(root, layer, "down_proj", device)
     shared_gate_w = load_layer_weight(root, layer, "mlp.shared_expert_gate.weight", device).float()
 
-    if device == "cuda":
+    if is_cuda(device):
         with torch.autocast(device_type="cuda", dtype=torch.float16):
             shared_gate = torch.sigmoid(F.linear(x, shared_gate_w))
             hidden_gate = F.linear(x.to(gate_w.dtype), gate_w)
@@ -205,7 +207,7 @@ def moe_step(root: Path, layer: int, residual: torch.Tensor, top_k: int, device:
 
     del post_norm, moe_in, router_w, routed, routed_sum, shared_out, moe_out
     gc.collect()
-    if device == "cuda":
+    if is_cuda(device):
         torch.cuda.empty_cache()
     return layer_out, expert_ids, weights, shared_gate, moe_input_norm
 
@@ -218,7 +220,7 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=8)
     args = parser.parse_args()
 
-    if args.device == "cuda" and not torch.cuda.is_available():
+    if is_cuda(args.device) and not torch.cuda.is_available():
         raise SystemExit("CUDA unavailable")
 
     root = args.root.resolve()
@@ -241,7 +243,7 @@ def main() -> None:
         del residual
         print(f"layer={layer} kind={kind} experts={expert_ids} weights={[round(v, 4) for v in weights]} shared_gate={shared_gate:.4f} moe_norm={moe_norm:.4f}")
 
-    if args.device == "cuda":
+    if is_cuda(args.device):
         torch.cuda.synchronize()
     print(f"elapsed={perf_counter() - start:.3f}s")
 
