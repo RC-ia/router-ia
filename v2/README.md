@@ -19,14 +19,28 @@ The original tree is untouched. V2 lives under `v2/src/router_ia/`.
 
 ## Run
 
-From the repository root:
+Install the V2 package from the repository root:
 
 ```bash
-PYTHONPATH=v2/src python -m router_ia.qwen36_chat_batch /path/to/model \
+python -m pip install ./v2
+```
+
+Then use its installed command:
+
+```bash
+router-ia-v2 /path/to/model \
   --device cuda --max-new-tokens 16
 ```
 
 The model directory must contain the Qwen3.6 Safetensors checkpoint and its index.
+
+### CUDA environment (optional)
+
+CUDA is optional: the runtime defaults to CPU execution when `--device` is not
+specified. To run with `--device cuda`, install a CUDA-enabled PyTorch build
+that matches the NVIDIA driver and CUDA environment on the host. PyTorch CUDA
+wheels are selected separately according to the platform; CUDA is not an
+implicit dependency of this package.
 
 ## Excluded
 
