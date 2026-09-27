@@ -110,6 +110,15 @@ class ExpertCrossLayerPredictor:
                 1 for expert in predicted if int(expert) in actual_set
             )
 
+    def reset(self) -> None:
+        """Discard routing data and metrics tied to the current checkpoint."""
+        with self._lock:
+            self._transitions = defaultdict(Counter)
+            self._observations = 0
+            self._predictions = 0
+            self._predicted_experts = 0
+            self._matched_experts = 0
+
     def _serialize_locked(self) -> dict:
         transitions = []
         for (target_layer, source_layer, source_expert), counter in self._transitions.items():
@@ -142,17 +151,21 @@ class ExpertCrossLayerPredictor:
         _ROUTER_STATE_SAVES += 1
 
     def load(self, path: Path, model_signature: str) -> bool:
-        global _ROUTER_STATE_PATH, _ROUTER_STATE_ROOT, _ROUTER_STATE_LOADED
+        global _ROUTER_STATE_PATH, _ROUTER_STATE_LOADED
         path = path.resolve()
+        self.reset()
+        _ROUTER_STATE_PATH = path
+        _ROUTER_STATE_LOADED = False
         if not path.is_file():
-            _ROUTER_STATE_PATH = path
-            _ROUTER_STATE_LOADED = False
+            self.reset()
             return False
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             if int(payload.get("version", -1)) != _ROUTER_STATE_VERSION:
+                self.reset()
                 return False
             if payload.get("model_signature") != model_signature:
+                self.reset()
                 return False
             transitions = defaultdict(Counter)
             for item in payload.get("transitions", []):
@@ -169,11 +182,10 @@ class ExpertCrossLayerPredictor:
             with self._lock:
                 self._transitions = transitions
                 self._observations = int(payload.get("observations", 0))
-            _ROUTER_STATE_PATH = path
-            _ROUTER_STATE_ROOT = _ROUTER_STATE_ROOT or None
             _ROUTER_STATE_LOADED = True
             return True
-        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            self.reset()
             return False
 
     def snapshot(self) -> dict[str, int | float]:
@@ -249,13 +261,15 @@ def _router_state_path(root: Path) -> Path:
 
 
 def _ensure_router_state(root: Path) -> None:
-    global _ROUTER_STATE_ROOT, _ROUTER_STATE_PATH
+    global _ROUTER_STATE_ROOT, _ROUTER_STATE_PATH, _ROUTER_STATE_LOADED
     key = root.resolve()
     if _ROUTER_STATE_ROOT == key:
         return
     _ROUTER_STATE_ROOT = key
     path = _router_state_path(key)
     _ROUTER_STATE_PATH = path
+    _ROUTER_STATE_LOADED = False
+    _ROUTING_PREDICTOR.reset()
     _ROUTING_PREDICTOR.load(path, _router_model_signature(key))
 
 

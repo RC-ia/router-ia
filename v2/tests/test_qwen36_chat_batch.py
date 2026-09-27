@@ -81,3 +81,37 @@ def test_generate_response_respects_max_new_tokens(
 def test_non_negative_int_rejects_negative_values() -> None:
     with pytest.raises(argparse.ArgumentTypeError, match="non-negative"):
         chat.non_negative_int("-1")
+
+
+def test_router_state_reset_when_switching_to_checkpoint_without_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from router_ia import qwen36_chat_batch_fused as fused
+
+    first_root = tmp_path / "first-model"
+    second_root = tmp_path / "second-model"
+    first_root.mkdir()
+    second_root.mkdir()
+    (first_root / "model.safetensors.index.json").write_text('{"model": "first"}')
+    (second_root / "model.safetensors.index.json").write_text('{"model": "second"}')
+    monkeypatch.chdir(tmp_path)
+    predictor = fused.ExpertCrossLayerPredictor()
+    monkeypatch.setattr(fused, "_ROUTING_PREDICTOR", predictor)
+    monkeypatch.setattr(fused, "_ROUTER_STATE_ROOT", None)
+    monkeypatch.setattr(fused, "_ROUTER_STATE_PATH", None)
+    monkeypatch.setattr(fused, "_ROUTER_STATE_LOADED", False)
+
+    predictor.observe(2, [22], {0: (11,)})
+    monkeypatch.setattr(fused, "_ROUTER_STATE_ROOT", first_root.resolve())
+    predictor.save(fused._router_state_path(first_root))
+    monkeypatch.setattr(fused, "_ROUTER_STATE_ROOT", None)
+
+    fused._ensure_router_state(first_root)
+    assert predictor.predict(2, {0: (11,)}) == [22]
+
+    assert not fused._router_state_path(second_root).exists()
+    fused._ensure_router_state(second_root)
+
+    assert not fused._ROUTER_STATE_LOADED
+    assert predictor.predict(2, {0: (11,)}) == []
