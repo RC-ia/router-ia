@@ -153,3 +153,33 @@ def test_router_state_reset_when_switching_to_checkpoint_without_state(
 
     assert not fused._ROUTER_STATE_LOADED
     assert predictor.predict(2, {0: (11,)}) == []
+
+@pytest.mark.parametrize("value", ["cpu", "cuda", "cuda:0"])
+def test_device_parser_accepts_pytorch_device_values(value: str) -> None:
+    args = chat.build_parser().parse_args(["/model", "--device", value])
+
+    assert str(args.device) == value
+
+
+def test_device_parser_rejects_invalid_pytorch_device() -> None:
+    with pytest.raises(SystemExit):
+        chat.build_parser().parse_args(["/model", "--device", "not-a-device"])
+
+
+def test_indexed_cuda_device_uses_cuda_vram_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from router_ia import qwen36_cached_loop as cached
+
+    properties = SimpleNamespace(total_memory=8 * 1024**3)
+    get_properties = Mock(return_value=properties)
+    set_fraction = Mock()
+    monkeypatch.setattr(cached, "VRAM_GB", 1.0)
+    monkeypatch.setattr(cached.torch.cuda, "is_available", Mock(return_value=True))
+    monkeypatch.setattr(cached.torch.cuda, "get_device_properties", get_properties)
+    monkeypatch.setattr(cached.torch.cuda, "set_per_process_memory_fraction", set_fraction)
+
+    cached._configure_vram_limit(chat.torch.device("cuda:3"))
+
+    get_properties.assert_called_once_with(3)
+    set_fraction.assert_called_once_with(pytest.approx(1 / 8), 3)

@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from . import qwen36_40layer_loop as base
+from .device_utils import is_cuda
 from . import qwen36_cached_loop as cached
 from .qwen36_gated_norm_probe import gated_rmsnorm
 from .qwen36_op_probe import rmsnorm
@@ -201,7 +202,7 @@ def _linear_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> t
     prefix = base.layer_prefix(layer)
     input_norm = base.load_layer_weight(root, layer, "input_layernorm.weight", device)
     h = rmsnorm(x0, input_norm)
-    compute_dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    compute_dtype = torch.bfloat16 if is_cuda(device) else torch.float32
     h_compute = h.to(dtype=compute_dtype)
 
     qkv_w = _projection(root, prefix + "linear_attn.in_proj_qkv", device)
@@ -246,7 +247,7 @@ def _linear_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> t
     gated, _, _ = gated_rmsnorm(attn, z, norm_w)
     out_w = _projection(root, prefix + "linear_attn.out_proj", device)
     gated_compute = gated.reshape(1, base.LINEAR_VALUE_DIM).to(
-        dtype=out_w.dtype if device == "cuda" else compute_dtype
+        dtype=out_w.dtype if is_cuda(device) else compute_dtype
     )
     attn_projected = F.linear(gated_compute, out_w).float()
     residual = x0.reshape(1, base.HIDDEN).float() + attn_projected
@@ -263,7 +264,7 @@ def _full_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> tor
     position = int(state.tokens_seen)
     input_norm = base.load_layer_weight(root, layer, "input_layernorm.weight", device)
     h = rmsnorm(x0, input_norm)
-    compute_dtype = torch.float16 if device == "cuda" else torch.float32
+    compute_dtype = torch.float16 if is_cuda(device) else torch.float32
     h_compute = h.to(dtype=compute_dtype)
     q_w = _projection(root, prefix + "self_attn.q_proj", device)
     k_w = _projection(root, prefix + "self_attn.k_proj", device)
