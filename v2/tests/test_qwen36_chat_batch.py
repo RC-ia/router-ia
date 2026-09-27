@@ -22,6 +22,44 @@ class _Tokenizer:
         return f"<{token_ids[0]}>"
 
 
+class _TemplateTokenizer(_Tokenizer):
+    chat_template = "{{ messages }}{% if add_generation_prompt %}<assistant>{% endif %}"
+
+    def __init__(self) -> None:
+        self.apply_chat_template = Mock(return_value=[101, 102, 103])
+
+
+def test_prompt_token_ids_uses_chat_template_with_generation_marker() -> None:
+    tokenizer = _TemplateTokenizer()
+
+    prompt_ids = chat.prompt_token_ids(tokenizer, "Olá")
+
+    assert prompt_ids == [101, 102, 103]
+    tokenizer.apply_chat_template.assert_called_once_with(
+        [{"role": "user", "content": "Olá"}],
+        tokenize=True,
+        add_generation_prompt=True,
+        tokenizer_kwargs={"add_special_tokens": False},
+    )
+
+
+def test_prompt_token_ids_falls_back_to_simple_prompt_without_template() -> None:
+    tokenizer = _Tokenizer()
+
+    prompt_ids = chat.prompt_token_ids(tokenizer, "prompt simples")
+
+    assert prompt_ids == [1, 2]
+
+
+def test_prompt_token_ids_raw_prompt_bypasses_available_template() -> None:
+    tokenizer = _TemplateTokenizer()
+
+    prompt_ids = chat.prompt_token_ids(tokenizer, "prompt bruto", raw_prompt=True)
+
+    assert prompt_ids == [1, 2]
+    tokenizer.apply_chat_template.assert_not_called()
+
+
 @pytest.fixture
 def generation_mocks(monkeypatch: pytest.MonkeyPatch):
     state = SimpleNamespace(reset=Mock())
