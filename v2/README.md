@@ -29,10 +29,25 @@ Then use its installed command:
 
 ```bash
 router-ia-v2 /path/to/model \
-  --device cuda --max-new-tokens 16
+  --device cuda --max-new-tokens 16 \
+  --max-context-tokens 4096
 ```
 
 The model directory must contain the Qwen3.6 Safetensors checkpoint and its index.
+
+### Full-attention KV context limits
+
+Full-attention layers retain K/V tensors for every processed token by default.
+Use `--max-context-tokens N` to place a hard per-layer cap on resident K/V
+tokens, and/or `--max-full-kv-bytes N` to cap the combined full-attention K/V
+tensor allocation in bytes. `0` (the default) disables either limit.
+
+The runtime deliberately stops with a clear error before appending a token that
+would exceed a configured limit. It does **not** evict older K/V entries:
+sliding-window attention is not verified as semantically supported by this
+checkpoint runtime. RoPE positions continue to refer to absolute processed
+token positions; attention statistics report those separately from the
+currently resident K/V window.
 
 ### CUDA environment (optional)
 

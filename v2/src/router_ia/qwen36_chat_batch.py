@@ -81,9 +81,11 @@ def print_attention(root: Path, label: str) -> None:
     stats = attention_cache.stats(root)
     print(
         f"  attention {label}: "
-        f"tokens={stats['tokens_seen']} | "
+        f"absolute_tokens={stats['absolute_position']} | "
+        f"kv_window={stats['full_tokens_resident']} "
+        f"(start={stats['kv_start_position']}) | "
         f"full_kv_layers={stats['full_layers_cached']} | "
-        f"full_kv_tokens={stats['full_tokens']} | "
+        f"full_kv_entries={stats['full_token_entries']} | "
         f"full_kv={stats['full_bytes'] / 1024**2:.1f} MiB | "
         f"delta_state={stats['linear_bytes'] / 1024**2:.1f} MiB | "
         f"conv_state={stats['linear_conv_bytes'] / 1024**2:.2f} MiB | "
@@ -291,6 +293,11 @@ def non_negative_int(value: str) -> int:
     return parsed
 
 
+def non_negative_bytes(value: str) -> int:
+    """Parse a byte budget; zero leaves the full-attention KV cache unlimited."""
+    return non_negative_int(value)
+
+
 def main() -> None:
     # Enable the transition-aware expert cache for the normal V2 entry point.
     # The fused module patches this already-imported module before generation.
@@ -310,6 +317,18 @@ def main() -> None:
         help="Bypass the tokenizer chat template and tokenize --prompt as raw text.",
     )
     parser.add_argument("--max-new-tokens", type=non_negative_int, default=DEFAULT_MAX_NEW_TOKENS)
+    parser.add_argument(
+        "--max-context-tokens",
+        type=non_negative_int,
+        default=0,
+        help="Hard cap for resident full-attention KV tokens per layer; 0 disables the cap.",
+    )
+    parser.add_argument(
+        "--max-full-kv-bytes",
+        type=non_negative_bytes,
+        default=0,
+        help="Hard cap for all full-attention K/V tensors in bytes; 0 disables the cap.",
+    )
     parser.add_argument("--sampling-top-k", type=int, default=20)
     parser.add_argument("--temperature", type=float, default=0.0)
     args = parser.parse_args()
@@ -317,6 +336,10 @@ def main() -> None:
     device = args.device.lower()
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but not available")
+    attention_cache.state_for(root, device).configure(
+        max_context_tokens=args.max_context_tokens,
+        max_full_kv_bytes=args.max_full_kv_bytes,
+    )
     cached._configure_vram_limit(device)
     tokenizer = load_tokenizer(root)
     final_norm_name, final_norm = load_final_norm(root)
@@ -338,6 +361,8 @@ def main() -> None:
     print(f"prompts={'1(custom)' if args.prompt is not None else '4'}")
     print(f"device={device}")
     print(f"max_new_tokens={args.max_new_tokens}")
+    print(f"max_context_tokens={args.max_context_tokens or 'unlimited'}")
+    print(f"max_full_kv_bytes={args.max_full_kv_bytes or 'unlimited'}")
     print(f"sampling_top_k={args.sampling_top_k}")
     print(f"temperature={args.temperature}")
     print(f"prompt_format={'raw' if args.raw_prompt else 'chat-template-or-raw-fallback'}")
