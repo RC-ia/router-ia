@@ -29,6 +29,11 @@ class AttentionState:
     full_values: dict[int, torch.Tensor] = field(default_factory=dict)
     linear_states: dict[int, torch.Tensor] = field(default_factory=dict)
     linear_conv_states: dict[int, torch.Tensor] = field(default_factory=dict)
+    # A value of zero disables the corresponding limit.  Full attention does
+    # not advertise a sliding-window mode in this runtime, so limits fail
+    # before adding a token rather than silently changing checkpoint semantics.
+    max_context_tokens: int = 0
+    max_full_kv_bytes: int = 0
     tokens_seen: int = 0
     device: str | None = None
 
@@ -44,10 +49,23 @@ class AttentionState:
             self.reset()
             self.device = device
 
+    def configure(self, *, max_context_tokens: int = 0, max_full_kv_bytes: int = 0) -> None:
+        if max_context_tokens < 0:
+            raise ValueError("max_context_tokens must be non-negative")
+        if max_full_kv_bytes < 0:
+            raise ValueError("max_full_kv_bytes must be non-negative")
+        self.max_context_tokens = int(max_context_tokens)
+        self.max_full_kv_bytes = int(max_full_kv_bytes)
+
     def snapshot(self) -> dict[str, int | float]:
         # KV cache layout is (batch, kv_heads, sequence, head_dim), so the
         # sequence length lives at dimension -2, not -1 (head_dim=256).
-        full_tokens = sum(int(value.shape[-2]) for value in self.full_keys.values())
+        full_lengths = [int(value.shape[-2]) for value in self.full_keys.values()]
+        # ``tokens_seen`` is the absolute sequence position.  A full-attention
+        # cache stores one entry per full layer, so its total entries differ
+        # from the number of token positions still resident.
+        full_tokens_resident = max(full_lengths, default=0)
+        full_token_entries = sum(full_lengths)
         linear_bytes = sum(int(value.numel() * value.element_size()) for value in self.linear_states.values())
         conv_bytes = sum(int(value.numel() * value.element_size()) for value in self.linear_conv_states.values())
         full_bytes = sum(
@@ -56,9 +74,15 @@ class AttentionState:
         )
         return {
             "tokens_seen": int(self.tokens_seen),
+            "absolute_position": int(self.tokens_seen),
+            "kv_start_position": max(int(self.tokens_seen) - full_tokens_resident, 0),
             "full_layers_cached": len(self.full_keys),
-            "full_tokens": full_tokens,
+            "full_tokens": full_tokens_resident,
+            "full_tokens_resident": full_tokens_resident,
+            "full_token_entries": full_token_entries,
             "full_bytes": full_bytes,
+            "max_context_tokens": int(self.max_context_tokens),
+            "max_full_kv_bytes": int(self.max_full_kv_bytes),
             "linear_layers_cached": len(self.linear_states),
             "linear_bytes": linear_bytes,
             "linear_conv_layers_cached": len(self.linear_conv_states),
@@ -260,6 +284,8 @@ def _linear_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> t
 def _full_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> torch.Tensor:
     state = active(root, device)
     prefix = base.layer_prefix(layer)
+    # RoPE must use the absolute sequence position even if a future cache
+    # policy changes how many earlier KV entries remain resident.
     position = int(state.tokens_seen)
     input_norm = base.load_layer_weight(root, layer, "input_layernorm.weight", device)
     h = rmsnorm(x0, input_norm)
@@ -278,16 +304,7 @@ def _full_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> tor
     k = rmsnorm(k, k_norm_w).float().unsqueeze(2)
     q, k_token = _apply_rope(q, k, position)
     v_token = v.float().unsqueeze(2)
-    full_k = state.full_keys.get(int(layer))
-    full_v = state.full_values.get(int(layer))
-    if full_k is None or full_v is None or full_k.device != k_token.device:
-        full_k = k_token.detach()
-        full_v = v_token.detach()
-    else:
-        full_k = torch.cat((full_k, k_token.detach()), dim=2)
-        full_v = torch.cat((full_v, v_token.detach()), dim=2)
-    state.full_keys[int(layer)] = full_k
-    state.full_values[int(layer)] = full_v
+    full_k, full_v = _append_full_kv(state, layer, k_token, v_token)
     k_expanded = full_k.repeat_interleave(base.FULL_NUM_KV_GROUPS, dim=1).float()
     v_expanded = full_v.repeat_interleave(base.FULL_NUM_KV_GROUPS, dim=1).float()
     q_now = q.squeeze(2)
@@ -306,6 +323,55 @@ def _full_stateful(root: Path, layer: int, x0: torch.Tensor, device: str) -> tor
     return residual
 
 
+def _full_kv_bytes(state: AttentionState) -> int:
+    return sum(
+        int(tensor.numel() * tensor.element_size())
+        for tensor in [*state.full_keys.values(), *state.full_values.values()]
+    )
+
+
+def _append_full_kv(
+    state: AttentionState,
+    layer: int,
+    k_token: torch.Tensor,
+    v_token: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Append one full-attention token after enforcing configured hard limits."""
+    full_k = state.full_keys.get(int(layer))
+    full_v = state.full_values.get(int(layer))
+    resident_tokens = int(full_k.shape[-2]) if full_k is not None else 0
+    if state.max_context_tokens and resident_tokens >= state.max_context_tokens:
+        raise RuntimeError(
+            "Full-attention KV context limit reached "
+            f"at absolute position {state.tokens_seen}: "
+            f"max_context_tokens={state.max_context_tokens}. "
+            "This checkpoint runtime has no verified sliding-window policy; "
+            "start a new context or raise --max-context-tokens."
+        )
+
+    append_bytes = int(k_token.numel() * k_token.element_size()) + int(v_token.numel() * v_token.element_size())
+    projected_bytes = _full_kv_bytes(state) + append_bytes
+    if state.max_full_kv_bytes and projected_bytes > state.max_full_kv_bytes:
+        raise RuntimeError(
+            "Full-attention KV byte budget reached "
+            f"at absolute position {state.tokens_seen}: "
+            f"projected={projected_bytes} bytes exceeds "
+            f"max_full_kv_bytes={state.max_full_kv_bytes}. "
+            "This checkpoint runtime has no verified sliding-window policy; "
+            "start a new context or raise --max-full-kv-bytes."
+        )
+
+    if full_k is None or full_v is None or full_k.device != k_token.device:
+        full_k = k_token.detach()
+        full_v = v_token.detach()
+    else:
+        full_k = torch.cat((full_k, k_token.detach()), dim=2)
+        full_v = torch.cat((full_v, v_token.detach()), dim=2)
+    state.full_keys[int(layer)] = full_k
+    state.full_values[int(layer)] = full_v
+    return full_k, full_v
+
+
 def step_attention(root: Path, layer: int, x0: torch.Tensor, device: str) -> torch.Tensor:
     if base.attention_type(root, layer) == "linear_attention":
         return _linear_stateful(root, layer, x0, device)
@@ -319,9 +385,15 @@ def stats(root: Path) -> dict[str, int | float]:
         if state is not None
         else {
             "tokens_seen": 0,
+            "absolute_position": 0,
+            "kv_start_position": 0,
             "full_layers_cached": 0,
             "full_tokens": 0,
+            "full_tokens_resident": 0,
+            "full_token_entries": 0,
             "full_bytes": 0,
+            "max_context_tokens": 0,
+            "max_full_kv_bytes": 0,
             "linear_layers_cached": 0,
             "linear_bytes": 0,
             "linear_conv_layers_cached": 0,
