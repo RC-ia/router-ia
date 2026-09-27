@@ -210,8 +210,30 @@ def run_generated_token(root: Path, token_id: int, final_norm: torch.Tensor, lm_
     return next_id, elapsed, peak_logit
 
 
-def generate_response(root: Path, prompt: str, tokenizer, final_norm: torch.Tensor, lm_head: torch.Tensor, final_norm_name: str, lm_head_name: str, device: str, max_new_tokens: int, sampling_top_k: int, temperature: float) -> list[int]:
-    prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+def prompt_token_ids(tokenizer, prompt: str, raw_prompt: bool = False) -> list[int]:
+    """Tokenize a user turn with the chat template, or fall back to plain text.
+
+    The fallback keeps supporting tokenizers that do not expose ``chat_template``.
+    ``raw_prompt`` deliberately bypasses an available template for debugging or
+    compatibility with prompts that already contain their own control tokens.
+    """
+    chat_template = getattr(tokenizer, "chat_template", None)
+    if chat_template and not raw_prompt:
+        prompt_ids = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=True,
+            add_generation_prompt=True,
+            # The rendered template owns its special tokens; adding them again
+            # during tokenization would duplicate control tokens.
+            tokenizer_kwargs={"add_special_tokens": False},
+        )
+    else:
+        prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    return [int(token_id) for token_id in prompt_ids]
+
+
+def generate_response(root: Path, prompt: str, tokenizer, final_norm: torch.Tensor, lm_head: torch.Tensor, final_norm_name: str, lm_head_name: str, device: str, max_new_tokens: int, sampling_top_k: int, temperature: float, raw_prompt: bool = False) -> list[int]:
+    prompt_ids = prompt_token_ids(tokenizer, prompt, raw_prompt=raw_prompt)
     if not prompt_ids:
         print("IA> [nenhum token produzido pelo tokenizer]")
         return []
@@ -282,6 +304,11 @@ def main() -> None:
     parser.add_argument("model_dir", type=Path)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--prompt", type=str, default=None, help="Run a single custom prompt instead of the default 4-prompt benchmark")
+    parser.add_argument(
+        "--raw-prompt",
+        action="store_true",
+        help="Bypass the tokenizer chat template and tokenize --prompt as raw text.",
+    )
     parser.add_argument("--max-new-tokens", type=non_negative_int, default=DEFAULT_MAX_NEW_TOKENS)
     parser.add_argument("--sampling-top-k", type=int, default=20)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -313,13 +340,14 @@ def main() -> None:
     print(f"max_new_tokens={args.max_new_tokens}")
     print(f"sampling_top_k={args.sampling_top_k}")
     print(f"temperature={args.temperature}")
+    print(f"prompt_format={'raw' if args.raw_prompt else 'chat-template-or-raw-fallback'}")
     print(f"lm_head={lm_head_name} shape={tuple(lm_head.shape)}")
     print(f"final_norm={final_norm_name} shape={tuple(final_norm.shape)}")
     print_cache(root, "initial")
     print_attention(root, "initial")
     prompts = [args.prompt] if args.prompt is not None else ["Olá", "Como você está?", "Explique o que é uma CPU", "Quanto é 2 + 2?"]
     for prompt in prompts:
-        generate_response(root, prompt, tokenizer, final_norm, lm_head, final_norm_name, lm_head_name, device, args.max_new_tokens, args.sampling_top_k, args.temperature)
+        generate_response(root, prompt, tokenizer, final_norm, lm_head, final_norm_name, lm_head_name, device, args.max_new_tokens, args.sampling_top_k, args.temperature, raw_prompt=args.raw_prompt)
     print("\n===== SUMMARY =====")
     print(f"turns={len(prompts)}")
     print_cache(root, "final")
